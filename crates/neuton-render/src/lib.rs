@@ -6,7 +6,7 @@ pub mod renderer;
 pub mod textures;
 
 pub use appearance::Appearance;
-pub use camera::{Camera, Mat4};
+pub use camera::{Camera, Frustum, Mat4};
 pub use renderer::WorldRenderer;
 pub use textures::{BakedElement, BakedFace, BakedModel, BlockTextures};
 pub use mesh::{BlockAppearance, Face, Mesh, Vertex, build, build_at};

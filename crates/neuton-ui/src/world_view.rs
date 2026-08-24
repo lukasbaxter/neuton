@@ -99,11 +99,14 @@ impl WorldView {
     pub fn stats(&self, renderer: &WorldRenderer) -> String {
         let [x, y, z] = self.camera.position;
         format!(
-            "{}  |  {:.0} fps  |  {} chunks, {:.1}M triangles  |  {x:.1} {y:.1} {z:.1}",
+            "{}  |  {:.0} fps ({:.1} ms)  |  {}/{} chunks drawn, {:.1}M tris  |  {x:.1} {y:.1} {z:.1}  |  {:.0} deg",
             self.session.status,
             if self.last_frame_ms > 0.0 { 1000.0 / self.last_frame_ms } else { 0.0 },
+            self.last_frame_ms,
+            renderer.drawn.get(),
             renderer.chunk_count(),
             self.session.triangles as f64 / 1.0e6,
+            self.camera.yaw,
         )
     }
 }

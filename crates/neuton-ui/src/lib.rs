@@ -231,8 +231,9 @@ impl ApplicationHandler for App {
                                     let png = neuton_render::png::encode_rgba(&pixels, width, height);
                                     match std::fs::write(path, png) {
                                         Ok(()) => println!(
-                                            "wrote {} ({} chunks, {:.1}M triangles)",
+                                            "wrote {} ({}/{} chunks drawn, {:.1}M triangles held)",
                                             path.display(),
+                                            r.drawn.get(),
                                             r.chunk_count(),
                                             w.session.triangles as f64 / 1.0e6
                                         ),
