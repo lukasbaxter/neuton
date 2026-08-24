@@ -271,12 +271,13 @@ fn bake(model: &BlockModel, atlas: &Atlas, tint: TintSource) -> BakedModel {
                 });
             }
 
-            // Blockstate rotation, applied here so the mesher never has to.
-            // Vanilla applies x first, then y.
-            for _ in 0..(model.x_rot.rem_euclid(360) / 90) {
+            // Blockstate rotation, applied here so the mesher never has to,
+            // and per element because a multipart block is several parts each
+            // turned a different way. Vanilla applies x first, then y.
+            for _ in 0..(element.x_rot.rem_euclid(360) / 90) {
                 rotate_x(&mut from, &mut to, &mut faces);
             }
-            for _ in 0..(model.y_rot.rem_euclid(360) / 90) {
+            for _ in 0..(element.y_rot.rem_euclid(360) / 90) {
                 rotate_y(&mut from, &mut to, &mut faces);
             }
 
