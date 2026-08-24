@@ -75,6 +75,40 @@ impl Face {
         }
     }
 
+    /// Axes and corner signs used for ambient occlusion.
+    ///
+    /// `u` and `v` are the two axes in the plane of the face, and each corner
+    /// names its position along them. The order matches [`Face::corners`],
+    /// which is what lets a corner's occlusion be attached to its vertex.
+    const fn ao_basis(self) -> ([i32; 3], usize, usize, [(i32, i32); 4]) {
+        match self {
+            Face::Down => (
+                [0, -1, 0], 0, 2,
+                [(-1, -1), (1, -1), (1, 1), (-1, 1)],
+            ),
+            Face::Up => (
+                [0, 1, 0], 0, 2,
+                [(-1, 1), (1, 1), (1, -1), (-1, -1)],
+            ),
+            Face::North => (
+                [0, 0, -1], 0, 1,
+                [(1, -1), (-1, -1), (-1, 1), (1, 1)],
+            ),
+            Face::South => (
+                [0, 0, 1], 0, 1,
+                [(-1, -1), (1, -1), (1, 1), (-1, 1)],
+            ),
+            Face::West => (
+                [-1, 0, 0], 2, 1,
+                [(-1, -1), (1, -1), (1, 1), (-1, 1)],
+            ),
+            Face::East => (
+                [1, 0, 0], 2, 1,
+                [(1, -1), (-1, -1), (-1, 1), (1, 1)],
+            ),
+        }
+    }
+
     /// The four corners of this face on a box, counter-clockwise seen from
     /// outside so back-face culling keeps the right ones.
     fn corners(self, from: [f32; 3], to: [f32; 3]) -> [[f32; 3]; 4] {
@@ -106,6 +140,25 @@ impl Mesh {
     pub fn triangles(&self) -> usize {
         self.indices.len() / 3
     }
+}
+
+/// How much light each occlusion level keeps.
+///
+/// Level 3 is an open corner, 0 is one wedged between two blocks and a
+/// diagonal. Vanilla's smooth lighting is the same idea, and it is most of what
+/// makes a Minecraft world read as solid rather than as flat coloured planes.
+const AO_LEVELS: [f32; 4] = [0.46, 0.66, 0.84, 1.0];
+
+/// Occlusion for one corner, from the three blocks around it.
+///
+/// Two sides touching means the corner is fully enclosed however the diagonal
+/// falls, which is why that case short-circuits.
+#[inline]
+fn corner_ao(side1: bool, side2: bool, corner: bool) -> usize {
+    if side1 && side2 {
+        return 0;
+    }
+    3 - (side1 as usize + side2 as usize + corner as usize)
 }
 
 /// Whether a block fills its cell and whether it hides its own internal faces.
@@ -221,24 +274,64 @@ fn push_element(
             base[2] + element.to[2],
         ];
 
+        let shade = dir.shade();
+
+        // Ambient occlusion, on full cubes only. A partial box sits inside its
+        // cell, so the neighbours a corner would sample are not the ones
+        // actually touching it, and the result reads as dirt rather than depth.
+        let ao = if element.full_cube {
+            let (normal, u_axis, v_axis, signs) = dir.ao_basis();
+            let solid = |offset: [i32; 3]| {
+                look.is_opaque(StateId(at(x + offset[0], y + offset[1], z + offset[2])))
+            };
+            let mut out = [3usize; 4];
+            for (i, (su, sv)) in signs.iter().enumerate() {
+                let mut side1 = normal;
+                side1[u_axis] += su;
+                let mut side2 = normal;
+                side2[v_axis] += sv;
+                let mut diagonal = normal;
+                diagonal[u_axis] += su;
+                diagonal[v_axis] += sv;
+                out[i] = corner_ao(solid(side1), solid(side2), solid(diagonal));
+            }
+            out
+        } else {
+            [3; 4]
+        };
+
         let start = mesh.vertices.len() as u32;
-        let light = dir.shade();
-        for (corner, uv) in dir.corners(from, to).iter().zip(face.uv.corners()) {
+        for (i, (corner, uv)) in dir.corners(from, to).iter().zip(face.uv.corners()).enumerate() {
             mesh.vertices.push(Vertex {
                 position: *corner,
                 uv,
                 tint: face.tint,
-                light,
+                light: shade * AO_LEVELS[ao[i]],
             });
         }
-        mesh.indices.extend_from_slice(&[
-            start,
-            start + 1,
-            start + 2,
-            start,
-            start + 2,
-            start + 3,
-        ]);
+
+        // A quad is two triangles, and which diagonal they share is visible
+        // when the corners are unevenly lit. Splitting along the darker
+        // diagonal keeps the gradient symmetric instead of bending it.
+        if ao[0] + ao[2] > ao[1] + ao[3] {
+            mesh.indices.extend_from_slice(&[
+                start + 1,
+                start + 2,
+                start + 3,
+                start + 1,
+                start + 3,
+                start,
+            ]);
+        } else {
+            mesh.indices.extend_from_slice(&[
+                start,
+                start + 1,
+                start + 2,
+                start,
+                start + 2,
+                start + 3,
+            ]);
+        }
     }
 }
 
@@ -292,6 +385,60 @@ mod tests {
         }
     }
 
+    /// Builds a column from a per-block closure, so a test can make a shape
+    /// rather than only a stack of uniform sections.
+    fn chunk_from(sections: usize, block: impl Fn(usize, usize, usize) -> u32) -> Chunk {
+        use neuton_world::{Palette, PalettedContainer, Section};
+        let mut out = Vec::with_capacity(sections);
+        for s in 0..sections {
+            // Collect the section's states, then build a palette from them.
+            let mut cells = vec![0u32; SECTION_VOLUME];
+            let mut solid = 0u16;
+            for y in 0..16 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let state = block(x, s * 16 + y, z);
+                        cells[block_index(x, y, z)] = state;
+                        if state != 0 {
+                            solid += 1;
+                        }
+                    }
+                }
+            }
+            let mut palette: Vec<u32> = cells.clone();
+            palette.sort_unstable();
+            palette.dedup();
+
+            // Four bits per entry covers any palette these tests build.
+            assert!(palette.len() <= 16, "test palette too large");
+            let bits = 4usize;
+            let per_word = 64 / bits;
+            let mut data = vec![0u64; SECTION_VOLUME.div_ceil(per_word)];
+            for (i, cell) in cells.iter().enumerate() {
+                let index = palette.iter().position(|p| p == cell).unwrap() as u64;
+                data[i / per_word] |= index << ((i % per_word) * bits);
+            }
+
+            out.push(Section {
+                block_count: solid,
+                fluid_count: 0,
+                blocks: PalettedContainer {
+                    palette: Palette::Indirect(palette),
+                    bits: bits as u8,
+                    data,
+                    len: SECTION_VOLUME,
+                },
+                biomes: PalettedContainer {
+                    palette: Palette::Single(0),
+                    bits: 0,
+                    data: Vec::new(),
+                    len: 64,
+                },
+            });
+        }
+        Chunk { x: 0, z: 0, min_y: 0, sections: out, heightmaps: Vec::new(), block_entities: Vec::new() }
+    }
+
     fn stone() -> u32 {
         neuton_blocks::by_name("minecraft:stone").unwrap().get().default_state.0
     }
@@ -321,7 +468,63 @@ mod tests {
     #[test]
     fn faces_carry_their_directional_shade() {
         let Some(t) = textures() else { return };
+        // A single isolated section: its shell has nothing beside it, so every
+        // corner is open and the only variation is the face direction.
         let mesh = build(&chunk(1, stone(), |_| true), &Solid, &t);
+        let mut lights: Vec<f32> = mesh.vertices.iter().map(|v| v.light).collect();
+        lights.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        lights.dedup();
+        assert_eq!(lights, vec![0.5, 0.6, 0.8, 1.0]);
+    }
+
+    #[test]
+    fn corner_occlusion_darkens_towards_enclosure() {
+        // Open corner keeps everything; two touching sides take the most.
+        assert_eq!(corner_ao(false, false, false), 3);
+        assert_eq!(corner_ao(true, false, false), 2);
+        assert_eq!(corner_ao(true, false, true), 1);
+        assert_eq!(corner_ao(true, true, false), 0);
+        // Both sides solid is fully enclosed whatever the diagonal does.
+        assert_eq!(corner_ao(true, true, true), corner_ao(true, true, false));
+        assert!(AO_LEVELS[0] < AO_LEVELS[3]);
+    }
+
+    #[test]
+    fn an_inside_corner_is_darker_than_a_flat_wall() {
+        let Some(t) = textures() else { return };
+        let s = stone();
+
+        // A flat floor: every top face is out in the open.
+        let flat = build(&chunk_from(1, |_, y, _| if y == 0 { s } else { 0 }), &Solid, &t);
+        // The same floor with a wall along one edge, which occludes the corner
+        // where the two meet.
+        let walled = build(
+            &chunk_from(1, |x, y, _| if y == 0 || (x == 0 && y < 4) { s } else { 0 }),
+            &Solid,
+            &t,
+        );
+
+        let darkest = |m: &Mesh| m.vertices.iter().fold(1.0f32, |a, v| a.min(v.light));
+        assert!(!flat.is_empty() && !walled.is_empty());
+        assert!(
+            darkest(&walled) < darkest(&flat),
+            "the inside corner should be darker: {} vs {}",
+            darkest(&walled),
+            darkest(&flat)
+        );
+    }
+
+    #[test]
+    fn occlusion_leaves_an_isolated_block_evenly_lit() {
+        let Some(t) = textures() else { return };
+        let s = stone();
+        // One block alone in the air: nothing touches it, so every corner is
+        // open and only the face direction varies.
+        let mesh = build(
+            &chunk_from(1, |x, y, z| if (x, y, z) == (8, 8, 8) { s } else { 0 }),
+            &Solid,
+            &t,
+        );
         let mut lights: Vec<f32> = mesh.vertices.iter().map(|v| v.light).collect();
         lights.sort_by(|a, b| a.partial_cmp(b).unwrap());
         lights.dedup();
