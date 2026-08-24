@@ -6,6 +6,7 @@
 //! reads has lower and steadier latency than scheduling through an async
 //! runtime.
 
+pub mod batches;
 pub mod component;
 pub mod connection;
 pub mod dns;
