@@ -150,6 +150,7 @@ fn play(
             after,
             camera_override(&args_vec()),
             bench_frames(&args_vec()),
+            say_lines(&args_vec()),
         ),
         None => neuton_ui::run_direct(host.to_string(), port, session),
     }
@@ -163,6 +164,15 @@ fn bench_frames(args: &[String]) -> u32 {
         Some(i) => args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(120),
         None => 0,
     }
+}
+
+/// `--say <text>` sends a line once in the world, for testing chat.
+fn say_lines(args: &[String]) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, a)| *a == "--say")
+        .filter_map(|(i, _)| args.get(i + 1).cloned())
+        .collect()
 }
 
 fn args_vec() -> Vec<String> {

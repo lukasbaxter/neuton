@@ -76,7 +76,8 @@ pub enum Event {
     ChunkForgotten { x: i32, z: i32 },
     /// The server moved us. Already acknowledged; ignoring these gets us kicked.
     Teleported { x: f64, y: f64, z: f64, yaw: f32, pitch: f32 },
-    Chat(String),
+    /// A chat line, already flattened to styled runs.
+    Chat(Vec<crate::Span>),
     Disconnect(String),
     /// Answered automatically; surfaced so latency can be tracked.
     KeepAlive,
@@ -403,6 +404,16 @@ impl Connection {
                     w.write_i32(token);
                     self.framed.write_packet(ids::play::serverbound::PONG, &w)?;
                 }
+                ids::play::clientbound::SYSTEM_CHAT => {
+                    // An NBT text component, then a flag for whether it belongs
+                    // on the action bar rather than in the chat log.
+                    if let Ok(value) = neuton_nbt::Value::parse(r.rest()) {
+                        let spans = crate::component::flatten(&value);
+                        if !spans.is_empty() {
+                            return Ok(Event::Chat(spans));
+                        }
+                    }
+                }
                 ids::play::clientbound::DISCONNECT => {
                     return Ok(Event::Disconnect(disconnect_reason(&mut r)));
                 }
@@ -478,6 +489,120 @@ impl Connection {
         &self.registries
     }
 
+    /// Tells the server where the player is and which way they are looking.
+    ///
+    /// Without this the server never learns that we moved, so it keeps sending
+    /// chunks around the spawn point and never loads any others. Plugins notice
+    /// too: a player who has not moved gets their chat muted as if they had
+    /// just joined.
+    ///
+    /// Which packet goes out depends on what actually changed, exactly as the
+    /// game does it. Sending position and rotation every tick regardless is
+    /// what anti-cheat calls a duplicate look, and it is right to: a real
+    /// client does not claim to have turned when it has not.
+    ///
+    /// `y` is the feet, not the eyes, which is where the camera sits.
+    pub fn send_movement(
+        &mut self,
+        position: Option<[f64; 3]>,
+        rotation: Option<(f32, f32)>,
+        on_ground: bool,
+    ) -> Result<()> {
+        // Bit 0 is on ground, bit 1 a horizontal collision.
+        let flags = u8::from(on_ground);
+        let mut w = Writer::new();
+
+        let id = match (position, rotation) {
+            (Some(p), Some((yaw, pitch))) => {
+                w.write_f64(p[0]);
+                w.write_f64(p[1]);
+                w.write_f64(p[2]);
+                w.write_f32(yaw);
+                w.write_f32(pitch);
+                w.write_u8(flags);
+                ids::play::serverbound::MOVE_PLAYER_POS_ROT
+            }
+            (Some(p), None) => {
+                w.write_f64(p[0]);
+                w.write_f64(p[1]);
+                w.write_f64(p[2]);
+                w.write_u8(flags);
+                ids::play::serverbound::MOVE_PLAYER_POS
+            }
+            (None, Some((yaw, pitch))) => {
+                w.write_f32(yaw);
+                w.write_f32(pitch);
+                w.write_u8(flags);
+                ids::play::serverbound::MOVE_PLAYER_ROT
+            }
+            // Standing still and looking the same way: a keep-alive for
+            // movement, which the game still sends but rarely.
+            (None, None) => {
+                w.write_u8(flags);
+                ids::play::serverbound::MOVE_PLAYER_STATUS_ONLY
+            }
+        };
+        self.framed.write_packet(id, &w)?;
+        Ok(())
+    }
+
+    /// Marks the end of a client tick.
+    ///
+    /// Sent once per tick after whatever else the tick produced. Real clients
+    /// have done this since 1.21.2 and anti-cheat checks for it, reasonably: a
+    /// client that never ends its ticks is not running the game loop.
+    pub fn send_tick_end(&mut self) -> Result<()> {
+        self.framed
+            .write_packet(ids::play::serverbound::CLIENT_TICK_END, &Writer::new())?;
+        Ok(())
+    }
+
+    /// Tells the server the client has finished loading the world.
+    ///
+    /// Sent once, after the first teleport is acknowledged. The server holds
+    /// some state back until it arrives.
+    pub fn send_loaded(&mut self) -> Result<()> {
+        self.framed
+            .write_packet(ids::play::serverbound::PLAYER_LOADED, &Writer::new())?;
+        Ok(())
+    }
+
+    /// Sends a chat message.
+    ///
+    /// Unsigned. Since 1.19 the game signs chat with a key from the session
+    /// server, and a server running `enforce-secure-profile` will refuse this;
+    /// most do not, and an offline-mode server cannot check a signature anyway.
+    pub fn send_chat(&mut self, message: &str) -> Result<()> {
+        let mut w = Writer::new();
+        w.write_str(&truncate(message, 256));
+        // Timestamp and salt are part of what a signature would cover.
+        w.write_i64(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        );
+        w.write_i64(0); // salt
+        w.write_bool(false); // no signature
+        // LastSeenMessages update: nothing acknowledged.
+        w.write_varint(0);
+        w.write_bytes(&[0, 0, 0]); // 20-bit fixed bitset
+        w.write_u8(0); // checksum
+        self.framed.write_packet(ids::play::serverbound::CHAT, &w)?;
+        Ok(())
+    }
+
+    /// Sends a command, without the leading slash.
+    ///
+    /// Its own packet, and unlike chat it carries no signature at all, so it
+    /// works on servers that refuse unsigned chat.
+    pub fn send_command(&mut self, command: &str) -> Result<()> {
+        let mut w = Writer::new();
+        w.write_str(&truncate(command, 256));
+        self.framed.write_packet(ids::play::serverbound::CHAT_COMMAND, &w)?;
+        Ok(())
+    }
+
     pub fn state(&self) -> State {
         self.state
     }
@@ -527,6 +652,26 @@ fn disconnect_reason(r: &mut Reader<'_>) -> String {
         }
     }
     "no reason given".to_string()
+}
+
+/// Cuts a string to a byte budget without splitting a character.
+///
+/// The server rejects an over-long message outright, and slicing a `String` by
+/// bytes would panic mid-character on anything non-ASCII.
+#[doc(hidden)]
+pub fn truncate_for_test(text: &str, max: usize) -> String {
+    truncate(text, max)
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 fn describe(name: Option<&'static str>, id: i32) -> String {

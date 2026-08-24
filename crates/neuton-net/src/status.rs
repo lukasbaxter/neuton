@@ -196,6 +196,16 @@ fn flatten(v: &serde_json::Value, inherited: &Span, out: &mut Vec<Span>) {
     }
 }
 
+/// Shared with the component parser, which meets the same legacy codes inside
+/// NBT text.
+pub(crate) fn push_legacy_public(text: &str, base: &Span, out: &mut Vec<Span>) {
+    push_legacy(text, base, out)
+}
+
+pub(crate) fn color_of_public(name: &str) -> Option<[u8; 3]> {
+    color_of(name)
+}
+
 /// Splits a string on legacy section-sign codes, emitting a run per style change.
 fn push_legacy(text: &str, base: &Span, out: &mut Vec<Span>) {
     if !text.contains('\u{a7}') {

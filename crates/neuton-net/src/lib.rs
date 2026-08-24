@@ -6,6 +6,7 @@
 //! reads has lower and steadier latency than scheduling through an async
 //! runtime.
 
+pub mod component;
 pub mod connection;
 pub mod dns;
 pub mod registries;
@@ -15,3 +16,4 @@ pub use connection::{Connection, Error, Event, Stats};
 pub use registries::{BiomeColors, DimensionShape, GrassModifier, Registries};
 pub use dns::{Resolution, Srv};
 pub use status::{ServerStatus, Span, ping};
+pub use component::{flatten as flatten_component, to_text};

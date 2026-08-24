@@ -5,6 +5,7 @@
 //! egui draws the launcher on top of a surface neuton owns.
 
 pub mod app;
+pub mod chat;
 pub mod auth_task;
 pub mod fonts;
 pub mod gpu;
@@ -56,12 +57,14 @@ pub fn run_screenshot(
     after: std::time::Duration,
     view: Option<([f32; 3], f32, f32)>,
     bench_frames: u32,
+    say: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App {
         direct: Some(app::PendingJoin { host, port, session }),
         shot: Some((path, after)),
         view,
         bench: bench_frames,
+        say,
         ..Default::default()
     };
     let event_loop = EventLoop::new()?;
@@ -107,6 +110,8 @@ struct App {
     warmup: u32,
     /// Frames to time before capturing, if benchmarking.
     bench: u32,
+    /// Lines to send on arrival, for testing the chat path.
+    say: Vec<String>,
     started: Option<Instant>,
 }
 
@@ -200,9 +205,12 @@ impl ApplicationHandler for App {
         let Some(state) = state else { return };
         let Some(launcher) = launcher else { return };
 
-        // While flying, input belongs to the world rather than to egui.
-        let flying = world.as_ref().is_some_and(|w| w.captured);
-        if !flying {
+        // In a world, input belongs to the world. The overlay covers the whole
+        // window, so letting egui see events first meant it swallowed every
+        // click and the mouse could never be captured.
+        let in_world = world.is_some();
+        let typing = world.as_ref().is_some_and(|w| w.chat.is_open());
+        if !in_world {
             let response = state.egui_winit.on_window_event(&state.gpu.window, &event);
             if response.repaint {
                 state.gpu.window.request_redraw();
@@ -211,6 +219,7 @@ impl ApplicationHandler for App {
                 return;
             }
         }
+        let _ = typing;
 
         // A join can only be started here, where the GPU lives.
         if let Some(pending) = launcher.pending_join.take() {
@@ -241,6 +250,20 @@ impl ApplicationHandler for App {
                 if let Some((path, after)) = &self.shot {
                     let elapsed = started.get_or_insert_with(Instant::now).elapsed();
                     if elapsed >= *after {
+                        // Anything the caller asked to be said on arrival, for
+                        // checking the chat path without a person at the
+                        // keyboard.
+                        if let Some(w) = world.as_mut() {
+                            for line in self.say.drain(..) {
+                                match line.strip_prefix('/') {
+                                    Some(cmd) if !cmd.is_empty() => w
+                                        .session
+                                        .send(session::Outgoing::Command(cmd.to_string())),
+                                    _ => w.session.send(session::Outgoing::Chat(line)),
+                                }
+                            }
+                        }
+
                         if let (Some(w), Some((pos, yaw, pitch))) = (world.as_mut(), self.view) {
                             w.camera.position = pos;
                             w.camera.yaw = yaw;
@@ -328,9 +351,34 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                let PhysicalKey::Code(code) = event.physical_key else { return };
                 let pressed = event.state == ElementState::Pressed;
+
+                // Typed characters, before key codes: a text field wants what
+                // the layout produced, not which physical key was pressed.
+                if pressed
+                    && let Some(w) = world.as_mut()
+                    && w.chat.is_open()
+                {
+                    if matches!(event.physical_key, PhysicalKey::Code(KeyCode::Backspace)) {
+                        w.backspace();
+                        state.gpu.window.request_redraw();
+                        return;
+                    }
+                    if let Some(text) = &event.text {
+                        w.type_text(text);
+                        state.gpu.window.request_redraw();
+                    }
+                }
+
+                let PhysicalKey::Code(code) = event.physical_key else { return };
                 if let Some(w) = world.as_mut() {
+                    // Escape while typing cancels the message, not the world.
+                    if pressed && code == KeyCode::Escape && w.chat.is_open() {
+                        w.key(code, pressed);
+                        set_capture(&state.gpu.window, w, true);
+                        state.gpu.window.request_redraw();
+                        return;
+                    }
                     if pressed && code == KeyCode::Escape {
                         // First Escape releases the mouse, a second leaves the
                         // world. Anything else strands the pointer.
@@ -345,13 +393,23 @@ impl ApplicationHandler for App {
                         }
                         return;
                     }
-                    w.key(code, pressed);
+                    // Opening chat releases the mouse so the pointer comes
+                    // back and typing does not also fly the camera.
+                    let was_typing = w.chat.is_open();
+                    if w.key(code, pressed) {
+                        set_capture(&state.gpu.window, w, false);
+                    } else if was_typing && !w.chat.is_open() {
+                        // Enter sent the message; go back to flying.
+                        set_capture(&state.gpu.window, w, true);
+                    }
+                    state.gpu.window.request_redraw();
                 }
             }
             WindowEvent::MouseInput { state: button_state, .. } => {
                 if let Some(w) = world.as_mut()
                     && button_state == ElementState::Pressed
                     && !w.captured
+                    && !w.chat.is_open()
                 {
                     set_capture(&state.gpu.window, w, true);
                 }
@@ -434,12 +492,19 @@ fn start_world(
 fn set_capture(window: &Window, world: &mut WorldView, capture: bool) {
     if capture {
         // Locked is what a game wants; some platforms only offer Confined.
-        let locked = window
+        let grabbed = window
             .set_cursor_grab(CursorGrabMode::Locked)
             .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
             .is_ok();
-        window.set_cursor_visible(!locked);
-        world.captured = locked;
+        window.set_cursor_visible(!grabbed);
+        // Looking around is driven by raw device motion, which arrives whether
+        // or not the platform would let us pin the pointer. Refusing to look
+        // just because the grab failed would be worse than a cursor that
+        // wanders off the window.
+        world.captured = true;
+        if !grabbed {
+            world.chat.note("Could not lock the mouse pointer; look still works.");
+        }
     } else {
         let _ = window.set_cursor_grab(CursorGrabMode::None);
         window.set_cursor_visible(true);
@@ -480,6 +545,8 @@ fn draw_into(
     let raw_input = state.egui_winit.take_egui_input(&state.gpu.window);
     let hud = world.as_ref().zip(renderer.as_ref()).map(|(w, r)| Hud {
         debug: w.show_debug.then(|| w.debug_lines(r)),
+        chat: w.chat.visible().cloned().collect(),
+        input: w.chat.input().map(str::to_string),
     });
     let mut output = state.egui_ctx.run_ui(raw_input, |ui| match &hud {
         // In a world, egui draws only the overlay.
@@ -626,6 +693,9 @@ fn draw_into(
 struct Hud {
     /// Present when the debug panel is up.
     debug: Option<Vec<String>>,
+    chat: Vec<Vec<neuton_net::Span>>,
+    /// The line being typed, if chat is open.
+    input: Option<String>,
 }
 
 /// The in-world overlay: a crosshair, and the debug panel when it is up.
@@ -662,12 +732,14 @@ fn overlay(ui: &mut egui::Ui, hud: &Hud) {
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                 ui.label(
                     egui::RichText::new(
-                        "WASD move  ·  space/ctrl height  ·  shift sprint  ·  F3 debug  ·  esc release",
+                        "WASD move  ·  space/ctrl height  ·  shift sprint  ·  T chat  ·  / command  ·  F3 debug  ·  esc release",
                     )
                     .monospace()
                     .size(11.0)
                     .color(egui::Color32::from_white_alpha(120)),
                 );
+                ui.add_space(4.0);
+                chat_panel(ui, hud);
             });
         });
 }
@@ -846,4 +918,57 @@ fn capture_frame(
         }
     }
     Some(out)
+}
+
+/// The chat log, and the input line when it is open.
+fn chat_panel(ui: &mut egui::Ui, hud: &Hud) {
+    // Bottom-up layout, so the input sits below the log and the log grows
+    // upwards the way it does in the game.
+    if let Some(input) = &hud.input {
+        egui::Frame::new()
+            .fill(egui::Color32::from_black_alpha(170))
+            .inner_margin(egui::Margin::symmetric(6, 3))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{input}_"))
+                            .monospace()
+                            .size(13.0)
+                            .color(egui::Color32::WHITE),
+                    );
+                });
+            });
+        ui.add_space(2.0);
+    }
+
+    for spans in hud.chat.iter().rev() {
+        egui::Frame::new()
+            .fill(egui::Color32::from_black_alpha(120))
+            .inner_margin(egui::Margin::symmetric(6, 1))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    for span in spans {
+                        let mut text = egui::RichText::new(&span.text).monospace().size(12.5);
+                        text = match span.color {
+                            Some([r, g, b]) => text.color(egui::Color32::from_rgb(r, g, b)),
+                            None => text.color(egui::Color32::from_rgb(0xE8, 0xE8, 0xE8)),
+                        };
+                        if span.bold {
+                            text = text.strong();
+                        }
+                        if span.italic {
+                            text = text.italics();
+                        }
+                        if span.strikethrough {
+                            text = text.strikethrough();
+                        }
+                        if span.underlined {
+                            text = text.underline();
+                        }
+                        ui.label(text);
+                    }
+                });
+            });
+    }
 }

@@ -1,8 +1,10 @@
 //! Flying around a live world.
 
-use crate::session::{WorldEvent, WorldSession};
+use crate::chat::Chat;
+use crate::session::{Outgoing, WorldEvent, WorldSession};
 use neuton_render::{Camera, WorldRenderer};
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 use winit::keyboard::KeyCode;
 
 /// Blocks per second at a walk, and the multiplier while sprinting.
@@ -27,6 +29,15 @@ pub struct WorldView {
     /// Smoothed frame time, so the number on screen is readable rather than
     /// flickering through every stutter.
     frame_ms_avg: f32,
+    pub chat: Chat,
+    /// When the last movement update went out, and what it said.
+    last_move_sent: Option<Instant>,
+    last_position: Option<[f64; 3]>,
+    last_rotation: Option<(f32, f32)>,
+    /// Ticks since anything about the player changed.
+    idle_ticks: u32,
+    /// Whether the server has been told the world finished loading.
+    reported_loaded: bool,
 }
 
 impl WorldView {
@@ -41,18 +52,92 @@ impl WorldView {
             last_frame_ms: 0.0,
             show_debug: true,
             frame_ms_avg: 0.0,
+            chat: Chat::default(),
+            last_move_sent: None,
+            last_position: None,
+            last_rotation: None,
+            idle_ticks: 0,
+            reported_loaded: false,
         }
     }
 
-    pub fn key(&mut self, code: KeyCode, pressed: bool) {
-        if pressed && code == KeyCode::F3 {
-            self.show_debug = !self.show_debug;
-            return;
+    /// Handles a key. Returns true if it wants the mouse released, which is
+    /// what opening chat does.
+    pub fn key(&mut self, code: KeyCode, pressed: bool) -> bool {
+        // While typing, keys belong to the text field and nothing else.
+        if self.chat.is_open() {
+            if !pressed {
+                return false;
+            }
+            match code {
+                KeyCode::Escape => self.chat.close(),
+                KeyCode::Enter | KeyCode::NumpadEnter => self.submit_chat(),
+                KeyCode::ArrowUp => self.chat.history_back(),
+                KeyCode::ArrowDown => self.chat.history_forward(),
+                _ => {}
+            }
+            return false;
         }
+
         if pressed {
+            match code {
+                KeyCode::F3 => {
+                    self.show_debug = !self.show_debug;
+                    return false;
+                }
+                // T for chat and slash for a command, as in the game.
+                KeyCode::KeyT => {
+                    self.chat.open("");
+                    self.held.clear();
+                    return true;
+                }
+                KeyCode::Slash => {
+                    self.chat.open("/");
+                    self.held.clear();
+                    return true;
+                }
+                _ => {}
+            }
             self.held.insert(code);
         } else {
             self.held.remove(&code);
+        }
+        false
+    }
+
+    /// Appends typed text to the input line.
+    ///
+    /// Driven from the key event's own text rather than from a key code, so
+    /// layouts, modifiers and dead keys all resolve to the character the user
+    /// actually meant.
+    pub fn type_text(&mut self, text: &str) {
+        let Some(input) = self.chat.input_mut() else { return };
+        for c in text.chars() {
+            // Control characters arrive here too; enter and escape are handled
+            // as keys and would otherwise be inserted literally.
+            if !c.is_control() && input.chars().count() < 256 {
+                input.push(c);
+            }
+        }
+    }
+
+    /// Deletes the last character of the input line.
+    pub fn backspace(&mut self) {
+        if let Some(input) = self.chat.input_mut() {
+            input.pop();
+        }
+    }
+
+    /// Sends whatever is in the input line.
+    fn submit_chat(&mut self) {
+        let Some(text) = self.chat.submit() else { return };
+        match text.strip_prefix('/') {
+            // Commands go in their own packet, which carries no signature and
+            // so works on servers that refuse unsigned chat.
+            Some(command) if !command.is_empty() => {
+                self.session.send(Outgoing::Command(command.to_string()));
+            }
+            _ => self.session.send(Outgoing::Chat(text)),
         }
     }
 
@@ -83,6 +168,53 @@ impl WorldView {
             axis(KeyCode::Space, KeyCode::ControlLeft) * speed,
         );
 
+        // The server is told where we are about twenty times a second, which is
+        // the rate the game itself uses. Less often and chunk loading lags
+        // behind the camera; more often is just traffic.
+        const MOVE_INTERVAL: Duration = Duration::from_millis(50);
+        if self.placed && self.last_move_sent.is_none_or(|t| t.elapsed() >= MOVE_INTERVAL) {
+            self.last_move_sent = Some(Instant::now());
+
+            let [x, y, z] = self.camera.position;
+            // The camera sits at eye height; the server wants the feet.
+            let position = [x as f64, (y - 1.62) as f64, z as f64];
+            let rotation = (self.camera.yaw, self.camera.pitch);
+
+            // Only report what changed. Claiming to have turned every tick when
+            // the view has not moved is what anti-cheat flags as a duplicate
+            // look, and it is a fair thing to flag.
+            let moved = self.last_position.is_none_or(|last| {
+                let d = [position[0] - last[0], position[1] - last[1], position[2] - last[2]];
+                d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 4.0e-8
+            });
+            let turned = self
+                .last_rotation
+                .is_none_or(|(yaw, pitch)| yaw != rotation.0 || pitch != rotation.1);
+
+            if moved {
+                self.last_position = Some(position);
+            }
+            if turned {
+                self.last_rotation = Some(rotation);
+            }
+            // Standing still and looking the same way needs no packet most
+            // ticks. The game sends a bare status update about once a second to
+            // show it is still there; sending one every tick is noise that
+            // anti-cheat reads as a client not running a real game loop.
+            self.idle_ticks = if moved || turned { 0 } else { self.idle_ticks + 1 };
+            if moved || turned || self.idle_ticks >= 20 {
+                if self.idle_ticks >= 20 {
+                    self.idle_ticks = 0;
+                }
+                self.session.send(Outgoing::Move {
+                    position: moved.then_some(position),
+                    rotation: turned.then_some(rotation),
+                });
+            }
+            // Every tick ends, whatever happened in it.
+            self.session.send(Outgoing::TickEnd);
+        }
+
         for event in self.session.drain() {
             match event {
                 WorldEvent::Joined { .. } => {
@@ -99,9 +231,16 @@ impl WorldView {
                         self.camera.position = [x as f32, y as f32 + 1.62, z as f32];
                         self.camera.yaw = yaw;
                         self.camera.pitch = pitch;
+                        if !self.reported_loaded {
+                            self.reported_loaded = true;
+                            self.session.send(Outgoing::Loaded);
+                        }
                     }
                 }
-                WorldEvent::Disconnected(_) => {}
+                WorldEvent::Chat(spans) => self.chat.push(spans),
+                WorldEvent::Disconnected(why) => {
+                    self.chat.note(format!("Disconnected: {why}"));
+                }
             }
         }
     }

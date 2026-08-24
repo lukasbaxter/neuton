@@ -51,10 +51,14 @@ impl Camera {
     }
 
     /// Unit vector to the camera's right, on the horizontal plane.
+    ///
+    /// This is `forward x up`, not `up x forward`. Facing south, right is west,
+    /// and getting the sign backwards swaps A and D without failing any test
+    /// that only checks the two are perpendicular.
     pub fn right(&self) -> [f32; 3] {
         let yaw = self.yaw.to_radians();
         let (sy, cy) = yaw.sin_cos();
-        [cy, 0.0, sy]
+        [-cy, 0.0, -sy]
     }
 
     pub fn view(&self) -> Mat4 {
@@ -284,6 +288,35 @@ mod tests {
             let c = Camera { yaw, pitch: 0.0, ..Default::default() };
             assert!(dot(c.forward(), c.right()).abs() < 1e-5, "yaw {yaw}");
         }
+    }
+
+    #[test]
+    fn right_points_right_and_not_left() {
+        // Perpendicularity alone is true of both signs, which is how a swapped
+        // pair of strafe keys passes a test suite.
+        let c = Camera { yaw: 0.0, pitch: 0.0, ..Default::default() };
+        // Facing south (+Z), your right hand points west (-X).
+        assert!(close(c.right(), [-1.0, 0.0, 0.0], 1e-5), "{:?}", c.right());
+
+        // And it agrees with the cross product it is shorthand for.
+        for yaw in [0.0, 45.0, 137.0, 300.0] {
+            let c = Camera { yaw, pitch: 0.0, ..Default::default() };
+            let expected = cross(c.forward(), [0.0, 1.0, 0.0]);
+            assert!(close(c.right(), expected, 1e-5), "yaw {yaw}: {:?}", c.right());
+        }
+    }
+
+    #[test]
+    fn strafing_right_moves_the_way_you_would_expect() {
+        // Facing south, strafing right takes you west.
+        let mut c = Camera { position: [0.0, 64.0, 0.0], yaw: 0.0, pitch: 0.0, ..Default::default() };
+        c.fly(0.0, 3.0, 0.0);
+        assert!(close(c.position, [-3.0, 64.0, 0.0], 1e-4), "{:?}", c.position);
+
+        // Facing east, strafing right takes you south.
+        let mut c = Camera { position: [0.0, 64.0, 0.0], yaw: 270.0, pitch: 0.0, ..Default::default() };
+        c.fly(0.0, 3.0, 0.0);
+        assert!(close(c.position, [0.0, 64.0, 3.0], 1e-3), "{:?}", c.position);
     }
 
     #[test]
