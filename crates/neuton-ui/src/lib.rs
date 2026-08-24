@@ -54,8 +54,18 @@ pub fn run_screenshot(
     session: neuton_auth::Session,
     path: std::path::PathBuf,
     after: std::time::Duration,
+    view: Option<([f32; 3], f32, f32)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_with(Some(app::PendingJoin { host, port, session }), Some((path, after)))
+    let mut app = App {
+        direct: Some(app::PendingJoin { host, port, session }),
+        shot: Some((path, after)),
+        view,
+        ..Default::default()
+    };
+    let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+    event_loop.run_app(&mut app)?;
+    Ok(())
 }
 
 fn run_with(
@@ -86,6 +96,9 @@ struct App {
     direct: Option<app::PendingJoin>,
     /// Where to write a screenshot, and how long to wait for the world first.
     shot: Option<(std::path::PathBuf, std::time::Duration)>,
+    /// A camera to force, rather than following the player's spawn. For looking
+    /// at a particular thing from a script.
+    view: Option<([f32; 3], f32, f32)>,
     started: Option<Instant>,
 }
 
@@ -220,6 +233,12 @@ impl ApplicationHandler for App {
                 if let Some((path, after)) = &self.shot {
                     let elapsed = started.get_or_insert_with(Instant::now).elapsed();
                     if elapsed >= *after {
+                        if let (Some(w), Some((pos, yaw, pitch))) = (world.as_mut(), self.view) {
+                            w.camera.position = pos;
+                            w.camera.yaw = yaw;
+                            w.camera.pitch = pitch;
+                        }
+
                         // The window's own size, so the capture matches what
                         // is on screen rather than laying the interface out for
                         // one resolution and rendering it at another.

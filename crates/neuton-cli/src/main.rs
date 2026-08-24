@@ -142,15 +142,42 @@ fn play(
         }
     };
     match shot {
-        Some((path, after)) => {
-            neuton_ui::run_screenshot(host.to_string(), port, session, path, after)
-        }
+        Some((path, after)) => neuton_ui::run_screenshot(
+            host.to_string(),
+            port,
+            session,
+            path,
+            after,
+            camera_override(&args_vec()),
+        ),
         None => neuton_ui::run_direct(host.to_string(), port, session),
     }
 }
 
 /// `--offline <name>` runs the join without Microsoft auth, for testing
 /// against a development server.
+fn args_vec() -> Vec<String> {
+    std::env::args().skip(1).collect()
+}
+
+/// `--at x,y,z` and `--look yaw,pitch` place the camera for a screenshot.
+fn camera_override(args: &[String]) -> Option<([f32; 3], f32, f32)> {
+    let numbers = |flag: &str| -> Option<Vec<f32>> {
+        let i = args.iter().position(|a| a == flag)?;
+        Some(args.get(i + 1)?.split(',').filter_map(|p| p.trim().parse().ok()).collect())
+    };
+    let at = numbers("--at")?;
+    if at.len() != 3 {
+        return None;
+    }
+    let look = numbers("--look").unwrap_or_default();
+    Some((
+        [at[0], at[1], at[2]],
+        look.first().copied().unwrap_or(0.0),
+        look.get(1).copied().unwrap_or(0.0),
+    ))
+}
+
 /// `--shot <path> [seconds]` renders one frame and exits.
 fn shot_path(args: &[String]) -> Option<(std::path::PathBuf, Duration)> {
     let i = args.iter().position(|a| a == "--shot")?;
@@ -387,6 +414,7 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
     );
     let mut mesh_time = Duration::ZERO;
     let mut triangles: u64 = 0;
+    let mut translucent_tris: u64 = 0;
     let mut vertices: u64 = 0;
     let mut histogram: std::collections::HashMap<&'static str, u64> = Default::default();
     let mut lit_samples: Vec<String> = Vec::new();
@@ -453,6 +481,7 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
                 let mesh = neuton_render::build(&c, &appearance, &textures);
                 mesh_time += t.elapsed();
                 triangles += mesh.triangles() as u64;
+                translucent_tris += (mesh.translucent.len() / 3) as u64;
                 vertices += mesh.vertices.len() as u64;
 
                 if conn.stats.chunks <= 3 || conn.stats.chunks % 100 == 0 {
@@ -506,6 +535,10 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
     if s.chunks > 0 {
         println!("\nmeshing");
         println!("  triangles {triangles} ({vertices} vertices)");
+        println!(
+            "  of which  {translucent_tris} translucent ({:.1}%)",
+            translucent_tris as f64 / triangles.max(1) as f64 * 100.0
+        );
         println!(
             "  time      {:.0} ms total, {:.2} ms per chunk",
             mesh_time.as_secs_f64() * 1000.0,
