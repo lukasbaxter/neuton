@@ -9,6 +9,7 @@
 //!   cargo run -p neuton-datagen -- [--mc-dir <dir>] [--java <path>]
 
 mod blocks;
+mod breaking;
 mod items;
 mod packets;
 mod paths;
@@ -74,6 +75,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     packets::generate(&ctx)?;
     blocks::generate(&ctx)?;
     items::generate(&ctx)?;
+    // Needs the jar itself, not the reports: hardness is in code and the
+    // mineable tags are in the built-in data pack.
+    breaking::generate(&ctx, &env.java, &env.classpath()?, &env.jar())?;
 
     println!("datagen: done");
     Ok(())

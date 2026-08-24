@@ -8,13 +8,19 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.SharedConstants;
 import net.minecraft.tags.BlockTags;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 
 public final class DumpHardness {
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
+        // Written to a file rather than stdout: the game logs a line of its own
+        // on the way up, and mixing that into the output is a parsing problem
+        // nobody needs.
+        Path out_path = Path.of(args[0]);
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
         StringBuilder out = new StringBuilder();
@@ -39,6 +45,6 @@ public final class DumpHardness {
             }
         }
         out.append("\n]\n");
-        System.out.println(out);
+        Files.writeString(out_path, out.toString());
     }
 }

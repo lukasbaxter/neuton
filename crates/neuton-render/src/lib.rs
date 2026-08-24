@@ -8,5 +8,8 @@ pub mod textures;
 pub use appearance::Appearance;
 pub use camera::{Camera, Frustum, Mat4};
 pub use renderer::WorldRenderer;
-pub use textures::{BakedElement, BakedFace, BakedModel, BiomeTints, BlockTextures};
+pub use textures::{
+    BakedElement, BakedFace, BakedModel, BiomeTints, BlockTextures, DESTROY_STAGES,
+    destroy_stage_texture,
+};
 pub use mesh::{BlockAppearance, Face, Mesh, Neighbours, Vertex, build, build_at, build_full};
