@@ -43,6 +43,13 @@ pub struct Element {
     pub to: [f32; 3],
     /// down, up, north, south, west, east.
     pub faces: [Option<FaceDef>; 6],
+    /// Rotation from the blockstate, in degrees.
+    ///
+    /// Per element rather than per model: a fence is a post plus one arm for
+    /// each side it connects to, and each arm is the same model turned a
+    /// different way.
+    pub x_rot: i32,
+    pub y_rot: i32,
 }
 
 impl Element {
@@ -56,9 +63,6 @@ impl Element {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BlockModel {
     pub elements: Vec<Element>,
-    /// Rotation from the blockstate variant, in degrees.
-    pub x_rot: i32,
-    pub y_rot: i32,
 }
 
 impl BlockModel {
@@ -122,10 +126,21 @@ impl ModelResolver {
         }
         let state = self.blockstates.get(&path)?.clone();
 
-        let (model, x_rot, y_rot) = pick_model(&state, variant)?;
-        let textures = self.resolve_chain(packs, &model)?;
-        let elements = self.resolve_elements(packs, &model, &textures)?;
-        Some(BlockModel { elements, x_rot, y_rot })
+        // A multipart block is the union of every part whose condition holds,
+        // which is how a fence grows an arm towards each neighbour it connects
+        // to and a vine sticks to whichever walls are there.
+        let parts = pick_parts(&state, variant);
+        let mut elements = Vec::new();
+        for (model, x_rot, y_rot) in parts {
+            let Some(textures) = self.resolve_chain(packs, &model) else { continue };
+            let Some(part) = self.resolve_elements(packs, &model, &textures) else { continue };
+            elements.extend(part.into_iter().map(|mut e| {
+                e.x_rot = x_rot;
+                e.y_rot = y_rot;
+                e
+            }));
+        }
+        (!elements.is_empty()).then_some(BlockModel { elements })
     }
 
     /// Finds the child-most `elements` in the parent chain and resolves its
@@ -213,40 +228,67 @@ impl ModelResolver {
     }
 }
 
-/// Chooses a model from a blockstate file for the given property string.
+/// Every model that applies to a block state, with its rotation.
 ///
-/// A blockstate key lists only the properties that change the model, so a
-/// stair's variants are keyed on facing, half and shape and say nothing about
-/// waterlogged. Comparing whole strings therefore never matches, and silently
-/// falls through to whichever variant happens to be first: every stair in the
-/// world faces the same way.
-///
-/// A key matches when every property it names agrees with the block state.
-fn pick_model(state: &serde_json::Value, variant: &str) -> Option<(String, i32, i32)> {
+/// A `variants` blockstate contributes exactly one. A `multipart` one
+/// contributes every part whose condition holds, and taking only the first is
+/// why fences did not connect and every vine faced the same way.
+fn pick_parts(state: &serde_json::Value, variant: &str) -> Vec<(String, i32, i32)> {
+    let properties = parse_properties(variant);
+
     if let Some(variants) = state.get("variants").and_then(|v| v.as_object()) {
-        let properties = parse_properties(variant);
+        // A blockstate key lists only the properties that change the model, so
+        // a stair is keyed on facing, half and shape and says nothing about
+        // waterlogged. Comparing whole strings therefore never matches.
         let chosen = variants
             .iter()
             .find(|(key, _)| matches(key, &properties))
-            // Nothing matched, which means the blockstate names a property this
-            // build does not know about. Drawing something is better than
-            // drawing nothing.
             .map(|(_, value)| value)
             .or_else(|| variants.get(""))
-            .or_else(|| variants.values().next())?;
-        return model_name(chosen);
+            .or_else(|| variants.values().next());
+        return chosen.and_then(model_name).into_iter().collect();
     }
-    // Multipart blocks (fences, walls, redstone) describe themselves as a set
-    // of conditional pieces. Taking the first is wrong in shape but gives the
-    // right textures, which is all this stage uses.
+
     if let Some(parts) = state.get("multipart").and_then(|m| m.as_array()) {
-        for part in parts {
-            if let Some(name) = part.get("apply").and_then(model_name) {
-                return Some(name);
-            }
-        }
+        return parts
+            .iter()
+            .filter(|part| match part.get("when") {
+                // No condition means the part is always there, like a fence
+                // post.
+                None => true,
+                Some(condition) => holds(condition, &properties),
+            })
+            .filter_map(|part| part.get("apply").and_then(model_name))
+            .collect();
     }
-    None
+    Vec::new()
+}
+
+/// Evaluates a multipart condition.
+///
+/// A condition is a set of property tests that must all hold, or an explicit
+/// `OR` or `AND` of further conditions. A test's value may itself be several
+/// alternatives separated by `|`.
+fn holds(condition: &serde_json::Value, properties: &[(&str, &str)]) -> bool {
+    let Some(object) = condition.as_object() else { return false };
+
+    if let Some(list) = object.get("OR").and_then(|v| v.as_array()) {
+        return list.iter().any(|c| holds(c, properties));
+    }
+    if let Some(list) = object.get("AND").and_then(|v| v.as_array()) {
+        return list.iter().all(|c| holds(c, properties));
+    }
+
+    object.iter().all(|(name, expected)| {
+        let Some(expected) = expected.as_str() else { return false };
+        let actual = properties.iter().find(|(n, _)| n == name).map(|(_, v)| *v);
+        match actual {
+            // Any of the alternatives will do.
+            Some(actual) => expected.split('|').any(|option| option == actual),
+            // A property the state does not have cannot satisfy a test on it.
+            None => false,
+        }
+    })
 }
 
 /// Splits `"facing=east,half=bottom"` into pairs.
@@ -335,7 +377,7 @@ fn parse_elements(
                         .and_then(face_index),
                 });
             }
-            Some(Element { from, to, faces })
+            Some(Element { from, to, faces, x_rot: 0, y_rot: 0 })
         })
         .collect()
 }
@@ -474,11 +516,11 @@ mod tests {
         assert_eq!(faces[0].as_ref().unwrap().texture, "assets/minecraft/textures/block/oak_log_top.png");
         assert_eq!(faces[2].as_ref().unwrap().texture, "assets/minecraft/textures/block/oak_log.png");
         assert_eq!(m.textures().len(), 2);
-        assert_eq!((m.x_rot, m.y_rot), (0, 0));
+        assert_eq!((m.elements[0].x_rot, m.elements[0].y_rot), (0, 0));
 
         // The horizontal variant carries the rotation the blockstate asked for.
         let sideways = r.model(&mut packs, "minecraft:oak_log", "axis=x").unwrap();
-        assert_eq!((sideways.x_rot, sideways.y_rot), (90, 90));
+        assert_eq!((sideways.elements[0].x_rot, sideways.elements[0].y_rot), (90, 90));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -527,18 +569,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A fence: a post that is always there, plus one arm per connected side.
+    fn fence_pack(tag: &str) -> (PathBuf, PackStack) {
+        pack(tag, &[
+            ("assets/minecraft/blockstates/fence.json", r##"{"multipart":[
+                {"apply":{"model":"minecraft:block/post"}},
+                {"when":{"north":"true"},"apply":{"model":"minecraft:block/side"}},
+                {"when":{"east":"true"},"apply":{"model":"minecraft:block/side","y":90}},
+                {"when":{"south":"true"},"apply":{"model":"minecraft:block/side","y":180}},
+                {"when":{"west":"true"},"apply":{"model":"minecraft:block/side","y":270}}]}"##),
+            ("assets/minecraft/models/block/post.json", r##"{"textures":{"t":"block/planks"},"elements":[
+                {"from":[6,0,6],"to":[10,16,10],"faces":{"up":{"texture":"#t"}}}]}"##),
+            ("assets/minecraft/models/block/side.json", r##"{"textures":{"t":"block/planks"},"elements":[
+                {"from":[7,6,0],"to":[9,9,6],"faces":{"up":{"texture":"#t"}}}]}"##),
+        ])
+    }
+
     #[test]
-    fn multipart_blocks_still_resolve() {
-        let (dir, mut packs) = pack("multipart", &[
-            ("assets/minecraft/blockstates/fence.json", r##"{"multipart":[{"apply":{"model":"minecraft:block/fence_post"}}]}"##),
-            ("assets/minecraft/models/block/fence_post.json", r##"{"textures":{"texture":"minecraft:block/oak_planks"},"elements":[
-                {"from":[6,0,6],"to":[10,16,10],"faces":{"up":{"texture":"#texture"}}}]}"##),
-        ]);
+    fn a_fence_grows_an_arm_for_each_connection() {
+        let (dir, mut packs) = fence_pack("fence");
         let mut r = ModelResolver::new();
-        let m = r.model(&mut packs, "minecraft:fence", "").unwrap();
-        assert_eq!(m.textures(), vec!["assets/minecraft/textures/block/oak_planks.png"]);
-        assert!(!m.elements[0].is_full_cube());
+
+        // Standing alone: just the post.
+        let alone = r
+            .model(&mut packs, "minecraft:fence", "east=false,north=false,south=false,west=false")
+            .unwrap();
+        assert_eq!(alone.elements.len(), 1);
+
+        // Connected two ways: the post and two arms, turned differently.
+        let joined = r
+            .model(&mut packs, "minecraft:fence", "east=true,north=true,south=false,west=false")
+            .unwrap();
+        assert_eq!(joined.elements.len(), 3, "post plus two arms");
+        let mut turns: Vec<i32> = joined.elements.iter().map(|e| e.y_rot).collect();
+        turns.sort();
+        assert_eq!(turns, vec![0, 0, 90], "each arm faces its own way");
+
+        // All four.
+        let all = r
+            .model(&mut packs, "minecraft:fence", "east=true,north=true,south=true,west=true")
+            .unwrap();
+        assert_eq!(all.elements.len(), 5);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multipart_conditions_understand_or_and_alternatives() {
+        let props = parse_properties("north=true,east=false,facing=up");
+        assert!(holds(&serde_json::json!({"north": "true"}), &props));
+        assert!(!holds(&serde_json::json!({"north": "false"}), &props));
+        // Several properties in one condition must all hold.
+        assert!(holds(&serde_json::json!({"north": "true", "east": "false"}), &props));
+        assert!(!holds(&serde_json::json!({"north": "true", "east": "true"}), &props));
+        // Alternatives separated by a bar.
+        assert!(holds(&serde_json::json!({"facing": "up|down"}), &props));
+        assert!(!holds(&serde_json::json!({"facing": "north|south"}), &props));
+        // Explicit OR and AND.
+        assert!(holds(
+            &serde_json::json!({"OR": [{"north": "false"}, {"east": "false"}]}),
+            &props
+        ));
+        assert!(!holds(
+            &serde_json::json!({"AND": [{"north": "true"}, {"east": "true"}]}),
+            &props
+        ));
+        // A property the state does not have cannot satisfy a test on it.
+        assert!(!holds(&serde_json::json!({"nonsense": "true"}), &props));
     }
 
     #[test]
@@ -576,11 +672,11 @@ mod tests {
 
         let east = r.model(&mut packs, "minecraft:s", "facing=east,waterlogged=false").unwrap();
         assert_eq!(east.textures(), vec!["assets/minecraft/textures/block/e.png"]);
-        assert_eq!(east.y_rot, 0);
+        assert_eq!(east.elements[0].y_rot, 0);
 
         let west = r.model(&mut packs, "minecraft:s", "facing=west,waterlogged=true").unwrap();
         assert_eq!(west.textures(), vec!["assets/minecraft/textures/block/w.png"]);
-        assert_eq!(west.y_rot, 180);
+        assert_eq!(west.elements[0].y_rot, 180);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
