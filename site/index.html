@@ -94,6 +94,29 @@ footer{border-top:1px solid var(--line);padding:44px 0 64px}
 .disc{font-size:12px;color:var(--dim);line-height:1.8;max-width:700px}
 .disc b{color:var(--mid);font-family:var(--mono);font-size:11.5px;letter-spacing:.04em}
 code{font-family:var(--mono);font-size:.92em;color:var(--acc)}
+.repo{display:block;border:1px solid var(--line);background:var(--card);border-radius:11px;padding:22px 24px;color:inherit}
+.repo:hover{border-color:var(--line2);background:var(--raise);text-decoration:none}
+.repo-h{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+.repo-h .gh{width:17px;height:17px;fill:var(--mid);flex:none}
+.repo-n{font-family:var(--mono);font-size:15px;color:var(--acc)}
+.repo-n b{font-weight:600}
+.repo-n span{color:var(--mid);font-weight:400}
+.badge{font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);border:1px solid var(--line2);border-radius:20px;padding:2px 10px}
+.repo-d{color:var(--mid);font-size:14.5px;max-width:none;margin-bottom:18px}
+.bars{display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--line);margin-bottom:15px}
+.bars i{height:100%}
+.repo-s{display:flex;gap:20px;flex-wrap:wrap;align-items:center;font-family:var(--mono);font-size:12.5px;color:var(--dim)}
+.repo-s b{color:var(--fg);font-weight:500}
+.lang{display:inline-flex;align-items:center;gap:7px;color:var(--mid)}
+.lang::before{content:"";width:9px;height:9px;border-radius:50%;background:var(--c,var(--line2))}
+
+.commits{list-style:none;margin-top:14px;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+.commits li{display:grid;grid-template-columns:76px 1fr auto;gap:18px;align-items:baseline;padding:12px 20px;border-bottom:1px solid var(--line);background:var(--card)}
+.commits li:last-child{border-bottom:none}
+.commits .sha{font-family:var(--mono);font-size:12.5px;color:var(--acc)}
+.commits .msg{color:var(--mid);font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.commits .when{font-family:var(--mono);font-size:11.5px;color:var(--dim);white-space:nowrap}
+@media(max-width:640px){.commits li{grid-template-columns:70px 1fr;gap:12px}.commits .when{display:none}}
 </style>
 </head>
 <body>
@@ -101,7 +124,7 @@ code{font-family:var(--mono);font-size:.92em;color:var(--acc)}
 <nav><div class="w">
   <a class="mark" href="#top">neuton</a>
   <div class="links">
-    <a href="#rust">rust</a><a href="#build">build</a><a href="#status">status</a><a href="#accounts">accounts</a>
+    <a href="#rust">rust</a><a href="#build">build</a><a href="#source">source</a><a href="#status">status</a><a href="#accounts">accounts</a>
   </div>
 </div></nav>
 
@@ -183,6 +206,44 @@ play.notmiji.com:25565
   </table></div>
 </div></section>
 
+<section id="source"><div class="w">
+  <h2>Source</h2>
+  <p class="lede">Client, launcher, renderer and the datagen that feeds them are one workspace, MIT licensed, in the open. Nothing is held back behind a release page.</p>
+
+  <a class="repo" href="https://github.com/lukasbaxter/neuton" target="_blank" rel="noopener">
+    <div class="repo-h">
+      <svg class="gh" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg>
+      <span class="repo-n"><span>lukasbaxter</span> / <b>neuton</b></span>
+      <span class="badge">public</span>
+    </div>
+    <p class="repo-d" data-gh="desc">A Minecraft: Java Edition 26.2 client written from scratch in Rust. Multiplayer only.</p>
+    <div class="bars"><i style="width:98.9%;background:#dea584"></i><i style="width:1.1%;background:#e34c26"></i></div>
+    <div class="repo-s">
+      <span class="lang" style="--c:#dea584">Rust</span>
+      <span class="lang" style="--c:#e34c26">HTML</span>
+      <span>&#9733; <b data-gh="stars">0</b></span>
+      <span>forks <b data-gh="forks">0</b></span>
+      <span>MIT</span>
+      <span>pushed <b data-gh="pushed">24 Aug 2026</b></span>
+    </div>
+  </a>
+
+  <ul class="commits" id="commits">
+    <li><span class="sha">3816d12</span><span class="msg">Load resource packs, and resolve real block textures</span><span class="when">24 Aug 2026</span></li>
+    <li><span class="sha">b467fe4</span><span class="msg">Add the licence and genericise a test fixture before publishing</span><span class="when">24 Aug 2026</span></li>
+    <li><span class="sha">3776d4b</span><span class="msg">Mesh chunks: naive faces, with same-block culling</span><span class="when">24 Aug 2026</span></li>
+    <li><span class="sha">1b7300c</span><span class="msg">Make the launcher dialogs closable</span><span class="when">24 Aug 2026</span></li>
+  </ul>
+
+  <div class="term" style="margin-top:26px">
+    <div class="bar"><i></i><i></i><i></i></div>
+<pre><span class="p">$</span> <span class="k">git clone https://github.com/lukasbaxter/neuton</span>
+<span class="p">$</span> <span class="k">cd neuton &amp;&amp; cargo run --release</span>
+opening the launcher</pre>
+  </div>
+  <p class="cap" style="margin-bottom:0">Rust 1.90, edition 2024. <code>cargo run --release</code> with no arguments opens the launcher; <code>neuton ping</code>, <code>neuton login</code> and <code>neuton join</code> are the same binary.</p>
+</div></section>
+
 <section id="status"><div class="w">
   <h2>Status</h2>
   <div class="cols">
@@ -233,12 +294,47 @@ play.notmiji.com:25565
 </div></section>
 
 <footer><div class="w">
-  <div class="fl"><a href="#rust">rust</a><a href="#build">build</a><a href="#status">status</a><a href="#accounts">accounts</a><a href="#download">download</a></div>
+  <div class="fl"><a href="#rust">rust</a><a href="#build">build</a><a href="#source">source</a><a href="#status">status</a><a href="#accounts">accounts</a><a href="#download">download</a><a href="https://github.com/lukasbaxter/neuton" target="_blank" rel="noopener">github</a></div>
   <p class="disc">
     <b>NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.</b><br>
     Minecraft is a trademark of Mojang Synergies AB. neuton requires your own copy of Minecraft: Java Edition. It does not provide, replace or circumvent the game licence, and will not sign in an account that does not own the game.
   </p>
 </div></footer>
+
+<script>
+(function(){
+  var api='https://api.github.com/repos/lukasbaxter/neuton';
+  function ago(t){
+    var s=(Date.now()-new Date(t).getTime())/1000;
+    var u=[[31536000,'y'],[2592000,'mo'],[604800,'w'],[86400,'d'],[3600,'h'],[60,'m']];
+    for(var i=0;i<u.length;i++){if(s>=u[i][0])return Math.floor(s/u[i][0])+u[i][1]+' ago';}
+    return 'just now';
+  }
+  function set(k,v){var e=document.querySelector('[data-gh="'+k+'"]');if(e)e.textContent=v;}
+  function get(u){return fetch(u,{headers:{Accept:'application/vnd.github+json'}}).then(function(r){
+    if(!r.ok)throw 0; return r.json();});}
+
+  get(api).then(function(d){
+    if(d.description)set('desc',d.description);
+    set('stars',d.stargazers_count);
+    set('forks',d.forks_count);
+    if(d.pushed_at)set('pushed',ago(d.pushed_at));
+  }).catch(function(){});
+
+  get(api+'/commits?per_page=4').then(function(c){
+    if(!c.length)return;
+    var ul=document.getElementById('commits');
+    ul.textContent='';
+    c.forEach(function(x){
+      var li=document.createElement('li');
+      var a=document.createElement('span');a.className='sha';a.textContent=x.sha.slice(0,7);
+      var b=document.createElement('span');b.className='msg';b.textContent=x.commit.message.split('\n')[0];
+      var d=document.createElement('span');d.className='when';d.textContent=ago(x.commit.author.date);
+      li.appendChild(a);li.appendChild(b);li.appendChild(d);ul.appendChild(li);
+    });
+  }).catch(function(){});
+})();
+</script>
 
 </body>
 </html>

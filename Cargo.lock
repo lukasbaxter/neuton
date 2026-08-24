@@ -1525,6 +1525,7 @@ name = "neuton-assets"
 version = "0.1.0"
 dependencies = [
  "neuton-blocks",
+ "png",
  "serde_json",
  "zip",
 ]
@@ -1546,6 +1547,7 @@ version = "0.1.0"
 name = "neuton-cli"
 version = "0.1.0"
 dependencies = [
+ "neuton-assets",
  "neuton-auth",
  "neuton-blocks",
  "neuton-net",
@@ -1595,8 +1597,11 @@ name = "neuton-render"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "neuton-assets",
  "neuton-blocks",
  "neuton-world",
+ "png",
+ "wgpu",
 ]
 
 [[package]]
@@ -1606,9 +1611,12 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "neuton-assets",
  "neuton-auth",
  "neuton-net",
  "neuton-protocol",
+ "neuton-render",
+ "neuton-world",
  "png",
  "pollster",
  "serde",

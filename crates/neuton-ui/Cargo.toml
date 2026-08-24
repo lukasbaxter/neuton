@@ -17,3 +17,6 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 neuton-net = { version = "0.1.0", path = "../neuton-net" }
 neuton-protocol = { version = "0.1.0", path = "../neuton-protocol" }
+neuton-render = { version = "0.1.0", path = "../neuton-render" }
+neuton-world = { version = "0.1.0", path = "../neuton-world" }
+neuton-assets = { version = "0.1.0", path = "../neuton-assets" }
