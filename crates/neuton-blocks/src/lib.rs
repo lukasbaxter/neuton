@@ -7,7 +7,9 @@
 
 mod generated;
 
-pub use generated::blocks::{BLOCK_COUNT, BLOCKS, STATE_COUNT, STATE_TO_BLOCK, block};
+pub use generated::blocks::{
+    BLOCK_COUNT, BLOCKS, STATE_COUNT, STATE_TO_BLOCK, STATE_VARIANT, VARIANT_KEYS, block,
+};
 
 /// Index into [`BLOCKS`]. Not the same thing as a state ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -57,6 +59,19 @@ impl StateId {
     #[inline]
     pub fn variant_index(self) -> Option<u32> {
         Some(self.0 - self.block()?.get().first_state.0)
+    }
+
+    /// The blockstate property string for this state, e.g. `"axis=y"`.
+    ///
+    /// Empty for blocks with no properties. This is the key a blockstate file
+    /// uses for its variants, so it can be compared directly.
+    #[inline]
+    pub fn variant_key(self) -> &'static str {
+        STATE_VARIANT
+            .get(self.0 as usize)
+            .and_then(|&i| VARIANT_KEYS.get(i as usize))
+            .copied()
+            .unwrap_or("")
     }
 
     /// Air is state 0 and by far the most common state in any chunk, so the

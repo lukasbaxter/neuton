@@ -21,6 +21,10 @@ pub fn generate(ctx: &Ctx) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut blocks = Vec::with_capacity(doc.len());
     let mut state_count = 0usize;
+    // Blockstate files key their variants on a property string such as
+    // "axis=y" or "facing=north,half=top". Recording it per state is what lets
+    // the model resolver pick the right variant instead of guessing.
+    let mut variant_of: std::collections::BTreeMap<u32, String> = Default::default();
 
     for (name, value) in &doc {
         let states = value.get("states").and_then(|s| s.as_array()).ok_or("block with no states")?;
@@ -36,6 +40,24 @@ pub fn generate(ctx: &Ctx) -> Result<(), Box<dyn std::error::Error>> {
             && last - first + 1 != ids.len() as u32
         {
             return Err(format!("block {name} has non-contiguous state ids").into());
+        }
+
+        for state in states {
+            let Some(id) = state.get("id").and_then(|v| v.as_u64()) else { continue };
+            let mut pairs: Vec<String> = state
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|props| {
+                    props
+                        .iter()
+                        .filter_map(|(k, v)| Some(format!("{k}={}", v.as_str()?)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Vanilla writes these sorted, and the blockstate keys are matched
+            // as whole strings, so the order has to agree exactly.
+            pairs.sort();
+            variant_of.insert(id as u32, pairs.join(","));
         }
 
         let default_state = states
@@ -100,6 +122,37 @@ pub fn generate(ctx: &Ctx) -> Result<(), Box<dyn std::error::Error>> {
     }
     writeln!(out, "];\n")?;
 
+    // Property strings repeat heavily across blocks, so states index into a
+    // deduplicated table rather than each carrying its own copy.
+    let mut keys: Vec<String> = variant_of.values().cloned().collect();
+    keys.sort();
+    keys.dedup();
+    let key_index: std::collections::HashMap<&str, usize> =
+        keys.iter().enumerate().map(|(i, k)| (k.as_str(), i)).collect();
+    if keys.len() > u16::MAX as usize {
+        return Err("more distinct property strings than a u16 index can address".into());
+    }
+
+    writeln!(out, "/// Distinct blockstate property strings, e.g. `\"axis=y\"`.")?;
+    writeln!(out, "pub static VARIANT_KEYS: [&str; {}] = [", keys.len())?;
+    for chunk in keys.chunks(4) {
+        let line: Vec<String> = chunk.iter().map(|k| format!("{k:?}")).collect();
+        writeln!(out, "    {},", line.join(", "))?;
+    }
+    writeln!(out, "];\n")?;
+
+    writeln!(out, "/// Index into [`VARIANT_KEYS`] for every state ID.")?;
+    writeln!(out, "pub static STATE_VARIANT: [u16; STATE_COUNT] = [")?;
+    let mut indices = vec![0u16; state_count];
+    for (id, key) in &variant_of {
+        indices[*id as usize] = key_index[key.as_str()] as u16;
+    }
+    for chunk in indices.chunks(32) {
+        let line: Vec<String> = chunk.iter().map(u16::to_string).collect();
+        writeln!(out, "    {},", line.join(","))?;
+    }
+    writeln!(out, "];\n")?;
+
     writeln!(out, "/// Block indices by name, for code that needs to name a block.")?;
     writeln!(out, "pub mod block {{")?;
     writeln!(out, "    use super::BlockId;")?;
@@ -111,6 +164,10 @@ pub fn generate(ctx: &Ctx) -> Result<(), Box<dyn std::error::Error>> {
 
     let path = ctx.repo.join("crates/neuton-blocks/src/generated/blocks.rs");
     emit(&path, &out)?;
-    println!("  blocks        : {} blocks, {state_count} states", blocks.len());
+    println!(
+        "  blocks        : {} blocks, {state_count} states, {} variant keys",
+        blocks.len(),
+        keys.len()
+    );
     Ok(())
 }
