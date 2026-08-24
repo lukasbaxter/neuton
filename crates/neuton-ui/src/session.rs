@@ -11,7 +11,7 @@ use neuton_render::{Appearance, BiomeTints, BlockTextures, Mesh, Neighbours};
 use neuton_world::Chunk;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
 /// What the world view needs to know about.
@@ -34,9 +34,14 @@ pub enum WorldEvent {
     Chat(Vec<neuton_net::Span>),
     Abilities(neuton_world::physics::Abilities),
     /// A whole container's contents, the player's own inventory included.
-    Container { window: i32, slots: Vec<Option<Stack>>, carried: Option<Stack> },
+    Container {
+        window: i32,
+        state_id: i32,
+        slots: Vec<Option<Stack>>,
+        carried: Option<Stack>,
+    },
     /// One slot of one container.
-    Slot { window: i32, slot: i32, stack: Option<Stack> },
+    Slot { window: i32, state_id: i32, slot: i32, stack: Option<Stack> },
     /// The server picked a hotbar slot for us.
     HeldSlot(i32),
     Health { health: f32, food: i32 },
@@ -66,14 +71,18 @@ pub enum Outgoing {
     Swing,
     /// Start breaking a block.
     StartBreaking { at: [i32; 3], face: u8 },
-    /// Tell the server the swing is finished and the block should give.
-    FinishBreaking { at: [i32; 3] },
+    /// Give up on a block part way through breaking it.
+    AbortBreaking { at: [i32; 3] },
     /// Use what is in hand against a block: placing, opening, flipping.
     UseOn { at: [i32; 3], face: u8, cursor: [f32; 3] },
     /// Use what is in hand with nothing in front of it.
     Use { yaw: f32, pitch: f32 },
     /// Ask to be put back in the world after dying.
     Respawn,
+    /// Click a slot in an open container.
+    Click { window: i32, state_id: i32, slot: i16, button: u8, mode: i32 },
+    /// Close an open container.
+    CloseContainer { window: i32 },
 }
 
 /// How the world's arrival was spent, for telling network from client.
@@ -136,6 +145,13 @@ impl WorldSession {
             // this a column is meshed once per neighbour that arrives, which on
             // a fresh join is nearly three times more work than it needs.
             let mut meshed_with: HashMap<(i32, i32), usize> = HashMap::new();
+            let meshers = Meshers::start(
+                tx.clone(),
+                Arc::new(appearance),
+                textures.clone(),
+                Arc::new(biome_tints),
+                thread_stop.clone(),
+            );
             let mut timing = Timing::default();
             let mut last_report = std::time::Instant::now();
 
@@ -159,14 +175,20 @@ impl WorldSession {
                         Outgoing::StartBreaking { at, face } => {
                             conn.send_player_action(0, *at, *face)
                         }
-                        Outgoing::FinishBreaking { at } => {
-                            conn.send_player_action(2, *at, 1)
+                        Outgoing::AbortBreaking { at } => {
+                            conn.send_player_action(1, *at, 1)
                         }
                         Outgoing::UseOn { at, face, cursor } => {
                             conn.send_use_item_on(*at, *face, *cursor, false)
                         }
                         Outgoing::Use { yaw, pitch } => conn.send_use_item(*yaw, *pitch),
                         Outgoing::Respawn => conn.send_respawn(),
+                        Outgoing::Click { window, state_id, slot, button, mode } => {
+                            conn.send_container_click(*window, *state_id, *slot, *button, *mode)
+                        }
+                        Outgoing::CloseContainer { window } => {
+                            conn.send_close_container(*window)
+                        }
                     };
                     if let Err(e) = result {
                         let _ = tx.send(WorldEvent::Disconnected(e.to_string()));
@@ -178,26 +200,22 @@ impl WorldSession {
                 // the incoming burst has been drained: chunks arrive hundreds at
                 // a time, and re-meshing on every single one would do the same
                 // work four times over.
+                // Waiting for the socket to go quiet is what keeps a column
+                // from being meshed once per neighbour that arrives: on a join
+                // that is four times the work for the same result.
                 if !dirty.is_empty() && !conn.has_pending() {
                     let batch: Vec<(i32, i32)> = dirty.drain().collect();
                     for (x, z) in batch {
-                        let Some(chunk) = world.get(&(x, z)) else { continue };
+                        if !world.contains_key(&(x, z)) {
+                            continue;
+                        }
                         let present = neighbours_present(x, z, &world);
                         if meshed_with.get(&(x, z)).is_some_and(|had| *had >= present) {
                             continue;
                         }
                         meshed_with.insert((x, z), present);
-                        let t = std::time::Instant::now();
-                        let mesh =
-                            mesh_chunk(chunk, &world, &appearance, &textures, &biome_tints);
-                        timing.meshing_ms += t.elapsed().as_secs_f64() * 1000.0;
-                        timing.meshes += 1;
-                        let blocks = chunk.clone();
-                        if tx
-                            .send(WorldEvent::Chunk { x, z, mesh: Box::new(mesh), blocks })
-                            .is_err()
-                        {
-                            return;
+                        if let Some(job) = MeshJob::new(x, z, &world) {
+                            meshers.submit(job);
                         }
                     }
                 }
@@ -207,6 +225,9 @@ impl WorldSession {
                 timing.waiting_ms += waited.elapsed().as_secs_f64() * 1000.0;
                 if last_report.elapsed().as_millis() > 250 {
                     last_report = std::time::Instant::now();
+                    timing.meshing_ms =
+                        meshers.spent.0.load(Ordering::Relaxed) as f64 / 1000.0;
+                    timing.meshes = meshers.spent.1.load(Ordering::Relaxed);
                     let _ = tx.send(WorldEvent::Timing(timing));
                 }
                 match polled {
@@ -220,20 +241,9 @@ impl WorldSession {
                     Ok(Event::Chunk(chunk)) => {
                         let (x, z) = (chunk.x, chunk.z);
                         world.insert((x, z), Arc::from(*chunk));
-                        let chunk = world.get(&(x, z)).expect("just inserted").clone();
-                        let chunk = &chunk;
                         meshed_with.insert((x, z), neighbours_present(x, z, &world));
-                        let t = std::time::Instant::now();
-                        let mesh =
-                            mesh_chunk(chunk, &world, &appearance, &textures, &biome_tints);
-                        timing.meshing_ms += t.elapsed().as_secs_f64() * 1000.0;
-                        timing.meshes += 1;
-                        let blocks = chunk.clone();
-                        if tx
-                            .send(WorldEvent::Chunk { x, z, mesh: Box::new(mesh), blocks })
-                            .is_err()
-                        {
-                            return; // the window closed
+                        if let Some(job) = MeshJob::new(x, z, &world) {
+                            meshers.submit(job);
                         }
                         // Its neighbours now know something they did not.
                         for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
@@ -282,16 +292,21 @@ impl WorldSession {
                     Ok(Event::Teleported { x, y, z, yaw, pitch, relative }) => {
                         let _ = tx.send(WorldEvent::Moved { x, y, z, yaw, pitch, relative });
                     }
-                    Ok(Event::Container { window, slots, carried, unread }) => {
+                    Ok(Event::Container { window, state_id, slots, carried, unread }) => {
                         if let Some(why) = unread {
                             // Worth saying out loud: it means a slot is missing
                             // from the screen, and it names what to add.
                             eprintln!("inventory: stopped reading slots, {why}");
                         }
-                        let _ = tx.send(WorldEvent::Container { window, slots, carried });
+                        let _ = tx.send(WorldEvent::Container {
+                            window,
+                            state_id,
+                            slots,
+                            carried,
+                        });
                     }
-                    Ok(Event::Slot { window, slot, stack }) => {
-                        let _ = tx.send(WorldEvent::Slot { window, slot, stack });
+                    Ok(Event::Slot { window, state_id, slot, stack }) => {
+                        let _ = tx.send(WorldEvent::Slot { window, state_id, slot, stack });
                     }
                     Ok(Event::HeldSlot(slot)) => {
                         let _ = tx.send(WorldEvent::HeldSlot(slot));
@@ -379,22 +394,111 @@ fn neighbours_present(x: i32, z: i32, world: &HashMap<(i32, i32), Arc<Chunk>>) -
 }
 
 /// Meshes one column against whichever of its neighbours are loaded.
-fn mesh_chunk(
-    chunk: &Chunk,
-    world: &HashMap<(i32, i32), Arc<Chunk>>,
-    appearance: &Appearance,
-    textures: &BlockTextures,
-    biomes: &BiomeTints,
-) -> Mesh {
-    let (x, z) = (chunk.x, chunk.z);
-    let get = |dx: i32, dz: i32| world.get(&(x + dx, z + dz)).map(|c| c.as_ref());
-    let neighbours = Neighbours {
-        west: get(-1, 0),
-        east: get(1, 0),
-        north: get(0, -1),
-        south: get(0, 1),
-    };
-    neuton_render::build_full(chunk, neighbours, appearance, textures, biomes, 1.0)
+/// One column to mesh, with the neighbours its edge faces depend on.
+///
+/// The neighbours travel with the job rather than being looked up later,
+/// because by the time a worker gets to it the world may have moved on.
+struct MeshJob {
+    x: i32,
+    z: i32,
+    chunk: Arc<Chunk>,
+    around: [Option<Arc<Chunk>>; 4],
+}
+
+impl MeshJob {
+    fn new(x: i32, z: i32, world: &HashMap<(i32, i32), Arc<Chunk>>) -> Option<Self> {
+        let chunk = world.get(&(x, z))?.clone();
+        let get = |dx: i32, dz: i32| world.get(&(x + dx, z + dz)).cloned();
+        Some(Self {
+            x,
+            z,
+            chunk,
+            around: [get(-1, 0), get(1, 0), get(0, -1), get(0, 1)],
+        })
+    }
+}
+
+/// Meshing is where a joining client actually spends its time, and it is
+/// perfectly parallel: one column at a time, sharing nothing but read-only
+/// tables. Doing it on the thread that reads the socket also throttles the
+/// world's arrival, because the server sizes its chunk batches from how long
+/// the last one took to acknowledge.
+struct Meshers {
+    jobs: Sender<MeshJob>,
+    /// Microseconds spent meshing across every worker, and columns produced.
+    spent: Arc<(AtomicU64, AtomicU64)>,
+}
+
+impl Meshers {
+    fn start(
+        tx: Sender<WorldEvent>,
+        appearance: Arc<Appearance>,
+        textures: Arc<BlockTextures>,
+        biomes: Arc<BiomeTints>,
+        stop: Arc<AtomicBool>,
+    ) -> Self {
+        let (jobs, rx) = channel::<MeshJob>();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let spent = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+        // One short of the machine's parallelism: the thread reading the socket
+        // is doing real work too and should not be fighting for a core.
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1).clamp(1, 8))
+            .unwrap_or(3);
+        for _ in 0..workers {
+            let (rx, tx) = (rx.clone(), tx.clone());
+            let (appearance, textures, biomes) =
+                (appearance.clone(), textures.clone(), biomes.clone());
+            let (spent, stop) = (spent.clone(), stop.clone());
+            std::thread::spawn(move || {
+                loop {
+                    let job = {
+                        let Ok(rx) = rx.lock() else { return };
+                        match rx.recv() {
+                            Ok(job) => job,
+                            Err(_) => return,
+                        }
+                    };
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let started = std::time::Instant::now();
+                    let neighbours = Neighbours {
+                        west: job.around[0].as_deref(),
+                        east: job.around[1].as_deref(),
+                        north: job.around[2].as_deref(),
+                        south: job.around[3].as_deref(),
+                    };
+                    let mesh = neuton_render::build_full(
+                        &job.chunk,
+                        neighbours,
+                        appearance.as_ref(),
+                        textures.as_ref(),
+                        biomes.as_ref(),
+                        1.0,
+                    );
+                    spent.0.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    spent.1.fetch_add(1, Ordering::Relaxed);
+                    if tx
+                        .send(WorldEvent::Chunk {
+                            x: job.x,
+                            z: job.z,
+                            mesh: Box::new(mesh),
+                            blocks: job.chunk,
+                        })
+                        .is_err()
+                    {
+                        return; // the window closed
+                    }
+                }
+            });
+        }
+        Self { jobs, spent }
+    }
+
+    fn submit(&self, job: MeshJob) {
+        let _ = self.jobs.send(job);
+    }
 }
 
 /// The columns a change at `at` also affects: only the ones it touches the edge

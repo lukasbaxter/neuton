@@ -112,6 +112,8 @@ pub struct Body {
     pub walk_speed: f64,
     /// The flying speed the server allows.
     pub fly_speed: f64,
+    /// Ticks left before another jump is allowed.
+    pub jump_delay: u8,
 }
 
 impl Default for Body {
@@ -123,6 +125,7 @@ impl Default for Body {
             flying: true,
             walk_speed: 0.1,
             fly_speed: 0.05,
+            jump_delay: 0,
         }
     }
 }
@@ -177,6 +180,8 @@ const SPRINT_MULTIPLIER: f64 = 1.3;
 const SNEAK_MULTIPLIER: f64 = 0.3;
 /// How high a step the player walks up without jumping.
 const STEP_HEIGHT: f64 = 0.6;
+/// Ticks before another jump is allowed, as the game counts them.
+const JUMP_DELAY: u8 = 10;
 
 /// Advances the body by one tick.
 ///
@@ -197,10 +202,18 @@ pub fn step(body: &mut Body, input: Input, world: &dyn BlockView, shapes: &dyn B
         wish[1] /= length;
     }
 
+    // Whether the player was standing on something when the tick began. The
+    // game decides friction from this once, up front, and keeps using it even
+    // if the tick ends in the air. That is why a jump still pays the ground's
+    // friction: take it from the end of the tick instead and a sprint jump
+    // keeps almost all of its speed, every hop compounds, and the player ends
+    // up moving at nearly twice the pace the server expects.
+    let grounded = body.on_ground;
+
     // The block underfoot decides how fast you take hold of the ground. It is
     // sampled a little below the feet, as the game does, so standing exactly on
     // a boundary picks the block you are standing on rather than the air.
-    let friction = if body.on_ground {
+    let friction = if grounded {
         let below = [
             body.position[0].floor() as i32,
             (body.position[1] - 0.500_000_1).floor() as i32,
@@ -213,7 +226,7 @@ pub fn step(body: &mut Body, input: Input, world: &dyn BlockView, shapes: &dyn B
 
     let acceleration = if body.flying {
         body.fly_speed * if input.sprint { 2.0 } else { 1.0 }
-    } else if body.on_ground {
+    } else if grounded {
         let speed = body.walk_speed * if input.sprint { SPRINT_MULTIPLIER } else { 1.0 };
         speed * (ACCELERATION_BASE / (friction * friction * friction))
     } else if input.sprint {
@@ -223,8 +236,11 @@ pub fn step(body: &mut Body, input: Input, world: &dyn BlockView, shapes: &dyn B
     };
 
     // A jump is taken before the tick moves, off the ground state the last tick
-    // ended on.
-    if input.jump && body.on_ground && !body.flying {
+    // ended on. The delay after one is the game's, and stops a held jump key
+    // from firing again the instant a landing is registered.
+    body.jump_delay = body.jump_delay.saturating_sub(1);
+    if input.jump && grounded && !body.flying && body.jump_delay == 0 {
+        body.jump_delay = JUMP_DELAY;
         body.velocity[1] = JUMP_POWER;
         if input.sprint {
             let yaw = (input.yaw as f64).to_radians();
@@ -232,6 +248,10 @@ pub fn step(body: &mut Body, input: Input, world: &dyn BlockView, shapes: &dyn B
             body.velocity[2] += yaw.cos() * SPRINT_JUMP_BOOST;
         }
         body.on_ground = false;
+    }
+    if !input.jump {
+        // Letting go clears the wait, so tapping is never slower than holding.
+        body.jump_delay = 0;
     }
     if body.flying {
         let up = f64::from(input.jump) - f64::from(input.sneak);
@@ -278,7 +298,7 @@ pub fn step(body: &mut Body, input: Input, world: &dyn BlockView, shapes: &dyn B
         body.velocity[2] *= AIR_DRAG;
     } else {
         body.velocity[1] = (body.velocity[1] - GRAVITY) * DRAG;
-        let horizontal = if body.on_ground { friction * AIR_DRAG } else { AIR_DRAG };
+        let horizontal = if grounded { friction * AIR_DRAG } else { AIR_DRAG };
         body.velocity[0] *= horizontal;
         body.velocity[2] *= horizontal;
     }
@@ -468,6 +488,7 @@ mod tests {
             flying: false,
             walk_speed: 0.1,
             fly_speed: 0.05,
+            jump_delay: 0,
         }
     }
 
@@ -628,6 +649,38 @@ mod tests {
     }
 
     #[test]
+    fn sprint_jumping_is_faster_than_sprinting_but_not_absurdly() {
+        // The game's own numbers: sprinting is 5.612 blocks a second, and
+        // bunny hopping carries you along at a bit under twice walking pace.
+        // Anything near double sprinting means the jump boost is being applied
+        // more than once a jump.
+        let settle = |jump: bool| {
+            let mut body = walker(0.5, 1.0);
+            body.on_ground = true;
+            let input =
+                Input { forward: 1.0, yaw: 270.0, sprint: true, jump, ..Default::default() };
+            run(&mut body, input, &Floor, 200);
+            let before = body.position[0];
+            run(&mut body, input, &Floor, 40);
+            (body.position[0] - before).abs() / (40.0 * TICK)
+        };
+        let sprinting = settle(false);
+        let hopping = settle(true);
+        assert!(
+            (sprinting - 5.612).abs() < 0.2,
+            "sprinting settled at {sprinting} blocks a second"
+        );
+        assert!(
+            hopping > sprinting,
+            "sprint jumping ({hopping}) should beat sprinting ({sprinting})"
+        );
+        assert!(
+            hopping < 9.0,
+            "sprint jumping ran away at {hopping} blocks a second"
+        );
+    }
+
+    #[test]
     fn sprinting_is_a_third_faster_than_walking() {
         let settle = |sprint: bool| {
             let mut body = walker(0.5, 1.0);
@@ -741,3 +794,4 @@ mod tests {
         assert!(!feet.intersects(&block));
     }
 }
+

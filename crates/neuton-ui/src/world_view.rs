@@ -52,6 +52,8 @@ pub struct WorldView {
     pub target: Option<neuton_world::raycast::Hit>,
     /// The block being broken, and when the swing at it started.
     mining: Option<([i32; 3], Instant)>,
+    /// When the arm last swung, so breaking keeps it moving.
+    last_swing: Option<Instant>,
     /// Whether the use button is held, for placing a run of blocks.
     using: bool,
     /// When the last placement went out, so holding the button does not send
@@ -119,6 +121,7 @@ impl WorldView {
             dead: false,
             target: None,
             mining: None,
+            last_swing: None,
             using: false,
             last_use: None,
             inventory: crate::inventory::Inventory::default(),
@@ -197,8 +200,7 @@ impl WorldView {
                     return false;
                 }
                 Some(Action::Inventory) if !repeat => {
-                    self.inventory.open = !self.inventory.open;
-                    self.held.clear();
+                    self.toggle_inventory();
                     return true;
                 }
                 // Double-tap jump to fly, where the server allows it at all.
@@ -309,13 +311,22 @@ impl WorldView {
         {
             self.use_item();
         }
-        // Holding the break button on a block keeps the swing going, and the
-        // server decides when it gives.
-        if let Some((at, since)) = self.mining
-            && since.elapsed() >= std::time::Duration::from_millis(200)
+        // Looking away from a block gives up on breaking it, and starting on
+        // whatever is under the crosshair now is a new swing.
+        if let Some((at, _)) = self.mining
+            && self.target.is_none_or(|hit| hit.block != at)
         {
-            self.session.send(Outgoing::FinishBreaking { at });
-            self.mining = Some((at, Instant::now()));
+            self.stop_breaking();
+            if self.target.is_some() {
+                self.begin_breaking();
+            }
+        }
+        // The arm keeps moving while a block is being broken.
+        const SWING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+        if self.mining.is_some()
+            && self.last_swing.is_none_or(|t| t.elapsed() >= SWING_INTERVAL)
+        {
+            self.last_swing = Some(Instant::now());
             self.session.send(Outgoing::Swing);
         }
     }
@@ -392,6 +403,9 @@ impl WorldView {
                         self.camera.pitch = turned_to.1;
                     }
                     if first {
+                        // For looking at the inventory screen without a hand on
+                        // the keyboard.
+                        self.inventory.open = std::env::var_os("NEUTON_INVENTORY").is_some();
                         self.body.flying = self.abilities.flying;
                         self.session.send(Outgoing::Loaded);
                         self.reported_loaded = true;
@@ -422,17 +436,25 @@ impl WorldView {
                 }
                 WorldEvent::Timing(t) => self.timing = t,
                 WorldEvent::Chat(spans) => self.chat.push(spans),
-                WorldEvent::Container { window, slots, .. } => {
+                WorldEvent::Container { window, state_id, slots, carried } => {
                     // Window zero is the player's own inventory, the one behind
                     // every other screen. Anything else is a chest or a
                     // workbench, which this client does not open yet.
                     if window == 0 {
+                        self.inventory.state_id = state_id;
                         self.inventory.replace(slots);
+                        self.inventory.set_carried(carried);
                     }
                 }
-                WorldEvent::Slot { window, slot, stack } => {
+                WorldEvent::Slot { window, state_id, slot, stack } => {
                     if window == 0 {
-                        self.inventory.set(slot, stack);
+                        self.inventory.state_id = state_id;
+                        // Minus one is the cursor rather than a slot.
+                        if slot < 0 {
+                            self.inventory.set_carried(stack);
+                        } else {
+                            self.inventory.set(slot, stack);
+                        }
                     }
                 }
                 WorldEvent::HeldSlot(slot) => {
@@ -620,6 +642,28 @@ impl WorldView {
         self.session.send(Outgoing::TickEnd);
     }
 
+    /// Opens or closes the inventory screen, telling the server either way.
+    pub fn toggle_inventory(&mut self) {
+        self.inventory.open = !self.inventory.open;
+        self.held.clear();
+        if !self.inventory.open {
+            // Closing hands anything left on the cursor back to the server,
+            // which drops it or puts it away as the rules require.
+            self.session.send(Outgoing::CloseContainer { window: 0 });
+        }
+    }
+
+    /// Clicks a slot. The server decides what actually happens and says so.
+    pub fn click_slot(&mut self, slot: usize, right: bool) {
+        self.session.send(Outgoing::Click {
+            window: 0,
+            state_id: self.inventory.state_id,
+            slot: slot as i16,
+            button: u8::from(right),
+            mode: 0,
+        });
+    }
+
     /// Asks the server to put the player back in the world.
     pub fn respawn(&mut self) {
         if !self.dead {
@@ -656,6 +700,11 @@ impl WorldView {
     }
 
     /// Starts breaking whatever is under the crosshair.
+    ///
+    /// The server runs its own timer from here: once it has been told a swing
+    /// started, it counts the block down and breaks it itself. So this sends
+    /// the start and then keeps quiet, rather than guessing when the block
+    /// should give and telling the server so, repeatedly, until it agreed.
     fn begin_breaking(&mut self) {
         let Some(hit) = self.target else {
             // Swinging at nothing is still a swing, and everyone else sees it.
@@ -664,18 +713,14 @@ impl WorldView {
         };
         self.session.send(Outgoing::Swing);
         self.session.send(Outgoing::StartBreaking { at: hit.block, face: hit.face });
-        // In creative the server breaks it on the first packet; in survival it
-        // wants to be told when the swing finished.
-        if self.abilities.instant_build {
-            self.mining = None;
-        } else {
-            self.mining = Some((hit.block, Instant::now()));
-        }
+        // In creative the first packet is the whole of it.
+        self.mining = (!self.abilities.instant_build).then(|| (hit.block, Instant::now()));
     }
 
+    /// Letting go, or looking away, gives up on the block.
     fn stop_breaking(&mut self) {
         if let Some((at, _)) = self.mining.take() {
-            self.session.send(Outgoing::FinishBreaking { at });
+            self.session.send(Outgoing::AbortBreaking { at });
         }
     }
 
