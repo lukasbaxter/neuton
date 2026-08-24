@@ -255,6 +255,26 @@ mod tests {
     }
 
     #[test]
+    fn turning_right_ends_up_facing_right() {
+        // The sign of a turn is the same class of mistake as the sign of the
+        // right vector: everything still works, just mirrored. Both are pinned
+        // by where you actually end up.
+        let mut c = Camera { yaw: 0.0, pitch: 0.0, ..Default::default() };
+        let right = c.right();
+        // A positive turn is to the right, so afterwards you face where your
+        // right hand was pointing.
+        c.turn(90.0, 0.0);
+        assert!(close(c.forward(), right, 1e-5), "{:?} vs {:?}", c.forward(), right);
+    }
+
+    #[test]
+    fn looking_down_is_a_positive_pitch() {
+        let mut c = Camera { yaw: 0.0, pitch: 0.0, ..Default::default() };
+        c.turn(0.0, 45.0);
+        assert!(c.forward()[1] < 0.0, "should be looking downwards: {:?}", c.forward());
+    }
+
+    #[test]
     fn pitch_cannot_flip_the_view_over() {
         let mut c = Camera::default();
         c.turn(0.0, -500.0);

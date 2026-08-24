@@ -175,7 +175,10 @@ impl WorldView {
 
     pub fn mouse_moved(&mut self, dx: f32, dy: f32) {
         if self.captured {
-            self.camera.turn(-dx * SENSITIVITY, dy * SENSITIVITY);
+            // Moving the mouse right turns the view right, and on these axes
+            // turning right raises the yaw: facing south, your right is west,
+            // which is a larger yaw than south.
+            self.camera.turn(dx * SENSITIVITY, dy * SENSITIVITY);
         }
     }
 
