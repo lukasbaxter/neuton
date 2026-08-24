@@ -36,11 +36,10 @@ fn chunk_body(x: i32, z: i32) -> Vec<u8> {
     for i in 0..SECTIONS {
         let solid = i % 3 == 1;
         sections.write_i16(if solid { 4096 } else { 0 });
+        sections.write_i16(0); // fluid count
         sections.write_u8(0); // single-valued block palette
         sections.write_varint(if solid { 1 } else { 0 });
-        sections.write_varint(0);
         sections.write_u8(0); // single-valued biome palette
-        sections.write_varint(0);
         sections.write_varint(0);
     }
 
