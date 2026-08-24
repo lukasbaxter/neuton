@@ -349,13 +349,18 @@ fn upload_atlas(
         height: atlas.size,
         depth_or_array_layers: 1,
     };
+    // Deliberately not the sRGB format. The surface is picked as non-sRGB, so
+    // an sRGB texture would be decoded to linear on sampling and then written
+    // to a surface that treats it as sRGB again, which darkens the whole world.
+    // Sampling and presenting in the same space keeps the atlas looking like
+    // the PNGs it came from.
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("block atlas"),
         size,
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
