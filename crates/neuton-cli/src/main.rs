@@ -26,9 +26,12 @@ fn main() -> std::process::ExitCode {
             info();
             Ok(())
         }
+        // No arguments is the normal way to start: open the launcher.
+        None => neuton_ui::run(),
         _ => {
             eprintln!(
-                "usage: neuton ping <host[:port]>   server list ping\n\
+                "usage: neuton                      open the launcher\n\
+                 \x20      neuton ping <host[:port]>   server list ping\n\
                  \x20      neuton join <host[:port]>   connect and stream the world\n\
                  \x20      neuton login               sign in with a Microsoft account\n\
                  \x20      neuton accounts            list signed-in accounts\n\

@@ -14,3 +14,4 @@ neuton-blocks = { workspace = true }
 neuton-auth = { path = "../neuton-auth" }
 neuton-net = { path = "../neuton-net" }
 neuton-world = { path = "../neuton-world" }
+neuton-ui = { path = "../neuton-ui" }
