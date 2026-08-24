@@ -167,13 +167,13 @@ impl Accounts {
 }
 
 #[cfg(unix)]
-fn restrict_permissions(path: &Path) -> std::io::Result<()> {
+pub(crate) fn restrict_permissions(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 #[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> std::io::Result<()> {
+pub(crate) fn restrict_permissions(_path: &Path) -> std::io::Result<()> {
     // Windows inherits the user profile's ACL, which is already owner-only.
     Ok(())
 }

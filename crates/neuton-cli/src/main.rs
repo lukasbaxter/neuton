@@ -260,9 +260,29 @@ fn prompt(dc: &neuton_auth::DeviceCode) {
 fn login() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Accounts::load_default()?;
     let t = Instant::now();
-    // Always a fresh sign-in: `login` on a machine that already has an account
-    // means "add another", not "reuse the one I have".
+
+    // A sign-in that got past Microsoft and was refused by Mojang left its
+    // refresh token behind. If the approval has since landed, finishing it
+    // needs no browser and no code.
+    if let Some(resumed) = neuton_auth::resume(&mut store) {
+        match resumed {
+            Ok(session) => {
+                println!("resumed the last sign-in; no code needed");
+                report(&session, &store, t);
+                return Ok(());
+            }
+            Err(e) => println!("could not resume the last sign-in ({e}); starting over\n"),
+        }
+    }
+
+    // Otherwise a fresh sign-in: `login` on a machine that already has an
+    // account means "add another", not "reuse the one I have".
     let session = neuton_auth::sign_in(&mut store, prompt)?;
+    report(&session, &store, t);
+    Ok(())
+}
+
+fn report(session: &neuton_auth::Session, store: &Accounts, t: Instant) {
     println!(
         "\nsigned in as {} ({:.0} ms)",
         session.profile.name,
@@ -273,7 +293,6 @@ fn login() -> Result<(), Box<dyn std::error::Error>> {
     if store.list().len() > 1 {
         println!("  accounts  {} signed in, this one is now active", store.list().len());
     }
-    Ok(())
 }
 
 fn accounts() -> Result<(), Box<dyn std::error::Error>> {

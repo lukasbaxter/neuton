@@ -12,6 +12,7 @@
 //! refresh token sends the user back to a browser.
 
 mod accounts;
+mod pending;
 mod error;
 mod flow;
 mod session;
@@ -132,6 +133,24 @@ pub fn authenticate(
 ///
 /// Used directly when adding a second account, where falling back to an already
 /// cached one would be wrong.
+/// Finishes a sign-in that previously died at Mojang's gate, with no browser
+/// step. Returns `None` when there is nothing waiting.
+pub fn resume(accounts: &mut Accounts) -> Option<Result<Session>> {
+    let refresh_token = pending::take()?;
+    let flow = DeviceCodeFlow::new(match client_id() {
+        Ok(id) => id,
+        Err(e) => return Some(Err(e)),
+    });
+    Some(match flow.refresh(&refresh_token) {
+        Ok(session) => {
+            pending::clear();
+            accounts.upsert(session.clone());
+            accounts.save().map(|()| session)
+        }
+        Err(e) => Err(e),
+    })
+}
+
 pub fn sign_in(
     accounts: &mut Accounts,
     mut on_prompt: impl FnMut(&DeviceCode),
@@ -140,6 +159,7 @@ pub fn sign_in(
     let dc = flow.start()?;
     on_prompt(&dc);
     let session = flow.wait(&dc, |_| {})?;
+    pending::clear();
     accounts.upsert(session.clone());
     accounts.save()?;
     Ok(session)
