@@ -210,7 +210,8 @@ impl ApplicationHandler for App {
         // click and the mouse could never be captured.
         let in_world = world.is_some();
         let typing = world.as_ref().is_some_and(|w| w.chat.is_open());
-        if !in_world {
+        let paused = world.as_ref().is_some_and(|w| w.paused);
+        if !in_world || paused {
             let response = state.egui_winit.on_window_event(&state.gpu.window, &event);
             if response.repaint {
                 state.gpu.window.request_redraw();
@@ -220,6 +221,17 @@ impl ApplicationHandler for App {
             }
         }
         let _ = typing;
+
+        // Leaving the world is decided on the pause menu, which egui owns.
+        if world.as_ref().is_some_and(|w| w.leaving) {
+            *world = None;
+            if let Some(r) = renderer.as_mut() {
+                r.clear();
+            }
+            state.gpu.window.set_title("neuton");
+            state.gpu.window.request_redraw();
+            return;
+        }
 
         // A join can only be started here, where the GPU lives.
         if let Some(pending) = launcher.pending_join.take() {
@@ -374,29 +386,29 @@ impl ApplicationHandler for App {
                 if let Some(w) = world.as_mut() {
                     // Escape while typing cancels the message, not the world.
                     if pressed && code == KeyCode::Escape && w.chat.is_open() {
-                        w.key(code, pressed);
+                        w.key(code, pressed, event.repeat);
                         set_capture(&state.gpu.window, w, true);
                         state.gpu.window.request_redraw();
                         return;
                     }
                     if pressed && code == KeyCode::Escape {
-                        // First Escape releases the mouse, a second leaves the
-                        // world. Anything else strands the pointer.
-                        if w.captured {
-                            set_capture(&state.gpu.window, w, false);
-                        } else {
-                            *world = None;
-                            if let Some(r) = renderer.as_mut() {
-                                r.clear();
-                            }
-                            state.gpu.window.set_title("neuton");
-                        }
+                        // Escape opens the pause menu and releases the mouse,
+                        // as it does in the game. Leaving is a choice on that
+                        // menu rather than a second press, which used to drop
+                        // you out of the world by accident.
+                        w.paused = !w.paused;
+                        set_capture(&state.gpu.window, w, !w.paused);
+                        state.gpu.window.request_redraw();
                         return;
                     }
                     // Opening chat releases the mouse so the pointer comes
                     // back and typing does not also fly the camera.
                     let was_typing = w.chat.is_open();
-                    if w.key(code, pressed) {
+                    // While paused, the world takes no input.
+                    if w.paused {
+                        return;
+                    }
+                    if w.key(code, pressed, event.repeat) {
                         set_capture(&state.gpu.window, w, false);
                     } else if was_typing && !w.chat.is_open() {
                         // Enter sent the message; go back to flying.
@@ -536,7 +548,7 @@ fn draw(
 fn draw_into(
     state: &mut State,
     launcher: &mut Launcher,
-    world: Option<&mut WorldView>,
+    mut world: Option<&mut WorldView>,
     renderer: Option<&mut WorldRenderer>,
     capture: Option<CaptureTarget<'_>>,
 ) {
@@ -547,12 +559,22 @@ fn draw_into(
         debug: w.show_debug.then(|| w.debug_lines(r)),
         chat: w.chat.visible().cloned().collect(),
         input: w.chat.input().map(str::to_string),
+        paused: w.paused,
+        server: w.session.server.clone(),
     });
+    let mut pause_action = PauseAction::None;
     let mut output = state.egui_ctx.run_ui(raw_input, |ui| match &hud {
         // In a world, egui draws only the overlay.
-        Some(hud) => overlay(ui, hud),
+        Some(hud) => pause_action = overlay(ui, hud),
         None => launcher.update(ui),
     });
+    if let Some(w) = world.as_mut() {
+        match pause_action {
+            PauseAction::Resume => w.paused = false,
+            PauseAction::Leave => w.leaving = true,
+            PauseAction::None => {}
+        }
+    }
     state.egui_winit.handle_platform_output(&state.gpu.window, output.platform_output.clone());
 
     let pixels_per_point = state.egui_ctx.pixels_per_point();
@@ -696,14 +718,27 @@ struct Hud {
     chat: Vec<Vec<neuton_net::Span>>,
     /// The line being typed, if chat is open.
     input: Option<String>,
+    paused: bool,
+    server: String,
+}
+
+/// What the player picked on the pause menu.
+#[derive(Clone, Copy, PartialEq)]
+enum PauseAction {
+    None,
+    Resume,
+    Leave,
 }
 
 /// The in-world overlay: a crosshair, and the debug panel when it is up.
-fn overlay(ui: &mut egui::Ui, hud: &Hud) {
+fn overlay(ui: &mut egui::Ui, hud: &Hud) -> PauseAction {
+    let mut action = PauseAction::None;
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show(ui, |ui| {
-            crosshair(ui);
+            if !hud.paused {
+                crosshair(ui);
+            }
 
             let Some(lines) = &hud.debug else { return };
             ui.scope(|ui| {
@@ -741,7 +776,65 @@ fn overlay(ui: &mut egui::Ui, hud: &Hud) {
                 ui.add_space(4.0);
                 chat_panel(ui, hud);
             });
+
+            if hud.paused {
+                action = pause_menu(ui, hud);
+            }
         });
+    action
+}
+
+/// The pause menu.
+fn pause_menu(ui: &mut egui::Ui, hud: &Hud) -> PauseAction {
+    let mut action = PauseAction::None;
+    // Dimmed, so it is obvious the world is not taking input.
+    ui.painter().rect_filled(
+        ui.clip_rect(),
+        0.0,
+        egui::Color32::from_black_alpha(140),
+    );
+
+    egui::Window::new("Paused")
+        .title_bar(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .frame(
+            egui::Frame::new()
+                .fill(theme::RAISE)
+                .stroke(egui::Stroke::new(1.0, theme::LINE2))
+                .corner_radius(12)
+                .inner_margin(egui::Margin::same(22)),
+        )
+        .show(ui.ctx(), |ui| {
+            ui.set_width(260.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("Paused").size(20.0).strong().color(theme::FG));
+                ui.label(
+                    egui::RichText::new(&hud.server)
+                        .monospace()
+                        .size(12.0)
+                        .color(theme::DIM),
+                );
+                ui.add_space(16.0);
+
+                let wide = egui::vec2(ui.available_width(), 32.0);
+                if ui.add_sized(wide, egui::Button::new("Back to game")).clicked() {
+                    action = PauseAction::Resume;
+                }
+                ui.add_space(6.0);
+                if ui.add_sized(wide, egui::Button::new("Disconnect")).clicked() {
+                    action = PauseAction::Leave;
+                }
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new("escape to go back")
+                        .monospace()
+                        .size(11.0)
+                        .color(theme::DIM),
+                );
+            });
+        });
+    action
 }
 
 /// A thin cross at the centre of the screen.

@@ -3,6 +3,7 @@
 use crate::chat::Chat;
 use crate::session::{Outgoing, WorldEvent, WorldSession};
 use neuton_world::{Body, Chunk, Input as MoveInput, physics};
+use neuton_world::physics::Abilities;
 use std::collections::HashMap;
 use std::sync::Arc;
 use neuton_render::{Camera, WorldRenderer};
@@ -41,6 +42,12 @@ pub struct WorldView {
     accumulator: f64,
     /// Set on the frame the jump key is pressed, for the double-tap to fly.
     last_jump: Option<Instant>,
+    /// What the server says the player may do.
+    pub abilities: Abilities,
+    /// Whether the pause menu is up. The world takes no input while it is.
+    pub paused: bool,
+    /// Set when the player chooses to disconnect.
+    pub leaving: bool,
     /// When the last movement update went out, and what it said.
     last_move_sent: Option<Instant>,
     last_position: Option<[f64; 3]>,
@@ -69,6 +76,9 @@ impl WorldView {
             shapes,
             accumulator: 0.0,
             last_jump: None,
+            abilities: Abilities::default(),
+            paused: false,
+            leaving: false,
             last_move_sent: None,
             last_position: None,
             last_rotation: None,
@@ -79,7 +89,11 @@ impl WorldView {
 
     /// Handles a key. Returns true if it wants the mouse released, which is
     /// what opening chat does.
-    pub fn key(&mut self, code: KeyCode, pressed: bool) -> bool {
+    ///
+    /// `repeat` marks an auto-repeat from a key being held. Holding space
+    /// produces a stream of them, and treating those as separate presses is
+    /// what made holding jump toggle flight over and over.
+    pub fn key(&mut self, code: KeyCode, pressed: bool, repeat: bool) -> bool {
         // While typing, keys belong to the text field and nothing else.
         if self.chat.is_open() {
             if !pressed {
@@ -112,8 +126,8 @@ impl WorldView {
                     self.held.clear();
                     return true;
                 }
-                // Double-tap jump to fly, as in creative mode.
-                KeyCode::Space => {
+                // Double-tap jump to fly, where the server allows it at all.
+                KeyCode::Space if self.abilities.may_fly && !repeat => {
                     let now = Instant::now();
                     if self.last_jump.is_some_and(|t| now.duration_since(t).as_millis() < 300) {
                         self.toggle_fly();
@@ -184,6 +198,11 @@ impl WorldView {
 
     /// Advances the player and the world for a frame of `dt` seconds.
     pub fn update(&mut self, dt: f32, renderer: &mut WorldRenderer, device: &wgpu::Device) {
+        // A paused world holds still, and holding a key while pausing must not
+        // leave the player walking into a wall.
+        if self.paused {
+            self.held.clear();
+        }
         self.tick_physics(dt);
 
         // The server is told where we are about twenty times a second, which is
@@ -262,6 +281,15 @@ impl WorldView {
                         }
                     }
                 }
+                WorldEvent::Abilities(abilities) => {
+                    self.abilities = abilities;
+                    // The server has the final say: it can put a player into
+                    // flight, and it can take it away mid-air.
+                    self.body.flying = abilities.flying;
+                    if !abilities.may_fly {
+                        self.body.flying = false;
+                    }
+                }
                 WorldEvent::Chat(spans) => self.chat.push(spans),
                 WorldEvent::Disconnected(why) => {
                     self.chat.note(format!("Disconnected: {why}"));
@@ -319,11 +347,15 @@ impl WorldView {
         ];
     }
 
-    /// Switches between walking and flying, as double-tapping jump does in the
-    /// game.
+    /// Switches between walking and flying, where the server allows it.
     fn toggle_fly(&mut self) {
+        if !self.abilities.may_fly {
+            return;
+        }
         self.body.flying = !self.body.flying;
-        self.body.velocity = [0.0; 3];
+        // Vertical speed is dropped, or letting go of fly at height turns into
+        // an instant plummet at whatever the fly speed was.
+        self.body.velocity[1] = 0.0;
         self.chat.note(if self.body.flying { "Flying" } else { "Walking" });
     }
 
@@ -359,6 +391,11 @@ impl WorldView {
             String::new(),
             format!("Chunks: {} drawn / {} loaded", renderer.drawn.get(), renderer.chunk_count()),
             format!("Triangles: {:.2}M", renderer.triangles() as f64 / 1.0e6),
+            format!(
+                "Mode: {}{}",
+                if self.abilities.instant_build { "creative" } else { "survival" },
+                if self.body.flying { ", flying" } else { "" }
+            ),
             format!("Server: {}", self.session.server),
             format!("Status: {}", self.session.status),
         ]

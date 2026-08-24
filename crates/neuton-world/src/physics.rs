@@ -68,6 +68,31 @@ pub trait BlockShapes {
     fn collision(&self, state: StateId) -> &[Aabb];
 }
 
+/// What the server says the player is allowed to do.
+#[derive(Debug, Clone, Copy)]
+pub struct Abilities {
+    pub may_fly: bool,
+    pub flying: bool,
+    pub instant_build: bool,
+    pub invulnerable: bool,
+    pub fly_speed: f32,
+    pub walk_speed: f32,
+}
+
+impl Default for Abilities {
+    fn default() -> Self {
+        // Survival, until the server says otherwise.
+        Self {
+            may_fly: false,
+            flying: false,
+            instant_build: false,
+            invulnerable: false,
+            fly_speed: 0.05,
+            walk_speed: 0.1,
+        }
+    }
+}
+
 /// The player's physical state.
 #[derive(Debug, Clone)]
 pub struct Body {
@@ -124,6 +149,13 @@ const TERMINAL_VELOCITY: f64 = 78.4;
 const JUMP_SPEED: f64 = 9.2;
 /// How high a step the player walks up without jumping.
 const STEP_HEIGHT: f64 = 0.6;
+/// How quickly the player reaches the speed they are asking for, per second.
+///
+/// On the ground you take hold quickly but not instantly; in the air you have
+/// almost no say, which is what stops a jump from being a steering opportunity.
+const GROUND_ACCELERATION: f64 = 18.0;
+const AIR_ACCELERATION: f64 = 2.5;
+const FLY_ACCELERATION: f64 = 9.0;
 
 /// Advances the body by `dt` seconds.
 pub fn step(
@@ -163,18 +195,36 @@ pub fn step(
         wish[1] /= length;
     }
 
-    body.velocity[0] = wish[0] * speed;
-    body.velocity[2] = wish[1] * speed;
+    // Approach the target speed rather than snapping to it. Setting velocity
+    // directly makes movement feel like a camera on rails: instant to start,
+    // instant to stop, and nothing carries. Acceleration and drag are what make
+    // it feel like a player.
+    let target = [wish[0] * speed, wish[1] * speed];
+    let rate = if body.flying {
+        FLY_ACCELERATION
+    } else if body.on_ground {
+        GROUND_ACCELERATION
+    } else {
+        // Barely any control in mid-air, which is what stops a jump being a
+        // steering opportunity.
+        AIR_ACCELERATION
+    };
+    // Exponential approach, so the result does not depend on the tick length.
+    let blend = 1.0 - (-rate * dt).exp();
+    body.velocity[0] += (target[0] - body.velocity[0]) * blend;
+    body.velocity[2] += (target[1] - body.velocity[2]) * blend;
 
     if body.flying {
-        // Vertical is driven directly rather than by gravity.
-        body.velocity[1] = if input.jump {
+        // Vertical is driven directly rather than by gravity, and smoothed the
+        // same way as the horizontal axes.
+        let target = if input.jump {
             FLY_SPEED
         } else if input.sneak {
             -FLY_SPEED
         } else {
             0.0
         };
+        body.velocity[1] += (target - body.velocity[1]) * blend;
     } else {
         if input.jump && body.on_ground {
             body.velocity[1] = JUMP_SPEED;
@@ -477,6 +527,61 @@ mod tests {
         body.flying = true;
         run(&mut body, Input::default(), &Floor, 40);
         assert!((body.position[1] - 20.0).abs() < 1e-6, "drifted to {}", body.position[1]);
+    }
+
+    #[test]
+    fn speed_builds_up_rather_than_appearing() {
+        let mut body = walker(0.5, 1.0);
+        body.on_ground = true;
+        let input = Input { forward: 1.0, yaw: 270.0, ..Default::default() };
+
+        // One tick in, the player is moving but nowhere near full speed.
+        step(&mut body, input, &Floor, &Cubes, 1.0 / 60.0);
+        let first = body.velocity[0].abs();
+        assert!(first > 0.0, "should have started moving");
+        assert!(first < WALK_SPEED * 0.5, "reached {first} in a single tick");
+
+        // And after a moment it is there.
+        run(&mut body, input, &Floor, 30);
+        assert!(
+            (body.velocity[0].abs() - WALK_SPEED).abs() < 0.1,
+            "settled at {}",
+            body.velocity[0].abs()
+        );
+    }
+
+    #[test]
+    fn letting_go_slides_to_a_stop() {
+        let mut body = walker(0.5, 1.0);
+        body.on_ground = true;
+        run(&mut body, Input { forward: 1.0, yaw: 270.0, ..Default::default() }, &Floor, 30);
+        let moving = body.velocity[0].abs();
+
+        // One tick of no input does not stop a player dead.
+        step(&mut body, Input { yaw: 270.0, ..Default::default() }, &Floor, &Cubes, 1.0 / 60.0);
+        assert!(body.velocity[0].abs() > 0.0, "stopped instantly");
+        assert!(body.velocity[0].abs() < moving, "did not slow down");
+
+        // But they do come to rest.
+        run(&mut body, Input { yaw: 270.0, ..Default::default() }, &Floor, 60);
+        assert!(body.velocity[0].abs() < 0.05, "still drifting at {}", body.velocity[0]);
+    }
+
+    #[test]
+    fn the_tick_length_does_not_change_the_result() {
+        // Exponential approach rather than a fixed fraction per tick, so
+        // halving the step does not halve the acceleration.
+        let settle = |dt: f64, ticks: usize| {
+            let mut b = walker(0.5, 1.0);
+            b.on_ground = true;
+            for _ in 0..ticks {
+                step(&mut b, Input { forward: 1.0, yaw: 270.0, ..Default::default() }, &Floor, &Cubes, dt);
+            }
+            b.velocity[0].abs()
+        };
+        let coarse = settle(1.0 / 30.0, 6);
+        let fine = settle(1.0 / 60.0, 12);
+        assert!((coarse - fine).abs() < 0.05, "{coarse} against {fine}");
     }
 
     #[test]
