@@ -48,7 +48,16 @@ pub struct ServerStatus {
     pub protocol: i64,
     /// Raw PNG bytes of the 64x64 server icon, if it sent one.
     pub favicon_png: Option<Vec<u8>>,
+    /// Application-level round trip, measured over the ping packet alone.
     pub latency_ms: f64,
+    /// Time to complete the TCP handshake.
+    pub connect_ms: f64,
+    /// Time from asking for the status to having it, which includes whatever
+    /// work the server does to build the MOTD.
+    pub status_ms: f64,
+    /// Size of the status JSON. A proxy that rewrites the MOTD usually shows up
+    /// here as a payload much smaller than a real server's.
+    pub payload_bytes: usize,
 }
 
 impl ServerStatus {
@@ -67,6 +76,7 @@ impl ServerStatus {
 pub fn ping(host: &str, port: u16) -> Result<ServerStatus, String> {
     let started = Instant::now();
     let mut conn = Framed::connect((host, port), TIMEOUT).map_err(|e| e.to_string())?;
+    let connect_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let mut w = Writer::new();
     w.write_varint(PROTOCOL_VERSION);
@@ -75,6 +85,7 @@ pub fn ping(host: &str, port: u16) -> Result<ServerStatus, String> {
     w.write_varint(1); // next state: status
     conn.write_packet(ids::handshake::serverbound::INTENTION, &w)
         .map_err(|e| e.to_string())?;
+    let asked = Instant::now();
     conn.write_packet(ids::status::serverbound::STATUS_REQUEST, &Writer::new())
         .map_err(|e| e.to_string())?;
 
@@ -86,6 +97,9 @@ pub fn ping(host: &str, port: u16) -> Result<ServerStatus, String> {
     }
     let json = r.read_str().map_err(|e| e.to_string())?;
     let mut status = parse(json)?;
+    status.connect_ms = connect_ms;
+    status.status_ms = asked.elapsed().as_secs_f64() * 1000.0;
+    status.payload_bytes = json.len();
 
     // Measured over the ping packet rather than the whole exchange, so a large
     // MOTD does not inflate the number.
@@ -131,6 +145,9 @@ fn parse(json: &str) -> Result<ServerStatus, String> {
         protocol: v.pointer("/version/protocol").and_then(|p| p.as_i64()).unwrap_or(-1),
         favicon_png,
         latency_ms: 0.0,
+        connect_ms: 0.0,
+        status_ms: 0.0,
+        payload_bytes: json.len(),
     })
 }
 

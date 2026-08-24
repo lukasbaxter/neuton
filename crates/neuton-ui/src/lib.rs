@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod auth_task;
+pub mod fonts;
 pub mod gpu;
 pub mod icons;
 pub mod ping_task;
@@ -74,6 +75,7 @@ impl ApplicationHandler for App {
 
         let egui_ctx = egui::Context::default();
         theme::apply(&egui_ctx);
+        fonts::install(&egui_ctx);
 
         let egui_winit = egui_winit::State::new(
             egui_ctx.clone(),
@@ -219,9 +221,10 @@ fn draw(state: &mut State, launcher: &mut Launcher) {
         state.egui_renderer.render(&mut pass.forget_lifetime(), &tris, &desc);
     }
 
-    free_all(&mut state.egui_renderer);
-
     state.gpu.queue.submit(Some(encoder.finish()));
+    // Freed only after submit. The render pass above still references these
+    // textures, and destroying them first fails validation at submit time.
+    free_all(&mut state.egui_renderer);
     // Presentation moved onto the queue in wgpu 30.
     state.gpu.queue.present(frame);
 }
