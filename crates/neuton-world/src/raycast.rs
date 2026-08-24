@@ -76,7 +76,6 @@ pub fn cast(
     // The face of the first block is only known once the ray has crossed into
     // it, so the starting block is tested with no face and skipped if it is the
     // one the player is standing inside.
-    let mut travelled = 0.0;
     let mut entered: Option<usize> = None;
 
     for _ in 0..512 {
@@ -94,8 +93,7 @@ pub fn cast(
         } else {
             2
         };
-        travelled = next[axis];
-        if travelled > distance {
+        if next[axis] > distance {
             return None;
         }
         block[axis] += step[axis];

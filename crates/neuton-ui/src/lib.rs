@@ -267,6 +267,14 @@ impl ApplicationHandler for App {
                 if let (Some(w), Some(r)) = (world.as_mut(), renderer.as_mut()) {
                     w.update(dt, r, &state.gpu.device, &state.gpu.queue);
                     w.record_frame(dt);
+                    // Dying is not something the player chose, so the mouse has
+                    // to come back on its own: a locked pointer cannot press the
+                    // button that gets you out of it. Same for opening a screen
+                    // the player is meant to click around in.
+                    let wants_mouse = w.dead || w.inventory.open;
+                    if wants_mouse == w.captured {
+                        set_capture(&state.gpu.window, w, !wants_mouse);
+                    }
                     // Settings that live outside the world view.
                     r.min_light = w.settings.min_light();
                     state.gpu.set_present_mode(r.wants_present_mode(w.settings.vsync));
@@ -485,6 +493,12 @@ impl ApplicationHandler for App {
                         state.gpu.window.request_redraw();
                         return;
                     }
+                    // Escape closes the inventory before it reaches the pause
+                    // menu, as it does in the game.
+                    if pressed && code == KeyCode::Escape && w.inventory.open {
+                        w.toggle_inventory();
+                        return;
+                    }
                     if pressed && code == KeyCode::Escape {
                         // Escape opens the pause menu and releases the mouse,
                         // as it does in the game. Leaving is a choice on that
@@ -514,7 +528,9 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state: button_state, button, .. } => {
                 if let Some(w) = world.as_mut() {
                     let pressed = button_state == ElementState::Pressed;
-                    if pressed && !w.captured && !w.chat.is_open() {
+                    if pressed && !w.captured && !w.chat.is_open() && !w.dead
+                        && !w.inventory.open
+                    {
                         // The first click is what takes the mouse, not an
                         // action in the world.
                         set_capture(&state.gpu.window, w, true);
@@ -893,13 +909,24 @@ fn overlay(ui: &mut egui::Ui, hud: &Hud, world: Option<&mut WorldView>) -> Pause
                     (world.health, world.food, !world.abilities.instant_build);
                 // Two and a bit strides to a full cycle, as the game bobs.
                 let bob = world.walked * 2.2;
-                let WorldView { inventory, art, .. } = world;
-                crate::inventory::held_item(ui, inventory, art, scale, bob);
-                crate::inventory::hotbar(ui, inventory, art, scale);
-                // Creative shows neither: nothing can hurt you and nothing
-                // makes you hungry.
-                if survival {
-                    crate::inventory::vitals(ui, art, scale, health, food);
+                let open = world.inventory.open;
+                let mut clicked = None;
+                {
+                    let WorldView { inventory, art, .. } = world;
+                    if open {
+                        clicked = crate::inventory::screen(ui, inventory, art, scale);
+                    } else {
+                        crate::inventory::held_item(ui, inventory, art, scale, bob);
+                    }
+                    crate::inventory::hotbar(ui, inventory, art, scale);
+                    // Creative shows neither: nothing can hurt you and nothing
+                    // makes you hungry.
+                    if survival {
+                        crate::inventory::vitals(ui, art, scale, health, food);
+                    }
+                }
+                if let Some((slot, right)) = clicked {
+                    world.click_slot(slot, right);
                 }
             }
 

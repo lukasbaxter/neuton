@@ -23,17 +23,36 @@ pub struct Inventory {
     pub selected: usize,
     /// Whether the inventory screen is up.
     pub open: bool,
+    /// What is being dragged on the cursor.
+    carried: Option<Stack>,
+    /// The server's revision of this container, echoed back with every click.
+    pub state_id: i32,
 }
 
 impl Default for Inventory {
     fn default() -> Self {
-        Self { slots: vec![None; SLOTS], selected: 0, open: false }
+        Self {
+            slots: vec![None; SLOTS],
+            selected: 0,
+            open: false,
+            carried: None,
+            state_id: 0,
+        }
     }
 }
 
 impl Inventory {
     pub fn slot(&self, index: usize) -> Option<&Stack> {
         self.slots.get(index).and_then(|s| s.as_ref())
+    }
+
+    /// What is on the cursor, mid-drag.
+    pub fn carried(&self) -> Option<&Stack> {
+        self.carried.as_ref()
+    }
+
+    pub fn set_carried(&mut self, stack: Option<Stack>) {
+        self.carried = stack;
     }
 
     /// What is in the player's hand.
@@ -134,10 +153,10 @@ impl ItemArt {
         id
     }
 
-    /// One of the game's interface sprites, by its name under `gui/sprites`.
+    /// One of the game's interface pictures, by its path under `textures/gui`.
     pub fn sprite(&mut self, ctx: &egui::Context, name: &str) -> Option<(egui::TextureId, [f32; 2])> {
         if !self.sprites.contains_key(name) {
-            let path = format!("assets/minecraft/textures/gui/sprites/{name}.png");
+            let path = format!("assets/minecraft/textures/gui/{name}.png");
             let handle = self
                 .packs()
                 .and_then(|packs| packs.read(&path))
@@ -184,7 +203,7 @@ pub fn hotbar(ui: &egui::Ui, inventory: &Inventory, art: &mut ItemArt, scale: f3
     let top = screen.bottom() - bar_h - 4.0 * scale;
     let bar = egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(bar_w, bar_h));
 
-    match art.sprite(&ctx, "hud/hotbar") {
+    match art.sprite(&ctx, "sprites/hud/hotbar") {
         Some((id, _)) => {
             painter.image(id, bar, full_uv(), egui::Color32::WHITE);
         }
@@ -208,7 +227,7 @@ pub fn hotbar(ui: &egui::Ui, inventory: &Inventory, art: &mut ItemArt, scale: f3
         egui::pos2(x, top - 1.0 * scale),
         egui::vec2(24.0 * scale, 24.0 * scale),
     );
-    match art.sprite(&ctx, "hud/hotbar_selection") {
+    match art.sprite(&ctx, "sprites/hud/hotbar_selection") {
         Some((id, _)) => {
             painter.image(id, selection, full_uv(), egui::Color32::WHITE);
         }
@@ -311,13 +330,13 @@ pub fn vitals(ui: &egui::Ui, art: &mut ItemArt, scale: f32, health: f32, food: i
         }
     };
 
-    row(left, health, "hud/heart/full", "hud/heart/half", "hud/heart/container", true);
+    row(left, health, "sprites/hud/heart/full", "sprites/hud/heart/half", "sprites/hud/heart/container", true);
     row(
         left + bar_w - 9.0 * 8.0 * scale - icon,
         food as f32,
-        "hud/food_full",
-        "hud/food_half",
-        "hud/food_empty",
+        "sprites/hud/food_full",
+        "sprites/hud/food_half",
+        "sprites/hud/food_empty",
         false,
     );
 }
@@ -348,25 +367,115 @@ fn draw_slot(
     }
 
     if stack.count > 1 {
-        let at = egui::pos2(cell.right() + scale, cell.bottom() + scale);
-        let font = egui::FontId::proportional(9.0 * scale);
-        // The game draws item counts with a hard black shadow one pixel down
-        // and right, and it is a surprising amount of why they read clearly.
-        painter.text(
-            at + egui::vec2(scale, scale),
-            egui::Align2::RIGHT_BOTTOM,
-            stack.count.to_string(),
-            font.clone(),
-            egui::Color32::from_rgb(0x3E, 0x3E, 0x3E),
-        );
-        painter.text(
-            at,
-            egui::Align2::RIGHT_BOTTOM,
-            stack.count.to_string(),
-            font,
-            egui::Color32::WHITE,
-        );
+        count_label(painter, cell, stack.count, scale);
     }
+}
+
+/// The stack size, in the corner of a slot.
+fn count_label(painter: &egui::Painter, cell: egui::Rect, count: i32, scale: f32) {
+    let at = egui::pos2(cell.right() + scale, cell.bottom() + scale);
+    let font = egui::FontId::proportional(9.0 * scale);
+    // The game draws item counts with a hard black shadow one pixel down and
+    // right, and it is a surprising amount of why they read clearly.
+    painter.text(
+        at + egui::vec2(scale, scale),
+        egui::Align2::RIGHT_BOTTOM,
+        count.to_string(),
+        font.clone(),
+        egui::Color32::from_rgb(0x3E, 0x3E, 0x3E),
+    );
+    painter.text(at, egui::Align2::RIGHT_BOTTOM, count.to_string(), font, egui::Color32::WHITE);
+}
+
+/// Where each slot sits on the inventory screen, in the game's own pixels
+/// against the 176 by 166 panel.
+///
+/// Indices are the container's, which is why they run in this order: the
+/// crafting result, the grid, armour, the backpack, the hotbar, the off hand.
+fn slot_positions() -> Vec<(usize, [f32; 2])> {
+    let mut out = Vec::with_capacity(SLOTS);
+    out.push((CRAFTING_OUTPUT, [154.0, 28.0]));
+    for i in CRAFTING_GRID {
+        let n = i - CRAFTING_GRID.start;
+        out.push((i, [98.0 + (n % 2) as f32 * 18.0, 18.0 + (n / 2) as f32 * 18.0]));
+    }
+    for i in ARMOUR {
+        out.push((i, [8.0, 8.0 + (i - ARMOUR.start) as f32 * 18.0]));
+    }
+    for i in BACKPACK {
+        let n = i - BACKPACK.start;
+        out.push((i, [8.0 + (n % 9) as f32 * 18.0, 84.0 + (n / 9) as f32 * 18.0]));
+    }
+    for i in HOTBAR {
+        out.push((i, [8.0 + (i - HOTBAR.start) as f32 * 18.0, 142.0]));
+    }
+    out.push((OFF_HAND, [77.0, 62.0]));
+    out
+}
+
+/// The whole inventory screen. Returns the slot that was clicked, if one was.
+pub fn screen(
+    ui: &egui::Ui,
+    inventory: &Inventory,
+    art: &mut ItemArt,
+    scale: f32,
+) -> Option<(usize, bool)> {
+    let screen = ui.clip_rect();
+    let ctx = ui.ctx().clone();
+    let painter = ui.painter();
+    painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(140));
+
+    // The panel is 176 by 166 of the game's pixels, and every slot is placed
+    // against that grid rather than against the window.
+    let panel = egui::Rect::from_center_size(
+        screen.center(),
+        egui::vec2(176.0 * scale, 166.0 * scale),
+    );
+    match art.sprite(&ctx, "container/inventory") {
+        Some((id, size)) => {
+            // The texture is a 256 square with the panel in its top left.
+            let uv = egui::Rect::from_min_max(
+                egui::pos2(0.0, 0.0),
+                egui::pos2(176.0 / size[0], 166.0 / size[1]),
+            );
+            painter.image(id, panel, uv, egui::Color32::WHITE);
+        }
+        None => {
+            painter.rect_filled(panel, 4.0, egui::Color32::from_gray(198));
+        }
+    }
+
+    let pointer = ui.ctx().pointer_latest_pos();
+    let mut hit = None;
+    for (index, at) in slot_positions() {
+        let cell = egui::Rect::from_min_size(
+            panel.min + egui::vec2(at[0] * scale, at[1] * scale),
+            egui::vec2(16.0 * scale, 16.0 * scale),
+        );
+        // The slot's own square is a pixel out from the item on every side.
+        let square = cell.expand(scale);
+        if pointer.is_some_and(|p| square.contains(p)) {
+            painter.rect_filled(square, 0.0, egui::Color32::from_white_alpha(90));
+            if ui.ctx().input(|i| i.pointer.primary_pressed()) {
+                hit = Some((index, false));
+            } else if ui.ctx().input(|i| i.pointer.secondary_pressed()) {
+                hit = Some((index, true));
+            }
+        }
+        draw_slot(ui, painter, art, inventory.slot(index), cell, scale);
+    }
+
+    // Whatever is on the cursor rides with it.
+    if let (Some(stack), Some(at)) = (inventory.carried(), pointer)
+        && let Some(id) = art.item(&ctx, stack)
+    {
+        let cell = egui::Rect::from_center_size(at, egui::vec2(16.0 * scale, 16.0 * scale));
+        painter.image(id, cell, full_uv(), egui::Color32::WHITE);
+        if stack.count > 1 {
+            count_label(painter, cell, stack.count, scale);
+        }
+    }
+    hit
 }
 
 fn full_uv() -> egui::Rect {

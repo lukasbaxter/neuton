@@ -143,12 +143,13 @@ pub enum Event {
     /// the slots before it are good, the ones after it were not attempted.
     Container {
         window: i32,
+        state_id: i32,
         slots: Vec<Option<Stack>>,
         carried: Option<Stack>,
         unread: Option<String>,
     },
     /// One slot of one container changed.
-    Slot { window: i32, slot: i32, stack: Option<Stack> },
+    Slot { window: i32, state_id: i32, slot: i32, stack: Option<Stack> },
     /// The server moved the hotbar selection, which it does on join and when a
     /// plugin sets it.
     HeldSlot(i32),
@@ -520,9 +521,9 @@ impl Connection {
                 }
                 ids::play::clientbound::CONTAINER_SET_CONTENT => {
                     let window = r.read_varint().map_err(named)?;
-                    // A state ID for the server to match acknowledgements
-                    // against. Only useful once this client can click a slot.
-                    let _state = r.read_varint().map_err(named)?;
+                    // The server's revision of this container. Every click has
+                    // to echo the latest one back or the server rejects it.
+                    let state_id = r.read_varint().map_err(named)?;
                     let count = r.read_varint_len(1024).map_err(named)?;
                     let (slots, stopped) = crate::items::read_stacks(&mut r, count);
                     // A stack this client cannot read costs the rest of the
@@ -532,14 +533,20 @@ impl Connection {
                     } else {
                         None
                     };
-                    return Ok(Event::Container { window, slots, carried, unread: stopped });
+                    return Ok(Event::Container {
+                        window,
+                        state_id,
+                        slots,
+                        carried,
+                        unread: stopped,
+                    });
                 }
                 ids::play::clientbound::CONTAINER_SET_SLOT => {
                     let window = r.read_varint().map_err(named)?;
-                    let _state = r.read_varint().map_err(named)?;
+                    let state_id = r.read_varint().map_err(named)?;
                     let slot = i32::from(r.read_i16().map_err(named)?);
                     let stack = crate::items::read_stack(&mut r).map_err(named)?;
-                    return Ok(Event::Slot { window, slot, stack });
+                    return Ok(Event::Slot { window, state_id, slot, stack });
                 }
                 ids::play::clientbound::SET_HELD_SLOT => {
                     let slot = r.read_varint().map_err(named)?;
@@ -786,6 +793,39 @@ impl Connection {
         let mut w = Writer::new();
         w.write_i16(slot as i16);
         self.framed.write_packet(ids::play::serverbound::SET_CARRIED_ITEM, &w)?;
+        Ok(())
+    }
+
+    /// Clicks a slot in an open container.
+    ///
+    /// The changed-slot map is sent empty. The client is meant to predict the
+    /// result and let the server correct it, and this one does not predict, so
+    /// it says so honestly and takes the correction the server sends back.
+    pub fn send_container_click(
+        &mut self,
+        window: i32,
+        state_id: i32,
+        slot: i16,
+        button: u8,
+        mode: i32,
+    ) -> Result<()> {
+        let mut w = Writer::new();
+        w.write_varint(window);
+        w.write_varint(state_id);
+        w.write_i16(slot);
+        w.write_u8(button);
+        w.write_varint(mode);
+        w.write_varint(0); // no predicted slot changes
+        w.write_varint(0); // and nothing predicted on the cursor
+        self.framed.write_packet(ids::play::serverbound::CONTAINER_CLICK, &w)?;
+        Ok(())
+    }
+
+    /// Closes an open container.
+    pub fn send_close_container(&mut self, window: i32) -> Result<()> {
+        let mut w = Writer::new();
+        w.write_varint(window);
+        self.framed.write_packet(ids::play::serverbound::CONTAINER_CLOSE, &w)?;
         Ok(())
     }
 
