@@ -47,13 +47,16 @@ fn vs_main(in: VertexIn) -> VertexOut {
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     var color = textureSample(atlas, atlas_sampler, in.uv);
 
-    // Cut out fully transparent texels rather than blending them. Foliage and
-    // glass would otherwise write depth over whatever is behind them.
-    if (color.a < 0.1) {
+    // Cutout, not blending. Leaves and grass have soft edges in the texture,
+    // and blending them leaves a halo of whatever was behind: against the sky
+    // that reads as a white fringe around every tree. A hard threshold is what
+    // the game does for foliage, and it survives mipmapping, where a blended
+    // edge only gets softer and paler with distance.
+    if (color.a < 0.5) {
         discard;
     }
 
-    color = vec4<f32>(color.rgb * in.tint * in.light, color.a);
+    color = vec4<f32>(color.rgb * in.tint * in.light, 1.0);
 
     let fog = clamp(
         (in.view_distance - globals.fog.x) / max(globals.fog.y - globals.fog.x, 0.001),

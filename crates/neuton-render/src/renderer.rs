@@ -112,9 +112,13 @@ impl WorldRenderer {
             label: Some("atlas"),
             // Nearest magnification keeps pixel art sharp up close; linear
             // minification stops distant blocks shimmering as the camera moves.
+            // Nearest magnification keeps pixel art sharp up close. Linear
+            // minification and trilinear mip blending stop distant blocks
+            // shimmering, which is the most obvious artefact once a world is
+            // more than a few chunks deep.
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
         let atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -179,7 +183,10 @@ impl WorldRenderer {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    // Opaque: the fragment shader discards rather than blends,
+                    // so every surviving fragment fully replaces what is under
+                    // it and depth ordering stops mattering.
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -344,6 +351,7 @@ fn upload_atlas(
     textures: &BlockTextures,
 ) -> wgpu::TextureView {
     let atlas = &textures.atlas;
+    let mips = atlas.mips();
     let size = wgpu::Extent3d {
         width: atlas.size,
         height: atlas.size,
@@ -357,28 +365,33 @@ fn upload_atlas(
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("block atlas"),
         size,
-        mip_level_count: 1,
+        mip_level_count: mips.len() as u32 + 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &atlas.pixels,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(atlas.size * 4),
-            rows_per_image: Some(atlas.size),
-        },
-        size,
-    );
+    // Level 0, then the chain, each half the size of the one before it.
+    let mut width = atlas.size;
+    for (level, pixels) in std::iter::once(&atlas.pixels).chain(mips.iter()).enumerate() {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(width),
+            },
+            wgpu::Extent3d { width, height: width, depth_or_array_layers: 1 },
+        );
+        width /= 2;
+    }
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
