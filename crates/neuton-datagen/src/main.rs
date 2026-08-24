@@ -9,6 +9,7 @@
 //!   cargo run -p neuton-datagen -- [--mc-dir <dir>] [--java <path>]
 
 mod blocks;
+mod items;
 mod packets;
 mod paths;
 
@@ -72,6 +73,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     packets::generate(&ctx)?;
     blocks::generate(&ctx)?;
+    items::generate(&ctx)?;
 
     println!("datagen: done");
     Ok(())

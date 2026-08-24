@@ -18,6 +18,11 @@ pub enum Error {
     BadEnum { got: i32 },
     /// A packet ID we have no decoder for, in the given state.
     UnknownPacket { state: &'static str, id: i32 },
+    /// An item carried a data component this client has no reader for. The
+    /// name is from the registry, so it says exactly what to add.
+    UnknownComponent { name: &'static str },
+    /// NBT embedded in a packet did not parse.
+    BadNbt,
     /// Key exchange or cipher setup failed.
     Crypto(String),
 }
@@ -35,6 +40,10 @@ impl fmt::Display for Error {
             Error::UnknownPacket { state, id } => {
                 write!(f, "unknown packet id {id:#04x} in state {state}")
             }
+            Error::UnknownComponent { name } => {
+                write!(f, "no reader for item component {name}")
+            }
+            Error::BadNbt => f.write_str("malformed nbt"),
             Error::Crypto(msg) => write!(f, "encryption failed: {msg}"),
         }
     }

@@ -4,6 +4,7 @@ use crate::registries::{DimensionShape, Registries};
 use neuton_auth::Session;
 use neuton_protocol::crypto::{SharedSecret, encrypt_key_exchange, server_hash};
 use neuton_protocol::{Framed, PROTOCOL_VERSION, Reader, State, Writer, ids};
+use crate::items::Stack;
 use neuton_world::Chunk;
 use std::io;
 use std::net::TcpStream;
@@ -135,6 +136,22 @@ pub enum Event {
     /// What the server says the player may do. Sent on join and whenever the
     /// game mode changes.
     Abilities(neuton_world::physics::Abilities),
+    /// The whole of an open container, the player's own inventory included.
+    /// Slot numbering is the container's: for the inventory screen, 0 is the
+    /// crafting output and 36 to 44 are the hotbar.
+    /// `unread` names the data component that stopped the read, when one did:
+    /// the slots before it are good, the ones after it were not attempted.
+    Container {
+        window: i32,
+        slots: Vec<Option<Stack>>,
+        carried: Option<Stack>,
+        unread: Option<String>,
+    },
+    /// One slot of one container changed.
+    Slot { window: i32, slot: i32, stack: Option<Stack> },
+    /// The server moved the hotbar selection, which it does on join and when a
+    /// plugin sets it.
+    HeldSlot(i32),
     Disconnect(String),
     /// Answered automatically; surfaced so latency can be tracked.
     KeepAlive,
@@ -162,6 +179,9 @@ pub struct Connection {
     /// The last position and rotation the server was told about. Relative
     /// teleports are offsets from this, and so are echoed back against it.
     reported: ([f64; 3], (f32, f32)),
+    /// The player's own entity ID, so packets addressed to it can be told apart
+    /// from the ones about everything else in the world.
+    entity_id: i32,
 }
 
 impl Connection {
@@ -178,6 +198,7 @@ impl Connection {
             stats: Stats::default(),
             started,
             reported: ([0.0; 3], (0.0, 0.0)),
+            entity_id: 0,
         };
 
         conn.handshake(host, port)?;
@@ -414,7 +435,10 @@ impl Connection {
                     })?;
                     self.stats.join_ms = self.started.elapsed().as_secs_f64() * 1000.0;
                     return Ok(Event::Joined {
-                        entity_id,
+                        entity_id: {
+                            self.entity_id = entity_id;
+                            entity_id
+                        },
                         dimension: self.dimension.clone(),
                     });
                 }
@@ -478,6 +502,33 @@ impl Connection {
 
                     return Ok(Event::Teleported { x, y, z, yaw, pitch, relative });
                 }
+                ids::play::clientbound::CONTAINER_SET_CONTENT => {
+                    let window = r.read_varint().map_err(named)?;
+                    // A state ID for the server to match acknowledgements
+                    // against. Only useful once this client can click a slot.
+                    let _state = r.read_varint().map_err(named)?;
+                    let count = r.read_varint_len(1024).map_err(named)?;
+                    let (slots, stopped) = crate::items::read_stacks(&mut r, count);
+                    // A stack this client cannot read costs the rest of the
+                    // packet, not the connection.
+                    let carried = if stopped.is_none() {
+                        crate::items::read_stack(&mut r).ok().flatten()
+                    } else {
+                        None
+                    };
+                    return Ok(Event::Container { window, slots, carried, unread: stopped });
+                }
+                ids::play::clientbound::CONTAINER_SET_SLOT => {
+                    let window = r.read_varint().map_err(named)?;
+                    let _state = r.read_varint().map_err(named)?;
+                    let slot = i32::from(r.read_i16().map_err(named)?);
+                    let stack = crate::items::read_stack(&mut r).map_err(named)?;
+                    return Ok(Event::Slot { window, slot, stack });
+                }
+                ids::play::clientbound::SET_HELD_SLOT => {
+                    let slot = r.read_varint().map_err(named)?;
+                    return Ok(Event::HeldSlot(slot));
+                }
                 ids::play::clientbound::KEEP_ALIVE => {
                     let token = r.read_i64().map_err(named)?;
                     let mut w = Writer::new();
@@ -530,12 +581,29 @@ impl Connection {
                     self.state = State::Configuration;
                     self.configure()?;
                 }
-                other => {
+                ids::play::clientbound::ENTITY_POSITION_SYNC => {
+                    let who = r.read_varint().map_err(named)?;
+                    if std::env::var_os("NEUTON_TRACE").is_some_and(|v| v == "2") {
+                        let x = r.read_f64().unwrap_or_default();
+                        let y = r.read_f64().unwrap_or_default();
+                        let z = r.read_f64().unwrap_or_default();
+                        eprintln!(
+                            "net: entity_position_sync {who}{} to {x:.1} {y:.1} {z:.1}",
+                            if who == self.entity_id { " (us)" } else { "" }
+                        );
+                    }
                     return Ok(Event::Ignored {
-                        id: other,
-                        name: ids::play::clientbound::name(other).unwrap_or("unknown"),
+                        id: ids::play::clientbound::ENTITY_POSITION_SYNC,
+                        name: "minecraft:entity_position_sync",
                         len,
                     });
+                }
+                other => {
+                    let name = ids::play::clientbound::name(other).unwrap_or("unknown");
+                    if std::env::var_os("NEUTON_TRACE").is_some_and(|v| v == "2") {
+                        eprintln!("net: ignored {name} ({other}) len {len}");
+                    }
+                    return Ok(Event::Ignored { id: other, name, len });
                 }
             }
         }
@@ -605,6 +673,15 @@ impl Connection {
     /// client does not claim to have turned when it has not.
     ///
     /// `y` is the feet, not the eyes, which is where the camera sits.
+    /// Tells the server which hotbar slot is selected. Without this the server
+    /// keeps handing out the first slot's item however the client draws it.
+    pub fn send_held_slot(&mut self, slot: i32) -> Result<()> {
+        let mut w = Writer::new();
+        w.write_i16(slot as i16);
+        self.framed.write_packet(ids::play::serverbound::SET_CARRIED_ITEM, &w)?;
+        Ok(())
+    }
+
     pub fn send_movement(
         &mut self,
         position: Option<[f64; 3]>,
@@ -674,6 +751,9 @@ impl Connection {
     /// Sent once, after the first teleport is acknowledged. The server holds
     /// some state back until it arrives.
     pub fn send_loaded(&mut self) -> Result<()> {
+        if std::env::var_os("NEUTON_TRACE").is_some() {
+            eprintln!("net: player_loaded");
+        }
         self.framed
             .write_packet(ids::play::serverbound::PLAYER_LOADED, &Writer::new())?;
         Ok(())

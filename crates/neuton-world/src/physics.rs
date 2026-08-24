@@ -240,12 +240,17 @@ pub fn step(body: &mut Body, input: Input, world: &dyn BlockView, shapes: &dyn B
         }
     }
 
-    // Forward is where the camera looks; right is ninety degrees clockwise from
-    // it, which on these axes is the negation of the usual cross product.
+    // Forward is where the camera looks; right is a quarter turn clockwise from
+    // it. Both axes are built from the same pair of terms, and getting one sign
+    // wrong does not tilt the strafe slightly -- it reflects it, so at forty
+    // five degrees "right" points backwards and A and D become another pair of
+    // forward and back keys.
     let yaw = (input.yaw as f64).to_radians();
     let (sin, cos) = yaw.sin_cos();
-    body.velocity[0] += (wish[1] * -sin - wish[0] * -cos) * acceleration;
-    body.velocity[2] += (wish[1] * cos + wish[0] * -sin) * acceleration;
+    let forward = [-sin, cos];
+    let right = [-cos, -sin];
+    body.velocity[0] += (forward[0] * wish[1] + right[0] * wish[0]) * acceleration;
+    body.velocity[2] += (forward[1] * wish[1] + right[1] * wish[0]) * acceleration;
 
     let motion = body.velocity;
     let moved = move_with_collision(body, motion, world, shapes);
@@ -650,6 +655,50 @@ mod tests {
         step(&mut body, Input::default(), &Void, &Cubes);
         let per_tick = fell - body.position[1];
         assert!((per_tick - 3.92).abs() < 0.01, "fell at {per_tick} blocks a tick");
+    }
+
+    #[test]
+    fn strafing_is_square_to_looking_at_every_angle() {
+        // The old test only ever looked due west, where the reflected strafe
+        // vector happens to coincide with the correct one. Every angle, then.
+        for turn in 0..24 {
+            let yaw = turn as f32 * 15.0;
+            let direction = |forward: f32, strafe: f32| {
+                let mut body = walker(0.5, 1.0);
+                body.on_ground = true;
+                let input = Input { forward, strafe, yaw, ..Default::default() };
+                let before = body.position;
+                step(&mut body, input, &Floor, &Cubes);
+                [body.position[0] - before[0], body.position[2] - before[2]]
+            };
+            let ahead = direction(1.0, 0.0);
+            let across = direction(0.0, 1.0);
+
+            let dot = ahead[0] * across[0] + ahead[1] * across[1];
+            assert!(dot.abs() < 1e-9, "at {yaw} degrees strafe is not square to forward");
+
+            // Right, specifically, not left. Facing south, your right hand
+            // points west, so forward crossed with right comes out positive on
+            // these axes.
+            let cross = ahead[0] * across[1] - ahead[1] * across[0];
+            assert!(cross > 0.0, "at {yaw} degrees D walks left, not right");
+        }
+    }
+
+    #[test]
+    fn looking_south_walks_south() {
+        // Yaw zero faces positive Z, and right of that is negative X.
+        let mut body = walker(0.5, 1.0);
+        body.on_ground = true;
+        let before = body.position;
+        step(&mut body, Input { forward: 1.0, yaw: 0.0, ..Default::default() }, &Floor, &Cubes);
+        assert!(body.position[2] - before[2] > 0.0, "forward should go south");
+
+        let mut body = walker(0.5, 1.0);
+        body.on_ground = true;
+        let before = body.position;
+        step(&mut body, Input { strafe: 1.0, yaw: 0.0, ..Default::default() }, &Floor, &Cubes);
+        assert!(body.position[0] - before[0] < 0.0, "right of south is west");
     }
 
     #[test]
