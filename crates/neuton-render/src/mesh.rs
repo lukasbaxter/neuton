@@ -5,7 +5,8 @@
 //! neighbour hides them, which is where nearly all the geometry goes: the
 //! inside of the world, and the inside of every ocean, is most of the world.
 
-use crate::textures::{BakedElement, BlockTextures};
+use crate::textures::{BakedElement, BiomeTints, BlockTextures};
+use neuton_world::BIOME_VOLUME;
 use neuton_blocks::StateId;
 use neuton_world::{Chunk, SECTION_VOLUME, block_index};
 
@@ -245,6 +246,18 @@ pub fn build_at(
     textures: &BlockTextures,
     daylight: f32,
 ) -> Mesh {
+    build_full(chunk, neighbours, look, textures, &BiomeTints::default(), daylight)
+}
+
+/// Builds a chunk's mesh, colouring tinted faces by the biome they sit in.
+pub fn build_full(
+    chunk: &Chunk,
+    neighbours: Neighbours<'_>,
+    look: &dyn BlockAppearance,
+    textures: &BlockTextures,
+    biomes: &BiomeTints,
+    daylight: f32,
+) -> Mesh {
     let mut mesh = Mesh::default();
     let sections = chunk.sections.len();
 
@@ -253,6 +266,9 @@ pub fn build_at(
     // wrongly-drawn faces every sixteen blocks.
     let mut column = vec![0u32; sections * SECTION_VOLUME];
     let mut scratch = vec![0u32; SECTION_VOLUME];
+    // Biomes are stored per 4x4x4 cell, so a section holds 64 of them.
+    let mut biome_ids = vec![0u32; sections * BIOME_VOLUME];
+    let mut biome_scratch = vec![0u32; BIOME_VOLUME];
     for (i, section) in chunk.sections.iter().enumerate() {
         let target = &mut column[i * SECTION_VOLUME..(i + 1) * SECTION_VOLUME];
         if section.is_empty() {
@@ -263,6 +279,12 @@ pub fn build_at(
             target.copy_from_slice(&scratch);
         } else {
             target.fill(0);
+        }
+    }
+    for (i, section) in chunk.sections.iter().enumerate() {
+        let target = &mut biome_ids[i * BIOME_VOLUME..(i + 1) * BIOME_VOLUME];
+        if section.biomes.unpack_into(&mut biome_scratch) {
+            target.copy_from_slice(&biome_scratch);
         }
     }
 
@@ -348,6 +370,11 @@ pub fn build_at(
                 if model.is_empty() {
                     continue;
                 }
+                // One biome per 4x4x4 cell, in the same y, z, x order as blocks.
+                let biome = biome_ids[(y as usize / 16) * BIOME_VOLUME
+                    + ((y as usize % 16) / 4) * 16
+                    + (z as usize / 4) * 4
+                    + (x as usize / 4)];
                 let base = [x as f32, (y + chunk.min_y) as f32, z as f32];
                 // A fluid's surface sits just below the top of its block unless
                 // there is more of the same fluid above it, which is what gives
@@ -362,7 +389,7 @@ pub fn build_at(
                 for element in &model.elements {
                     push_element(
                         &mut mesh, base, element, state, look, &at, &hides, x, y, z, chunk,
-                        daylight, surface,
+                        daylight, surface, biomes, biome,
                     );
                 }
             }
@@ -386,6 +413,8 @@ fn push_element(
     chunk: &Chunk,
     daylight: f32,
     surface: f32,
+    biomes: &BiomeTints,
+    biome: u32,
 ) {
     // World Y, since light is indexed in world coordinates while the block loop
     // counts from the bottom of the column.
@@ -481,12 +510,13 @@ fn push_element(
         }
 
         let alpha = look.alpha(state);
+        let tint = biomes.get(biome, face.tint);
         let start = mesh.vertices.len() as u32;
         for (i, (corner, uv)) in dir.corners(from, to).iter().zip(face.uv.corners()).enumerate() {
             mesh.vertices.push(Vertex {
                 position: *corner,
                 uv,
-                tint: [face.tint[0], face.tint[1], face.tint[2], alpha],
+                tint: [tint[0], tint[1], tint[2], alpha],
                 light: shade * AO_LEVELS[ao[i]] * lit[i],
             });
         }

@@ -10,6 +10,7 @@ neuton-world = { path = "../neuton-world" }
 bytemuck = { version = "1", features = ["derive"] }
 neuton-assets = { version = "0.1.0", path = "../neuton-assets" }
 wgpu = "30.0.1"
+neuton-net = { version = "0.1.0", path = "../neuton-net" }
 
 [dev-dependencies]
 png = "0.18.1"

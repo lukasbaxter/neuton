@@ -27,59 +27,77 @@ pub enum TintSource {
     Fixed(u32),
 }
 
-/// Colormaps loaded from the pack stack, and the tints sampled out of them.
-pub struct Tints {
-    grass: Rgb,
-    foliage: Rgb,
-    dry_foliage: Rgb,
-    water: Rgb,
+/// A decoded colormap, kept so any climate can be looked up in it.
+struct ColorMap {
+    rgb: Vec<u8>,
+    width: u32,
+    height: u32,
 }
 
-impl Default for Tints {
-    fn default() -> Self {
-        // Vanilla's own fallbacks, used when a pack ships no colormap.
-        Self {
-            grass: rgb(0x91BD59),
-            foliage: rgb(0x77AB2F),
-            dry_foliage: rgb(0xAEA42A),
-            water: rgb(0x3F76E4),
-        }
-    }
+/// Colormaps loaded from the pack stack.
+#[derive(Default)]
+pub struct Tints {
+    grass_map: Option<ColorMap>,
+    foliage_map: Option<ColorMap>,
+    dry_foliage_map: Option<ColorMap>,
 }
 
 impl Tints {
-    /// Samples the colormaps for a temperate biome.
-    ///
-    /// One tint for the whole world for now. Per-biome tinting needs the biome
-    /// registry resolved and the biome palette read per section, which is a
-    /// larger job; sampling at plains conditions is what most of a normal world
-    /// looks like anyway.
+    /// Loads the colormaps out of the pack stack.
     pub fn load(packs: &mut PackStack) -> Self {
-        let mut out = Self::default();
-        // Plains: temperature 0.8, downfall 0.4.
-        if let Some(c) = sample(packs, "assets/minecraft/textures/colormap/grass.png", 0.8, 0.4) {
-            out.grass = c;
+        let load = |packs: &mut PackStack, path: &str| decode(&packs.read(path)?);
+        Self {
+            grass_map: load(packs, "assets/minecraft/textures/colormap/grass.png"),
+            foliage_map: load(packs, "assets/minecraft/textures/colormap/foliage.png"),
+            dry_foliage_map: load(packs, "assets/minecraft/textures/colormap/dry_foliage.png"),
         }
-        if let Some(c) = sample(packs, "assets/minecraft/textures/colormap/foliage.png", 0.8, 0.4) {
-            out.foliage = c;
-        }
-        if let Some(c) =
-            sample(packs, "assets/minecraft/textures/colormap/dry_foliage.png", 0.8, 0.4)
-        {
-            out.dry_foliage = c;
-        }
-        out
     }
 
+    /// The colour a source takes in a given climate.
+    ///
+    /// Temperature runs along one axis of the colormap and rainfall scaled by
+    /// temperature along the other, both inverted, which is why a hot dry biome
+    /// lands in the corner vanilla fills with desert tan.
+    pub fn sample(&self, source: TintSource, temperature: f32, downfall: f32) -> Rgb {
+        let map = match source {
+            TintSource::Grass => &self.grass_map,
+            TintSource::Foliage => &self.foliage_map,
+            TintSource::DryFoliage => &self.dry_foliage_map,
+            TintSource::Water => return rgb(0x3F76E4),
+            TintSource::Fixed(hex) => return rgb(hex),
+            TintSource::None => return NO_TINT,
+        };
+        let fallback = match source {
+            TintSource::Grass => 0x91BD59,
+            TintSource::Foliage => 0x77AB2F,
+            _ => 0xAEA42A,
+        };
+        let Some(map) = map else { return rgb(fallback) };
+
+        let temperature = temperature.clamp(0.0, 1.0);
+        let adjusted = downfall.clamp(0.0, 1.0) * temperature;
+        let x = ((1.0 - temperature) * 255.0) as u32;
+        let y = ((1.0 - adjusted) * 255.0) as u32;
+        map.at(x, y).unwrap_or_else(|| rgb(fallback))
+    }
+
+    /// The tint for a temperate biome, for callers with no biome data.
     pub fn get(&self, source: TintSource) -> Rgb {
-        match source {
-            TintSource::None => NO_TINT,
-            TintSource::Grass => self.grass,
-            TintSource::Foliage => self.foliage,
-            TintSource::DryFoliage => self.dry_foliage,
-            TintSource::Water => self.water,
-            TintSource::Fixed(hex) => rgb(hex),
+        self.sample(source, 0.8, 0.4)
+    }
+}
+
+impl ColorMap {
+    fn at(&self, x: u32, y: u32) -> Option<Rgb> {
+        if x >= self.width || y >= self.height {
+            return None;
         }
+        let i = ((y * self.width + x) * 3) as usize;
+        Some([
+            self.rgb[i] as f32 / 255.0,
+            self.rgb[i + 1] as f32 / 255.0,
+            self.rgb[i + 2] as f32 / 255.0,
+        ])
     }
 }
 
@@ -110,13 +128,8 @@ pub fn source_for(block: &str) -> TintSource {
     TintSource::None
 }
 
-/// Reads one pixel out of a colormap.
-///
-/// The maps are 256x256 indexed by temperature along x and by rainfall scaled
-/// by temperature along y, both inverted. The bottom-right half is unused, so a
-/// hot dry biome lands on a black pixel that vanilla never asks for.
-fn sample(packs: &mut PackStack, path: &str, temperature: f32, downfall: f32) -> Option<Rgb> {
-    let bytes = packs.read(path)?;
+/// Decodes a colormap to plain RGB.
+fn decode(bytes: &[u8]) -> Option<ColorMap> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().ok()?;
@@ -128,20 +141,12 @@ fn sample(packs: &mut PackStack, path: &str, temperature: f32, downfall: f32) ->
         png::ColorType::Rgba => 4,
         _ => return None,
     };
-
-    let temperature = temperature.clamp(0.0, 1.0);
-    let adjusted = (downfall.clamp(0.0, 1.0)) * temperature;
-    let x = ((1.0 - temperature) * 255.0) as u32;
-    let y = ((1.0 - adjusted) * 255.0) as u32;
-    if x >= info.width || y >= info.height {
-        return None;
+    let pixels = (info.width * info.height) as usize;
+    let mut rgb = Vec::with_capacity(pixels * 3);
+    for p in buf[..pixels * channels].chunks_exact(channels) {
+        rgb.extend_from_slice(&p[..3]);
     }
-    let i = ((y * info.width + x) * channels) as usize;
-    Some([
-        buf[i] as f32 / 255.0,
-        buf[i + 1] as f32 / 255.0,
-        buf[i + 2] as f32 / 255.0,
-    ])
+    Some(ColorMap { rgb, width: info.width, height: info.height })
 }
 
 fn rgb(hex: u32) -> Rgb {
@@ -183,6 +188,23 @@ mod tests {
         assert!(grass[1] > grass[0] && grass[1] > grass[2], "{grass:?}");
         assert!(grass[0] < 0.9, "{grass:?}");
         assert_eq!(t.get(TintSource::None), NO_TINT);
+    }
+
+    #[test]
+    fn climate_changes_the_colour() {
+        let Some(jar) = crate::vanilla_jar("26.2") else { return };
+        let mut packs = PackStack::new();
+        packs.push(jar).unwrap();
+        let t = Tints::load(&mut packs);
+
+        // Plains against desert: warm and dry should be visibly drier.
+        let plains = t.sample(TintSource::Grass, 0.8, 0.4);
+        let desert = t.sample(TintSource::Grass, 2.0, 0.0);
+        let snowy = t.sample(TintSource::Grass, 0.0, 0.5);
+        assert_ne!(plains, desert, "climate should change grass colour");
+        assert_ne!(plains, snowy);
+        // Hotter and drier means less green and more yellow.
+        assert!(desert[0] > plains[0], "desert grass should be warmer: {desert:?}");
     }
 
     #[test]

@@ -306,9 +306,10 @@ impl Connection {
 
     fn absorb_registry(&mut self, r: &mut Reader<'_>) -> Result<()> {
         let registry_id = r.read_str()?;
-        // Only dimension_type matters for decoding; skip the rest without
-        // building trees for thousands of biome and damage-type entries.
-        if registry_id != "minecraft:dimension_type" {
+        // Only two registries matter to the renderer: dimension_type decides
+        // how tall a chunk is, and biome decides what colour its grass is.
+        // Everything else would be thousands of trees built to be discarded.
+        if registry_id != "minecraft:dimension_type" && registry_id != "minecraft:worldgen/biome" {
             return Ok(());
         }
         let count = r.read_varint_len(1 << 16)?;
@@ -471,6 +472,10 @@ impl Connection {
 
     pub fn dimension(&self) -> &DimensionShape {
         &self.dimension
+    }
+
+    pub fn registries(&self) -> &Registries {
+        &self.registries
     }
 
     pub fn state(&self) -> State {
