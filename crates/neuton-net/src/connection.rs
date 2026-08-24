@@ -841,6 +841,9 @@ impl Connection {
     ///
     /// `action` is the game's own ordering: 0 starts, 1 gives up, 2 finishes.
     pub fn send_player_action(&mut self, action: i32, at: [i32; 3], face: u8) -> Result<()> {
+        if std::env::var_os("NEUTON_TRACE").is_some() {
+            eprintln!("net: player_action {action} at {at:?} face {face}");
+        }
         self.sequence += 1;
         let mut w = Writer::new();
         w.write_varint(action);

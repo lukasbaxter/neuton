@@ -47,13 +47,13 @@ impl Env {
         Ok(Self { mc_dir, java, repo, version: VERSION.to_string(), protocol })
     }
 
-    fn jar(&self) -> PathBuf {
+    pub fn jar(&self) -> PathBuf {
         self.mc_dir.join("versions").join(&self.version).join(format!("{}.jar", self.version))
     }
 
     /// Builds a classpath of every library the launcher downloaded, plus the
     /// client jar itself.
-    fn classpath(&self) -> Result<String, Err> {
+    pub fn classpath(&self) -> Result<String, Err> {
         let mut jars = Vec::new();
         collect_jars(&self.mc_dir.join("libraries"), &mut jars)?;
         if jars.is_empty() {

@@ -170,6 +170,17 @@ impl neuton_world::BlockShapes for BlockTextures {
 }
 
 /// Baked models for every block state.
+/// How many pictures the game has of a block part way to broken.
+pub const DESTROY_STAGES: u32 = 10;
+
+/// Where one of those pictures lives, in the form the atlas keys on.
+pub fn destroy_stage_texture(stage: u32) -> String {
+    format!(
+        "assets/minecraft/textures/block/destroy_stage_{}.png",
+        stage.min(DESTROY_STAGES - 1)
+    )
+}
+
 pub struct BlockTextures {
     /// Index into `models`, one per state. Deduplicated hard: most states of a
     /// block share a model and most blocks are one plain cube.
@@ -211,6 +222,13 @@ impl BlockTextures {
                     raw[id as usize] = Some(Pending { model, tint, fluid: fluid.clone() });
                 }
             }
+        }
+
+        // The cracks that spread over a block as it is broken. No model refers
+        // to them, so they have to be asked for by name or they are not in the
+        // atlas to draw with.
+        for stage in 0..DESTROY_STAGES {
+            wanted.insert(destroy_stage_texture(stage));
         }
 
         let paths: Vec<String> = wanted.into_iter().collect();

@@ -5,6 +5,7 @@
 
 pub mod chunk;
 pub mod palette;
+pub mod mining;
 pub mod physics;
 pub mod raycast;
 

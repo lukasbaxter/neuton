@@ -56,6 +56,10 @@ pub struct WorldRenderer {
     outline_buffer: wgpu::Buffer,
     /// Line ends in the outline buffer this frame.
     outline_vertices: u32,
+    /// Geometry for the cracks over a block being broken.
+    breaking_vertices: wgpu::Buffer,
+    breaking_indices: wgpu::Buffer,
+    breaking_count: u32,
 }
 
 impl WorldRenderer {
@@ -333,6 +337,19 @@ impl WorldRenderer {
             outline_pipeline,
             outline_buffer,
             outline_vertices: 0,
+            breaking_vertices: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("breaking vertices"),
+                size: (std::mem::size_of::<Vertex>() * 6 * 4 * 16) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            breaking_indices: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("breaking indices"),
+                size: (std::mem::size_of::<u32>() * 6 * 6 * 16) as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            breaking_count: 0,
             atlas_bind_group,
             depth: create_depth(device, width, height),
             depth_size: (width, height),
@@ -442,6 +459,72 @@ impl WorldRenderer {
         let bytes = &bytes[..bytes.len().min(capacity)];
         queue.write_buffer(&self.outline_buffer, 0, bytes);
         self.outline_vertices = (bytes.len() / 12) as u32;
+    }
+
+    /// Sets the cracks drawn over the block being broken.
+    ///
+    /// `stage` runs from zero to nine as the swing progresses; `None` clears
+    /// them. The boxes are the block's own shapes, so cracks appear over a slab
+    /// where the slab is rather than over the whole cube it sits in.
+    pub fn set_breaking(
+        &mut self,
+        queue: &wgpu::Queue,
+        textures: &BlockTextures,
+        boxes: &[([f32; 3], [f32; 3])],
+        stage: Option<u32>,
+    ) {
+        let Some(stage) = stage else {
+            self.breaking_count = 0;
+            return;
+        };
+        let uv = textures.atlas.uv(&crate::textures::destroy_stage_texture(stage));
+        let corners = uv.corners();
+
+        let mut vertices: Vec<Vertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        for (min, max) in boxes {
+            // A hair outside the block, so the cracks sit on the surface rather
+            // than fighting it for the same depth.
+            const OUT: f32 = 0.002;
+            let a = [min[0] - OUT, min[1] - OUT, min[2] - OUT];
+            let b = [max[0] + OUT, max[1] + OUT, max[2] + OUT];
+            // down, up, north, south, west, east, wound so each is seen from
+            // outside the box.
+            let faces: [[[f32; 3]; 4]; 6] = [
+                [[a[0], a[1], b[2]], [b[0], a[1], b[2]], [b[0], a[1], a[2]], [a[0], a[1], a[2]]],
+                [[a[0], b[1], a[2]], [b[0], b[1], a[2]], [b[0], b[1], b[2]], [a[0], b[1], b[2]]],
+                [[b[0], b[1], a[2]], [a[0], b[1], a[2]], [a[0], a[1], a[2]], [b[0], a[1], a[2]]],
+                [[a[0], b[1], b[2]], [b[0], b[1], b[2]], [b[0], a[1], b[2]], [a[0], a[1], b[2]]],
+                [[a[0], b[1], a[2]], [a[0], b[1], b[2]], [a[0], a[1], b[2]], [a[0], a[1], a[2]]],
+                [[b[0], b[1], b[2]], [b[0], b[1], a[2]], [b[0], a[1], a[2]], [b[0], a[1], b[2]]],
+            ];
+            for face in faces {
+                let base = vertices.len() as u32;
+                for (corner, position) in face.iter().enumerate() {
+                    vertices.push(Vertex {
+                        position: *position,
+                        uv: corners[corner],
+                        tint: [1.0, 1.0, 1.0, 1.0],
+                        light: 1.0,
+                    });
+                }
+                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            }
+        }
+
+        let vertex_bytes: &[u8] = bytemuck::cast_slice(&vertices);
+        let index_bytes: &[u8] = bytemuck::cast_slice(&indices);
+        if vertex_bytes.len() as u64 > self.breaking_vertices.size()
+            || index_bytes.len() as u64 > self.breaking_indices.size()
+        {
+            // More shapes than the buffer holds: a block with sixteen boxes is
+            // not worth growing a buffer for mid-frame.
+            self.breaking_count = 0;
+            return;
+        }
+        queue.write_buffer(&self.breaking_vertices, 0, vertex_bytes);
+        queue.write_buffer(&self.breaking_indices, 0, index_bytes);
+        self.breaking_count = indices.len() as u32;
     }
 
     pub fn forget(&mut self, x: i32, z: i32) {
@@ -586,6 +669,13 @@ impl WorldRenderer {
         // Second: water and glass, over everything solid, so what is behind
         // them has already been drawn and can show through.
         pass.set_pipeline(&self.translucent_pipeline);
+        // The cracks go in this pass: they are a texture with holes in it laid
+        // over a block that has already been drawn.
+        if self.breaking_count > 0 {
+            pass.set_vertex_buffer(0, self.breaking_vertices.slice(..));
+            pass.set_index_buffer(self.breaking_indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.breaking_count, 0, 0..1);
+        }
         for chunk in &visible {
             let Some(buffer) = &chunk.translucent else { continue };
             pass.set_vertex_buffer(0, chunk.vertices.slice(..));

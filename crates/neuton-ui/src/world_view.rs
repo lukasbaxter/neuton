@@ -300,6 +300,13 @@ impl WorldView {
         self.pump_events(renderer, device);
         self.tick_physics(dt);
         self.aim();
+        // For looking at the breaking animation without a hand on the mouse.
+        if std::env::var_os("NEUTON_BREAK").is_some() {
+            self.camera.pitch = 60.0;
+            if self.mining.is_none() && self.target.is_some() && self.placed {
+                self.begin_breaking();
+            }
+        }
         self.show_target(renderer, queue);
 
         // Holding the use button lays a run of blocks, at the rate the game
@@ -311,15 +318,17 @@ impl WorldView {
         {
             self.use_item();
         }
-        // Looking away from a block gives up on breaking it, and starting on
-        // whatever is under the crosshair now is a new swing.
+        // Looking at a different block gives up on the one being broken and
+        // starts on that one instead. Only a different block, though: the
+        // crosshair finding nothing for a frame is what happens when a chunk is
+        // being replaced underneath it, and giving up on that resets the
+        // server's progress and means nothing ever breaks.
         if let Some((at, _)) = self.mining
-            && self.target.is_none_or(|hit| hit.block != at)
+            && let Some(hit) = self.target
+            && hit.block != at
         {
             self.stop_breaking();
-            if self.target.is_some() {
-                self.begin_breaking();
-            }
+            self.begin_breaking();
         }
         // The arm keeps moving while a block is being broken.
         const SWING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
@@ -768,7 +777,18 @@ impl WorldView {
         }
     }
 
-    /// Draws the box around whatever is being pointed at.
+    /// The block state at a world position, if its column is loaded.
+    fn state_at(&self, at: [i32; 3]) -> Option<neuton_blocks::StateId> {
+        let column = (at[0].div_euclid(16), at[2].div_euclid(16));
+        self.blocks.get(&column)?.state_at(
+            at[0].rem_euclid(16) as usize,
+            at[1],
+            at[2].rem_euclid(16) as usize,
+        )
+    }
+
+    /// Draws the box around whatever is being pointed at, and the cracks over
+    /// whatever is being broken.
     fn show_target(&self, renderer: &mut WorldRenderer, queue: &wgpu::Queue) {
         let mut boxes: Vec<([f32; 3], [f32; 3])> = Vec::new();
         if let Some(hit) = self.target {
@@ -802,6 +822,56 @@ impl WorldView {
             }
         }
         renderer.set_outline(queue, &boxes);
+
+        // The cracks spread over the block being broken, which is not always
+        // the one under the crosshair: a player can look away mid swing.
+        let cracks = self.breaking_stage().and_then(|stage| {
+            let (at, _) = self.mining?;
+            let state = self.state_at(at)?;
+            let base = [at[0] as f32, at[1] as f32, at[2] as f32];
+            let shapes: Vec<([f32; 3], [f32; 3])> =
+                neuton_world::physics::BlockShapes::collision(self.shapes.as_ref(), state)
+                    .iter()
+                    .map(|shape| {
+                        (
+                            [
+                                base[0] + shape.min[0] as f32,
+                                base[1] + shape.min[1] as f32,
+                                base[2] + shape.min[2] as f32,
+                            ],
+                            [
+                                base[0] + shape.max[0] as f32,
+                                base[1] + shape.max[1] as f32,
+                                base[2] + shape.max[2] as f32,
+                            ],
+                        )
+                    })
+                    .collect();
+            Some((shapes, stage))
+        });
+        match cracks {
+            Some((shapes, stage)) => {
+                renderer.set_breaking(queue, self.shapes.as_ref(), &shapes, Some(stage));
+            }
+            None => renderer.set_breaking(queue, self.shapes.as_ref(), &[], None),
+        }
+    }
+
+    /// How far the current swing has got, from zero to nine.
+    ///
+    /// `None` when nothing is being broken, or when the block cannot be broken
+    /// at all and there is no progress to show.
+    fn breaking_stage(&self) -> Option<u32> {
+        let (at, since) = self.mining?;
+        let state = self.state_at(at)?;
+        let held = self.inventory.held().map_or("", |stack| stack.name);
+        let total = neuton_world::mining::seconds_to_break(state, held, self.body.on_ground)?;
+        if total <= 0.0 {
+            return None;
+        }
+        let progress = since.elapsed().as_secs_f32() / total;
+        Some(((progress * neuton_render::DESTROY_STAGES as f32) as u32)
+            .min(neuton_render::DESTROY_STAGES - 1))
     }
 
     /// Works out what the player is pointing at.

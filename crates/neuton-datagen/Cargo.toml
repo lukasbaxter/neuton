@@ -6,4 +6,5 @@ license.workspace = true
 publish = false
 
 [dependencies]
+zip = { version = "6", default-features = false, features = ["deflate"] }
 serde_json = "1"

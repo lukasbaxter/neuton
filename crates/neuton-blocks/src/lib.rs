@@ -8,6 +8,7 @@
 mod generated;
 
 pub use generated::items::{self, Item};
+pub use generated::breaking;
 
 pub use generated::blocks::{
     BLOCK_COUNT, BLOCKS, STATE_COUNT, STATE_TO_BLOCK, STATE_VARIANT, VARIANT_KEYS, block,
