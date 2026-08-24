@@ -258,14 +258,14 @@ mod tests {
         let path = temp("crud");
         let mut list = ServerList::load(&path);
         let a = list.add("Miji", "play.notmiji.com");
-        let b = list.add("Dev", "192.168.1.85:25571");
+        let b = list.add("Dev", "192.168.0.10:25571");
         list.save().unwrap();
 
         let mut back = ServerList::load(&path);
         assert_eq!(back.len(), 2);
         assert_eq!(back.get(a).unwrap().name, "Miji");
 
-        assert!(back.edit(b, "Dev server", "192.168.1.85:25571"));
+        assert!(back.edit(b, "Dev server", "192.168.0.10:25571"));
         assert!(!back.edit(9999, "x", "y"));
         assert!(back.remove(a));
         assert!(!back.remove(a));
