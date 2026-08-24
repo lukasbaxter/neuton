@@ -1520,6 +1520,7 @@ dependencies = [
  "neuton-blocks",
  "neuton-net",
  "neuton-protocol",
+ "neuton-render",
  "neuton-ui",
  "neuton-world",
 ]
@@ -1557,6 +1558,15 @@ dependencies = [
  "rand",
  "rsa",
  "sha1",
+]
+
+[[package]]
+name = "neuton-render"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "neuton-blocks",
+ "neuton-world",
 ]
 
 [[package]]

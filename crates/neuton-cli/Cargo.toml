@@ -15,3 +15,4 @@ neuton-auth = { path = "../neuton-auth" }
 neuton-net = { path = "../neuton-net" }
 neuton-world = { path = "../neuton-world" }
 neuton-ui = { path = "../neuton-ui" }
+neuton-render = { version = "0.1.0", path = "../neuton-render" }
