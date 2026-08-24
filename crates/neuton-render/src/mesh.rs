@@ -5,6 +5,7 @@
 //! world is the overwhelming majority of it. Merging coplanar quads comes later
 //! and lives behind this same interface.
 
+use crate::textures::FaceUvs;
 use neuton_blocks::StateId;
 use neuton_world::{Chunk, SECTION_VOLUME, block_index};
 
@@ -18,8 +19,9 @@ use neuton_world::{Chunk, SECTION_VOLUME, block_index};
 pub struct Vertex {
     /// World position, relative to the chunk column's origin.
     pub position: [f32; 3],
-    pub color: [f32; 3],
-    /// Directional shade, already applied per face.
+    /// Atlas coordinates.
+    pub uv: [f32; 2],
+    /// Directional shade, applied per face.
     pub light: f32,
 }
 
@@ -94,13 +96,15 @@ impl Mesh {
         self.indices.len() / 3
     }
 
-    fn push_face(&mut self, base: [f32; 3], face: Face, color: [f32; 3]) {
+    fn push_face(&mut self, base: [f32; 3], face: Face, uv: neuton_assets::Uv) {
         let start = self.vertices.len() as u32;
         let light = face.shade();
-        for corner in face.corners() {
+        let corners = face.corners();
+        let texcoords = uv.corners();
+        for (corner, uv) in corners.iter().zip(texcoords) {
             self.vertices.push(Vertex {
                 position: [base[0] + corner[0], base[1] + corner[1], base[2] + corner[2]],
-                color,
+                uv,
                 light,
             });
         }
@@ -139,15 +143,18 @@ pub trait BlockAppearance {
         false
     }
 
-    /// Flat colour to draw it in, until real textures land.
-    fn color(&self, state: StateId) -> [f32; 3];
+}
+
+/// Supplies the atlas rectangles for a block's six faces.
+pub trait FaceUvSource {
+    fn face_uvs(&self, state: StateId) -> &FaceUvs;
 }
 
 /// Builds the mesh for one chunk column.
 ///
 /// Blocks are unpacked one section at a time into a reused scratch buffer, so
 /// meshing a chunk allocates only for the output.
-pub fn build(chunk: &Chunk, look: &dyn BlockAppearance) -> Mesh {
+pub fn build(chunk: &Chunk, look: &dyn BlockAppearance, textures: &dyn FaceUvSource) -> Mesh {
     let mut mesh = Mesh::default();
     let sections = chunk.sections.len();
 
@@ -188,7 +195,7 @@ pub fn build(chunk: &Chunk, look: &dyn BlockAppearance) -> Mesh {
                 if state.is_air() {
                     continue;
                 }
-                let color = look.color(state);
+                let uvs = textures.face_uvs(state);
                 let base = [x as f32, (y + chunk.min_y) as f32, z as f32];
                 for face in Face::ALL {
                     let [dx, dy, dz] = face.offset();
@@ -197,7 +204,7 @@ pub fn build(chunk: &Chunk, look: &dyn BlockAppearance) -> Mesh {
                     // where almost all the geometry disappears: the inside of
                     // the world, and the inside of every ocean, is most of it.
                     if !look.hides_face(state, neighbour) {
-                        mesh.push_face(base, face, color);
+                        mesh.push_face(base, face, uvs[face as usize]);
                     }
                 }
             }
@@ -210,14 +217,25 @@ pub fn build(chunk: &Chunk, look: &dyn BlockAppearance) -> Mesh {
 mod tests {
     use super::*;
 
-    /// Everything non-air is a solid grey cube.
+    /// Everything non-air is a solid cube.
     struct Solid;
     impl BlockAppearance for Solid {
         fn is_opaque(&self, state: StateId) -> bool {
             !state.is_air()
         }
-        fn color(&self, _state: StateId) -> [f32; 3] {
-            [0.5, 0.5, 0.5]
+    }
+
+    /// One tile covering the whole atlas, so geometry can be checked without
+    /// needing a real installation.
+    struct OneTile(FaceUvs);
+    impl Default for OneTile {
+        fn default() -> Self {
+            Self([neuton_assets::Uv { min: [0.0, 0.0], max: [1.0, 1.0] }; 6])
+        }
+    }
+    impl FaceUvSource for OneTile {
+        fn face_uvs(&self, _state: StateId) -> &FaceUvs {
+            &self.0
         }
     }
 
@@ -254,7 +272,7 @@ mod tests {
 
     #[test]
     fn an_empty_column_produces_nothing() {
-        let mesh = build(&chunk(4, |_| false), &Solid);
+        let mesh = build(&chunk(4, |_| false), &Solid, &OneTile::default());
         assert!(mesh.is_empty());
         assert_eq!(mesh.vertices.len(), 0);
     }
@@ -263,7 +281,7 @@ mod tests {
     fn a_single_solid_section_only_draws_its_shell() {
         // One 16x16x16 section alone in the column. Interior faces are hidden,
         // so only the outside survives: six sides of 256 faces each.
-        let mesh = build(&chunk(1, |_| true), &Solid);
+        let mesh = build(&chunk(1, |_| true), &Solid, &OneTile::default());
         assert_eq!(mesh.triangles(), 6 * 256 * 2);
         assert_eq!(mesh.vertices.len(), 6 * 256 * 4);
     }
@@ -273,7 +291,7 @@ mod tests {
         // Two solid sections stacked. If the mesher looked at sections in
         // isolation it would draw the touching faces and this would be twice
         // the single-section shell.
-        let mesh = build(&chunk(2, |_| true), &Solid);
+        let mesh = build(&chunk(2, |_| true), &Solid, &OneTile::default());
         // Top and bottom are still 256 each; the four sides are now 16x32.
         let expected = (2 * 256 + 4 * 16 * 32) * 2;
         assert_eq!(mesh.triangles(), expected);
@@ -281,7 +299,7 @@ mod tests {
 
     #[test]
     fn faces_carry_their_directional_shade() {
-        let mesh = build(&chunk(1, |_| true), &Solid);
+        let mesh = build(&chunk(1, |_| true), &Solid, &OneTile::default());
         let lights: Vec<f32> = {
             let mut l: Vec<f32> = mesh.vertices.iter().map(|v| v.light).collect();
             l.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -293,7 +311,7 @@ mod tests {
 
     #[test]
     fn geometry_sits_inside_the_column_bounds() {
-        let mesh = build(&chunk(2, |i| i == 1), &Solid);
+        let mesh = build(&chunk(2, |i| i == 1), &Solid, &OneTile::default());
         for v in &mesh.vertices {
             assert!((0.0..=16.0).contains(&v.position[0]), "x out of range: {v:?}");
             assert!((0.0..=32.0).contains(&v.position[1]), "y out of range: {v:?}");
@@ -307,7 +325,7 @@ mod tests {
     fn min_y_offsets_the_whole_column() {
         let mut c = chunk(1, |_| true);
         c.min_y = -64;
-        let mesh = build(&c, &Solid);
+        let mesh = build(&c, &Solid, &OneTile::default());
         assert!(mesh.vertices.iter().all(|v| (-64.0..=-48.0).contains(&v.position[1])));
     }
 
@@ -320,9 +338,6 @@ mod tests {
         fn self_culls(&self, state: StateId) -> bool {
             !state.is_air()
         }
-        fn color(&self, _state: StateId) -> [f32; 3] {
-            [0.2, 0.4, 0.9]
-        }
     }
 
     #[test]
@@ -330,14 +345,14 @@ mod tests {
         // Two solid sections of a single non-opaque, self-culling block. Without
         // same-block culling this would draw every internal face and produce
         // the whole volume instead of the shell.
-        let mesh = build(&chunk(2, |_| true), &Fluid);
+        let mesh = build(&chunk(2, |_| true), &Fluid, &OneTile::default());
         let expected = (2 * 256 + 4 * 16 * 32) * 2;
         assert_eq!(mesh.triangles(), expected);
     }
 
     #[test]
     fn every_index_points_at_a_real_vertex() {
-        let mesh = build(&chunk(2, |i| i == 0), &Solid);
+        let mesh = build(&chunk(2, |i| i == 0), &Solid, &OneTile::default());
         assert!(!mesh.indices.is_empty());
         let max = mesh.vertices.len() as u32;
         assert!(mesh.indices.iter().all(|&i| i < max));

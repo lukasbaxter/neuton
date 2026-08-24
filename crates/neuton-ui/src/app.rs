@@ -37,6 +37,16 @@ pub struct Launcher {
     notice: Option<(String, Color32)>,
     /// Set once so the first paint kicks off a refresh of the whole list.
     pinged_at_startup: bool,
+    /// Set when the user presses Join, and taken by the event loop, which owns
+    /// the GPU and so is the only place a world can actually be started.
+    pub pending_join: Option<PendingJoin>,
+}
+
+/// A join the launcher has asked for but cannot perform itself.
+pub struct PendingJoin {
+    pub host: String,
+    pub port: u16,
+    pub session: neuton_auth::Session,
 }
 
 impl Launcher {
@@ -55,6 +65,7 @@ impl Launcher {
             modal: Modal::None,
             notice: None,
             pinged_at_startup: false,
+            pending_join: None,
         }
     }
 
@@ -514,12 +525,21 @@ impl Launcher {
         }
     }
 
-    /// What pressing Join or Play does. Nothing yet, honestly.
+    /// Hands a join to the event loop, which owns the window and the GPU.
     fn join_selected(&mut self) {
-        self.notice = Some((
-            "Not yet: the renderer is still being built.".to_string(),
-            WARN,
-        ));
+        let Some(server) = self.selected.and_then(|id| self.servers.get(id)) else {
+            self.notice = Some(("Select a server first.".to_string(), WARN));
+            return;
+        };
+        let Some(account) = self.accounts.active().cloned() else {
+            self.notice = Some(("Sign in first.".to_string(), WARN));
+            return;
+        };
+        // The address is resolved again by the connection, including any SRV
+        // record, so the typed form is what gets passed on.
+        let (host, port) = server.host_port();
+        self.notice = None;
+        self.pending_join = Some(PendingJoin { host, port, session: account });
     }
 
     // -------------------------------------------------------- network detail

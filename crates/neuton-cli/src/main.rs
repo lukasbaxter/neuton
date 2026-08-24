@@ -17,6 +17,7 @@ fn main() -> std::process::ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("ping") if args.len() >= 2 => ping(&args[1]),
         Some("join") if args.len() >= 2 => join(&args[1], offline_name(&args)),
+        Some("play") if args.len() >= 2 => play(&args[1], offline_name(&args), shot_path(&args)),
         Some("login") => login(),
         Some("logout") => logout(args.get(1).map(String::as_str)),
         Some("accounts") => accounts(),
@@ -33,6 +34,7 @@ fn main() -> std::process::ExitCode {
                 "usage: neuton                      open the launcher\n\
                  \x20      neuton ping <host[:port]>   server list ping\n\
                  \x20      neuton join <host[:port]>   connect and stream the world\n\
+                 \x20      neuton play <host[:port]>   open straight into the world\n\
                  \x20      neuton login               sign in with a Microsoft account\n\
                  \x20      neuton accounts            list signed-in accounts\n\
                  \x20      neuton switch <name>       choose the active account\n\
@@ -120,8 +122,43 @@ fn ping(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Opens the window directly in a world, skipping the launcher.
+fn play(
+    target: &str,
+    offline: Option<&str>,
+    shot: Option<(std::path::PathBuf, Duration)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (host, port) = split_host_port(target);
+    let session = match offline {
+        Some(name) => neuton_auth::Session {
+            profile: neuton_auth::Profile { uuid: 0, name: name.to_string() },
+            access_token: String::new(),
+            refresh_token: String::new(),
+            expires_at: u64::MAX,
+        },
+        None => {
+            let mut store = Accounts::load_default()?;
+            neuton_auth::authenticate(&mut store, true, prompt)?.0
+        }
+    };
+    match shot {
+        Some((path, after)) => {
+            neuton_ui::run_screenshot(host.to_string(), port, session, path, after)
+        }
+        None => neuton_ui::run_direct(host.to_string(), port, session),
+    }
+}
+
 /// `--offline <name>` runs the join without Microsoft auth, for testing
 /// against a development server.
+/// `--shot <path> [seconds]` renders one frame and exits.
+fn shot_path(args: &[String]) -> Option<(std::path::PathBuf, Duration)> {
+    let i = args.iter().position(|a| a == "--shot")?;
+    let path = std::path::PathBuf::from(args.get(i + 1)?);
+    let secs = args.get(i + 2).and_then(|s| s.parse::<f64>().ok()).unwrap_or(12.0);
+    Some((path, Duration::from_secs_f64(secs)))
+}
+
 fn offline_name(args: &[String]) -> Option<&str> {
     let i = args.iter().position(|a| a == "--offline")?;
     args.get(i + 1).map(String::as_str)
@@ -324,6 +361,30 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
     // Mesh every chunk as it arrives, to measure the real cost on real terrain
     // rather than on a synthetic column of stone.
     let appearance = neuton_render::Appearance::new();
+    // Real textures, resolved from the installed game and whatever resource
+    // packs are on top of it.
+    let t_assets = Instant::now();
+    let textures = {
+        let mut packs = neuton_assets::PackStack::new();
+        if let Some(jar) = neuton_assets::vanilla_jar("26.2") {
+            let _ = packs.push(jar);
+        }
+        if let Some(dir) = neuton_assets::resource_pack_dir() {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let _ = packs.push(e.path());
+            }
+        }
+        println!("assets   packs {:?}", packs.names());
+        neuton_render::BlockTextures::build(&mut packs)
+    };
+    println!(
+        "atlas    {}x{} px, {} textures, {} face sets ({:.0} ms)",
+        textures.atlas.size,
+        textures.atlas.size,
+        textures.atlas.len(),
+        textures.distinct(),
+        t_assets.elapsed().as_secs_f64() * 1000.0
+    );
     let mut mesh_time = Duration::ZERO;
     let mut triangles: u64 = 0;
     let mut vertices: u64 = 0;
@@ -374,7 +435,7 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
                 }
 
                 let t = Instant::now();
-                let mesh = neuton_render::build(&c, &appearance);
+                let mesh = neuton_render::build(&c, &appearance, &textures);
                 mesh_time += t.elapsed();
                 triangles += mesh.triangles() as u64;
                 vertices += mesh.vertices.len() as u64;

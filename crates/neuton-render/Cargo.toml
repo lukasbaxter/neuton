@@ -8,3 +8,8 @@ license.workspace = true
 neuton-blocks = { workspace = true }
 neuton-world = { path = "../neuton-world" }
 bytemuck = { version = "1", features = ["derive"] }
+neuton-assets = { version = "0.1.0", path = "../neuton-assets" }
+wgpu = "30.0.1"
+
+[dev-dependencies]
+png = "0.18.1"
