@@ -149,6 +149,7 @@ fn play(
             path,
             after,
             camera_override(&args_vec()),
+            bench_frames(&args_vec()),
         ),
         None => neuton_ui::run_direct(host.to_string(), port, session),
     }
@@ -156,6 +157,14 @@ fn play(
 
 /// `--offline <name>` runs the join without Microsoft auth, for testing
 /// against a development server.
+/// `--bench [frames]` times the renderer before the screenshot is taken.
+fn bench_frames(args: &[String]) -> u32 {
+    match args.iter().position(|a| a == "--bench") {
+        Some(i) => args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(120),
+        None => 0,
+    }
+}
+
 fn args_vec() -> Vec<String> {
     std::env::args().skip(1).collect()
 }

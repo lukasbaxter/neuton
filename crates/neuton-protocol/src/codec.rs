@@ -83,7 +83,6 @@ impl Framed<std::net::TcpStream> {
     /// directly and treats any error as "nothing waiting", which is the safe
     /// answer: the caller does optional work rather than skipping required work.
     pub fn has_pending(&mut self) -> bool {
-        use std::io::Read;
         let mut byte = [0u8; 1];
         match self.stream.set_nonblocking(true) {
             Ok(()) => {}
