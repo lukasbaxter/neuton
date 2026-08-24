@@ -322,19 +322,33 @@ mod tests {
     }
 
     #[test]
-    fn an_unencrypted_reader_cannot_read_an_encrypted_stream() {
+    fn an_unencrypted_reader_never_recovers_the_plaintext() {
         use crate::crypto::SharedSecret;
-        let secret = SharedSecret::generate();
-        let mut out = Framed::new(Vec::new());
-        out.enable_encryption(&secret);
-        let mut body = Writer::new();
-        body.write_bytes(&[0u8; 64]);
-        out.write_packet(1, &body).unwrap();
+        let payload = [0xABu8; 64];
 
-        // Without the cipher the length prefix is garbage, so this must fail
-        // loudly rather than silently returning wrong bytes.
-        let mut inp = Framed::new(io::Cursor::new(out.stream));
-        assert!(inp.read_packet().is_err());
+        // Repeated, because the outcome depends on the random key: usually the
+        // length prefix decrypts to nonsense and the read fails, but sometimes
+        // it happens to name a length the buffer can satisfy. Either is fine.
+        // What must never happen is the plaintext coming back.
+        for _ in 0..64 {
+            let secret = SharedSecret::generate();
+            let mut out = Framed::new(Vec::new());
+            out.enable_encryption(&secret);
+            let mut body = Writer::new();
+            body.write_bytes(&payload);
+            out.write_packet(1, &body).unwrap();
+            let wire = out.stream;
+
+            assert!(
+                !wire.windows(payload.len()).any(|w| w == payload),
+                "plaintext survived encryption"
+            );
+
+            let mut inp = Framed::new(io::Cursor::new(wire));
+            if let Ok(frame) = inp.read_packet() {
+                assert_ne!(frame, &payload[..], "decoded the payload without the key");
+            }
+        }
     }
 
     #[test]
