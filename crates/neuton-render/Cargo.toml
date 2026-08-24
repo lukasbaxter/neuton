@@ -1,0 +1,10 @@
+[package]
+name = "neuton-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neuton-blocks = { workspace = true }
+neuton-world = { path = "../neuton-world" }
+bytemuck = { version = "1", features = ["derive"] }

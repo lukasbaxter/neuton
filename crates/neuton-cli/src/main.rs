@@ -321,6 +321,13 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
     // check that palettes, state IDs and the generated tables all agree.
     let mut spawn: Option<(f64, f64, f64)> = None;
     let mut column: Vec<String> = Vec::new();
+    // Mesh every chunk as it arrives, to measure the real cost on real terrain
+    // rather than on a synthetic column of stone.
+    let appearance = neuton_render::Appearance::new();
+    let mut mesh_time = Duration::ZERO;
+    let mut triangles: u64 = 0;
+    let mut vertices: u64 = 0;
+    let mut histogram: std::collections::HashMap<&'static str, u64> = Default::default();
 
     while Instant::now() < deadline {
         match conn.poll()? {
@@ -351,6 +358,27 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
                         column.push(format!("    y={y:<4} {name}"));
                     }
                 }
+                // What is actually in these chunks, so a bad culling rate can be
+                // attributed to the world or to the mesher.
+                for section in c.sections.iter().filter(|s| !s.is_empty()) {
+                    let mut scratch = vec![0u32; neuton_world::SECTION_VOLUME];
+                    if section.blocks.unpack_into(&mut scratch) {
+                        for raw in &scratch {
+                            if *raw != 0
+                                && let Some(b) = neuton_blocks::StateId(*raw).block()
+                            {
+                                *histogram.entry(b.name()).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+
+                let t = Instant::now();
+                let mesh = neuton_render::build(&c, &appearance);
+                mesh_time += t.elapsed();
+                triangles += mesh.triangles() as u64;
+                vertices += mesh.vertices.len() as u64;
+
                 if conn.stats.chunks <= 3 || conn.stats.chunks % 100 == 0 {
                     println!(
                         "chunk    #{} at ({}, {})  {} non-air, {} sections used",
@@ -392,6 +420,25 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
     println!("  bytes    {:.1} KiB", s.bytes as f64 / 1024.0);
     println!("  chunks   {}", s.chunks);
     println!("  blocks   {}", s.blocks);
+    if s.chunks > 0 {
+        println!("\nmeshing");
+        println!("  triangles {triangles} ({vertices} vertices)");
+        println!(
+            "  time      {:.0} ms total, {:.2} ms per chunk",
+            mesh_time.as_secs_f64() * 1000.0,
+            mesh_time.as_secs_f64() * 1000.0 / s.chunks as f64
+        );
+        let mut top: Vec<_> = histogram.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1));
+        println!("\nmost common blocks");
+        for (name, count) in top.iter().take(10) {
+            println!("  {:<28} {}", name.trim_start_matches("minecraft:"), count);
+        }
+        println!(
+            "\n  culled    {:.1}% of faces never drawn",
+            100.0 - (triangles as f64 / 2.0) / (s.blocks as f64 * 6.0) * 100.0
+        );
+    }
     if !ignored.is_empty() {
         let mut top: Vec<_> = ignored.iter().collect();
         top.sort_by(|a, b| b.1.cmp(a.1));
