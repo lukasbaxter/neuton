@@ -8,6 +8,8 @@
 
 pub mod connection;
 pub mod registries;
+pub mod status;
 
 pub use connection::{Connection, Error, Event, Stats};
 pub use registries::{DimensionShape, Registries};
+pub use status::{ServerStatus, Span, ping};

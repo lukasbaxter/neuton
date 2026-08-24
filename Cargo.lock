@@ -1544,6 +1544,7 @@ dependencies = [
  "neuton-nbt",
  "neuton-protocol",
  "neuton-world",
+ "serde_json",
 ]
 
 [[package]]
@@ -1566,7 +1567,12 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "neuton-auth",
+ "neuton-net",
+ "neuton-protocol",
+ "png",
  "pollster",
+ "serde",
+ "serde_json",
  "wgpu",
  "winit",
 ]
