@@ -11,9 +11,39 @@ talks to Microsoft registers its own application. Shipping someone else's ID
 would put neuton's sign-ins behind their consent screen and rate limits, and
 would get that ID revoked for everyone using it.
 
-Registering one takes about two minutes and is free:
+Registering one is free. It needs an **Entra directory** (formerly Azure AD),
+which is not the same thing as an Azure subscription and does not cost anything.
 
-1. Go to <https://portal.azure.com> → **Microsoft Entra ID** → **App registrations** → **New registration**
+### If you have never used Azure with this account
+
+A personal Microsoft account has no Entra directory until one is created. Going
+straight to `portal.azure.com` in that state fails with a confusing error that
+looks like it is about the app you are trying to register:
+
+```
+AADSTS16000: User account '...' from identity provider 'live.com' does not
+exist in tenant 'Microsoft Services' and cannot access the application
+'74658136-14ec-4630-ad9b-26e160ff0fc6'(ADIbizaUX) in that tenant.
+```
+
+That application ID is the Azure Portal's own front end, not anything of yours.
+The message means "this account has no directory to sign in to".
+
+Fixes, in the order worth trying:
+
+1. Open <https://entra.microsoft.com> instead. It is the newer entry point and
+   will offer to create a directory for a personal account.
+2. Use a private or incognito window. `interaction_required` in that error means
+   a silent sign-in failed, and a work account already signed into the browser is
+   a common cause.
+3. If neither works, sign up at <https://azure.microsoft.com/free>. This creates
+   a "Default Directory" for the account. A card is asked for during signup, but
+   directories and app registrations are free and no subscription is needed to
+   register an app.
+
+### Registering the app
+
+1. <https://entra.microsoft.com> → **App registrations** → **New registration**
 2. Name it whatever you like
 3. Supported account types: **Personal Microsoft accounts only**
 4. Leave the redirect URI blank, then **Register**
@@ -22,6 +52,9 @@ Registering one takes about two minutes and is free:
 
 Step 6 is the one people miss. Without it the device code request comes back
 `unauthorized_client`.
+
+Step 3 matters too: a single-tenant setting rejects the personal account that
+actually owns your Minecraft licence.
 
 ## Telling neuton about it
 
@@ -74,6 +107,8 @@ Failures worth recognising:
 | Symptom | Cause |
 | --- | --- |
 | `unauthorized_client` | Step 6 above was skipped |
+| `AADSTS16000` / `ADIbizaUX` | The portal, not neuton. The account has no Entra directory yet |
+| `does not exist in tenant 'Microsoft Services'` | Signed in with a work account, or no directory exists |
 | `no Xbox profile` | The account has never signed into Xbox; create one at xbox.com |
 | `child account` | Needs adding to a Microsoft family group |
 | `does not own Minecraft: Java Edition` | Signed in fine, but no game licence on this account |
