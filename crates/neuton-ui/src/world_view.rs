@@ -48,6 +48,11 @@ pub struct WorldView {
     pub paused: bool,
     /// Set when the player chooses to disconnect.
     pub leaving: bool,
+    /// When the world started and finished arriving, for measuring it.
+    pub joined_at: Instant,
+    pub first_chunk: Option<Instant>,
+    pub last_chunk: Option<Instant>,
+    pub timing: crate::session::Timing,
     /// When the last movement update went out, and what it said.
     last_move_sent: Option<Instant>,
     last_position: Option<[f64; 3]>,
@@ -79,6 +84,10 @@ impl WorldView {
             abilities: Abilities::default(),
             paused: false,
             leaving: false,
+            joined_at: Instant::now(),
+            first_chunk: None,
+            last_chunk: None,
+            timing: Default::default(),
             last_move_sent: None,
             last_position: None,
             last_rotation: None,
@@ -256,6 +265,10 @@ impl WorldView {
                     self.session.status = "in world".to_string();
                 }
                 WorldEvent::Chunk { x, z, mesh, blocks } => {
+                    if self.first_chunk.is_none() {
+                        self.first_chunk = Some(Instant::now());
+                    }
+                    self.last_chunk = Some(Instant::now());
                     renderer.upload(device, x, z, &mesh);
                     self.blocks.insert((x, z), blocks);
                 }
@@ -290,6 +303,7 @@ impl WorldView {
                         self.body.flying = false;
                     }
                 }
+                WorldEvent::Timing(t) => self.timing = t,
                 WorldEvent::Chat(spans) => self.chat.push(spans),
                 WorldEvent::Disconnected(why) => {
                     self.chat.note(format!("Disconnected: {why}"));

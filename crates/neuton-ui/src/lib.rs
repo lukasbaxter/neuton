@@ -33,6 +33,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     run_with(None, None)
 }
 
+/// When the process started, for measuring how long it takes to be usable.
+static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn started() -> Instant {
+    *START.get_or_init(Instant::now)
+}
+
 /// Opens straight into a world, skipping the launcher.
 ///
 /// For development against a local server, where clicking through the launcher
@@ -77,6 +84,7 @@ fn run_with(
     direct: Option<app::PendingJoin>,
     shot: Option<(std::path::PathBuf, std::time::Duration)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    started();
     let event_loop = EventLoop::new()?;
     // Wait for input rather than spinning: an idle launcher should use no CPU.
     // A world requests its own redraws continuously.
@@ -171,6 +179,9 @@ impl ApplicationHandler for App {
 
         self.launcher = Some(Launcher::new());
         self.state = Some(State { gpu, egui_ctx, egui_winit, egui_renderer });
+        if std::env::var_os("NEUTON_TIMING").is_some() {
+            eprintln!("startup: window and GPU ready in {:.0} ms", started().elapsed().as_secs_f64() * 1000.0);
+        }
 
         if let Some(pending) = self.direct.take() {
             let Self { state, world, renderer, textures, tints, .. } = self;
@@ -314,6 +325,33 @@ impl ApplicationHandler for App {
                             width,
                             height,
                         );
+                        if std::env::var_os("NEUTON_TIMING").is_some()
+                            && let Some(w) = world.as_ref()
+                        {
+                            let ms = |t: Option<Instant>| {
+                                t.map(|t| (t - w.joined_at).as_secs_f64() * 1000.0)
+                                    .unwrap_or(f64::NAN)
+                            };
+                            let span = ms(w.last_chunk) - ms(w.first_chunk);
+                            eprintln!(
+                                "world: first chunk {:.0} ms after connecting, last {:.0} ms, {} columns",
+                                ms(w.first_chunk),
+                                ms(w.last_chunk),
+                                renderer.as_ref().map(|r| r.chunk_count()).unwrap_or(0),
+                            );
+                            eprintln!(
+                                "world: of that {:.0} ms spent meshing ({} meshes) and {:.0} ms waiting on the server",
+                                w.timing.meshing_ms,
+                                w.timing.meshes,
+                                w.timing.waiting_ms,
+                            );
+                            eprintln!(
+                                "world: streaming took {:.1} s, meshing was {:.0}% of it",
+                                span / 1000.0,
+                                w.timing.meshing_ms / span.max(1.0) * 100.0,
+                            );
+                        }
+
                         if self.bench > 0 {
                             let ms = bench(state, launcher, world, renderer, self.bench);
                             let tris = renderer.as_ref().map(|r| r.triangles()).unwrap_or(0);
@@ -467,7 +505,14 @@ fn start_world(
                 }
             }
             *tints = Some(Arc::new(neuton_assets::Tints::load(&mut packs)));
+            let t = Instant::now();
             *textures = Some(Arc::new(BlockTextures::build(&mut packs)));
+            if std::env::var_os("NEUTON_TIMING").is_some() {
+                eprintln!(
+                    "startup: resource packs resolved and atlas stitched in {:.0} ms",
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
         let atlas = textures.clone().unwrap();
 
