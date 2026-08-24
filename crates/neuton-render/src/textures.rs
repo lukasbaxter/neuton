@@ -94,7 +94,12 @@ use neuton_blocks::{BLOCK_COUNT, STATE_COUNT, StateId};
 /// One face, ready to draw.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BakedFace {
-    pub uv: Uv,
+    /// Atlas coordinates for the face's four corners, in the order the mesher
+    /// emits them.
+    ///
+    /// Corners rather than a rectangle, because a model face names a sub-region
+    /// of its texture and a rotation reorders which corner is which.
+    pub uv: [[f32; 2]; 4],
     /// Where this face's colour comes from.
     ///
     /// Resolved at mesh time rather than baked, because it depends on the biome
@@ -119,6 +124,12 @@ pub struct BakedElement {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BakedModel {
     pub elements: Vec<BakedElement>,
+    /// True if this block fills its cell and hides what is behind it.
+    ///
+    /// Taken from the geometry rather than guessed from the name. A block whose
+    /// model is a full cube with all six faces occludes; a shelf, a slab or a
+    /// lantern does not, whatever it is called.
+    pub occludes: bool,
     /// True for water and lava.
     ///
     /// Fluids have no model in the game files at all: `block/water.json`
@@ -239,7 +250,7 @@ fn bake(model: &BlockModel, atlas: &Atlas, tint: TintSource) -> BakedModel {
             for (i, face) in element.faces.iter().enumerate() {
                 let Some(face) = face else { continue };
                 faces[i] = Some(BakedFace {
-                    uv: atlas.uv(&face.texture),
+                    uv: map_uv(atlas.uv(&face.texture), face.uv),
                     tint: if face.tinted { tint } else { TintSource::None },
                     cullface: face.cullface,
                 });
@@ -263,7 +274,29 @@ fn bake(model: &BlockModel, atlas: &Atlas, tint: TintSource) -> BakedModel {
             }
         })
         .collect();
-    BakedModel { elements, fluid: false }
+    // A block hides what is behind it only if it is a full cube, has all six
+    // faces, and none of those faces can be seen through. Geometry alone is not
+    // enough: leaves and glass are full cubes with holes in their textures.
+    let occludes = model.elements.iter().any(|e| {
+        e.is_full_cube()
+            && e.faces.iter().all(|f| {
+                f.as_ref().is_some_and(|face| atlas.is_opaque(&face.texture))
+            })
+    });
+    BakedModel { elements, fluid: false, occludes }
+}
+
+/// Places a model face's texture region inside its atlas tile.
+///
+/// Model space runs 0..16 with v downwards, and the four corners come back in
+/// the order the mesher emits its vertices.
+fn map_uv(tile: Uv, uv: [f32; 4]) -> [[f32; 2]; 4] {
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * (t / 16.0);
+    let u1 = lerp(tile.min[0], tile.max[0], uv[0]);
+    let v1 = lerp(tile.min[1], tile.max[1], uv[1]);
+    let u2 = lerp(tile.min[0], tile.max[0], uv[2]);
+    let v2 = lerp(tile.min[1], tile.max[1], uv[3]);
+    [[u1, v2], [u2, v2], [u2, v1], [u1, v1]]
 }
 
 /// The still texture a fluid draws with, or `None` for anything else.
@@ -283,7 +316,7 @@ fn fluid_texture(block: &str) -> Option<String> {
 /// which is the only place the neighbour needed to decide that is available.
 fn bake_fluid(texture: &str, atlas: &Atlas, tint: TintSource) -> BakedModel {
     let face = Some(BakedFace {
-        uv: atlas.uv(texture),
+        uv: map_uv(atlas.uv(texture), [0.0, 0.0, 16.0, 16.0]),
         tint,
         // Every face can be hidden, including by another fluid block: an ocean
         // is a surface, not a volume.
@@ -306,6 +339,8 @@ fn bake_fluid(texture: &str, atlas: &Atlas, tint: TintSource) -> BakedModel {
             full_cube: true,
         }],
         fluid: true,
+        // A fluid is see-through: it must not hide the seabed behind it.
+        occludes: false,
     }
 }
 
@@ -318,8 +353,10 @@ fn rotate_x(from: &mut [f32; 3], to: &mut [f32; 3], faces: &mut [Option<BakedFac
     let (a, b) = (map(*from), map(*to));
     *from = [a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2])];
     *to = [a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])];
+    // The box map sends up to north, north to down, down to south and south to
+    // up, so the face that ends up at north is the one that was at up.
     // down=0 up=1 north=2 south=3 west=4 east=5
-    permute(faces, [3, 2, 0, 1, 4, 5]);
+    permute(faces, [2, 3, 1, 0, 4, 5]);
 }
 
 /// Rotates a box and its faces 90 degrees about the Y axis, clockwise seen from
@@ -329,7 +366,9 @@ fn rotate_y(from: &mut [f32; 3], to: &mut [f32; 3], faces: &mut [Option<BakedFac
     let (a, b) = (map(*from), map(*to));
     *from = [a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2])];
     *to = [a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])];
-    permute(faces, [0, 1, 5, 4, 2, 3]);
+    // North becomes east, east becomes south, and so on, so the face that ends
+    // up at north is the one that was at west.
+    permute(faces, [0, 1, 4, 5, 3, 2]);
 }
 
 /// `source[i]` is the face that ends up at position `i`.
@@ -349,12 +388,13 @@ fn permute(faces: &mut [Option<BakedFace>; 6], source: [usize; 6]) {
 fn fingerprint(model: &BakedModel) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(model.elements.len() * 96);
+    let _ = write!(out, "{}{}", model.fluid, model.occludes);
     for e in &model.elements {
         let _ = write!(out, "{:?}{:?}{}", e.from, e.to, e.full_cube);
         for face in &e.faces {
             match face {
                 Some(f) => {
-                    let _ = write!(out, "|{:?}{:?}{:?}", f.uv.min, f.uv.max, f.tint);
+                    let _ = write!(out, "|{:?}{:?}", f.uv, f.tint);
                     let _ = write!(out, "{:?}", f.cullface);
                 }
                 None => out.push('_'),
@@ -513,6 +553,99 @@ mod tests {
         assert!(fallback[1] > fallback[0], "fallback should still be green");
         // Untinted faces are untouched whatever the biome.
         assert_eq!(table.get(1, TintSource::None), [1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn occlusion_follows_the_geometry_not_the_name() {
+        let Some(mut packs) = packs() else { return };
+        let t = BlockTextures::build(&mut packs);
+        let occludes = |name: &str| {
+            t.model(neuton_blocks::by_name(name).unwrap().get().default_state).occludes
+        };
+
+        assert!(occludes("minecraft:stone"));
+        assert!(occludes("minecraft:dirt"));
+        assert!(occludes("minecraft:oak_planks"));
+
+        // Partial geometry cannot hide what is behind it, whatever it is
+        // called. A shelf is the case that gave this away: nothing in its name
+        // says it is not a cube, and treating it as one deleted the top face of
+        // the block underneath.
+        assert!(!occludes("minecraft:oak_slab"));
+        assert!(!occludes("minecraft:oak_stairs"));
+        assert!(!occludes("minecraft:lantern"));
+        assert!(!occludes("minecraft:oak_fence"));
+        assert!(!occludes("minecraft:water"));
+        if neuton_blocks::by_name("minecraft:oak_shelf").is_some() {
+            assert!(!occludes("minecraft:oak_shelf"));
+        }
+    }
+
+    #[test]
+    fn face_uvs_follow_the_model_not_the_whole_tile() {
+        let Some(mut packs) = packs() else { return };
+        let t = BlockTextures::build(&mut packs);
+
+        // A lantern's sides show a 6x7 patch of a 16x16 texture. Using the
+        // whole tile stretches the image over the box and looks like a smear.
+        let lantern = neuton_blocks::by_name("minecraft:lantern").unwrap().get().default_state;
+        let side = t.model(lantern).elements[0].faces[2].expect("lantern has a north face");
+        let stone = neuton_blocks::by_name("minecraft:stone").unwrap().get().default_state;
+        let whole = t.model(stone).elements[0].faces[2].expect("stone has a north face");
+
+        let span = |uv: [[f32; 2]; 4]| (uv[1][0] - uv[0][0]).abs();
+        assert!(
+            span(side.uv) < span(whole.uv) * 0.9,
+            "lantern face should cover less than a whole tile: {} vs {}",
+            span(side.uv),
+            span(whole.uv)
+        );
+    }
+
+    #[test]
+    fn a_stair_faces_the_way_its_blockstate_says() {
+        let Some(mut packs) = packs() else { return };
+        let t = BlockTextures::build(&mut packs);
+        let stairs = neuton_blocks::by_name("minecraft:oak_stairs").unwrap();
+        let b = stairs.get();
+
+        let model_for = |variant: &str| {
+            let state = (b.first_state.0..b.first_state.0 + b.state_count)
+                .map(StateId)
+                .find(|s| s.variant_key() == variant)
+                .expect("variant exists");
+            t.model(state).clone()
+        };
+
+        // The step of a bottom stair is the upper box; where it sits along X or
+        // Z is what "facing" means. East is the unrotated model, so its step is
+        // at the west end, and the other facings must differ from it and from
+        // each other.
+        let centre = |m: &BakedModel| {
+            let upper = m
+                .elements
+                .iter()
+                .max_by(|a, b| a.from[1].partial_cmp(&b.from[1]).unwrap())
+                .expect("stairs have elements");
+            [
+                (upper.from[0] + upper.to[0]) / 2.0,
+                (upper.from[2] + upper.to[2]) / 2.0,
+            ]
+        };
+
+        let east = centre(&model_for("facing=east,half=bottom,shape=straight,waterlogged=false"));
+        let west = centre(&model_for("facing=west,half=bottom,shape=straight,waterlogged=false"));
+        let north = centre(&model_for("facing=north,half=bottom,shape=straight,waterlogged=false"));
+        let south = centre(&model_for("facing=south,half=bottom,shape=straight,waterlogged=false"));
+
+        // Opposite facings put the step on opposite sides.
+        assert!((east[0] - west[0]).abs() > 0.2, "east and west steps coincide: {east:?} {west:?}");
+        assert!(
+            (north[1] - south[1]).abs() > 0.2,
+            "north and south steps coincide: {north:?} {south:?}"
+        );
+        // And the two axes are genuinely different orientations.
+        assert!((east[0] - north[0]).abs() > 0.2 || (east[1] - north[1]).abs() > 0.2);
     }
 
     #[test]

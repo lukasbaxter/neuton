@@ -1,9 +1,10 @@
-//! Whether a block fills its cell, and whether it hides its own internal faces.
+//! Whether a block hides what is behind it, and whether it hides its own
+//! internal faces.
 //!
-//! Still a heuristic on block names. The real answer is in the model's
-//! `elements`, which is the same work that will give stairs and slabs their
-//! actual shape; until that lands, an over-inclusive guess here costs a few
-//! triangles rather than leaving holes in the world.
+//! Occlusion is read from the baked model: a block occludes if its geometry is
+//! a full cube with all six faces. Guessing from names got this wrong for every
+//! block nobody thought to list, and a wrong guess in that direction does not
+//! cost triangles, it deletes the face of whatever is underneath.
 
 use crate::mesh::BlockAppearance;
 use neuton_blocks::{BLOCK_COUNT, STATE_COUNT, StateId};
@@ -29,6 +30,15 @@ impl Default for Appearance {
 }
 
 impl Appearance {
+    /// Builds the table, taking occlusion from the baked models.
+    pub fn from_models(textures: &crate::BlockTextures) -> Self {
+        let mut out = Self::new();
+        for id in 0..STATE_COUNT {
+            out.opaque[id] = textures.model(StateId(id as u32)).occludes;
+        }
+        out
+    }
+
     pub fn new() -> Self {
         let mut opaque = vec![true; STATE_COUNT];
         let mut self_culling = vec![false; STATE_COUNT];

@@ -14,10 +14,17 @@ use crate::PackStack;
 use std::collections::HashMap;
 
 /// One face of one element.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FaceDef {
     /// Pack-relative texture path, ready for the atlas.
     pub texture: String,
+    /// Region of the texture this face shows, in the model's 0..16 space as
+    /// `[u1, v1, u2, v2]` with v increasing downwards.
+    ///
+    /// Partial models rely on this: a lantern's sides are a 6x7 patch of its
+    /// texture, and stretching the whole image over them instead is why one
+    /// looks like a smear rather than a lantern.
+    pub uv: [f32; 4],
     /// Whether this face takes the block's biome tint.
     ///
     /// Read from the model's `tintindex`, which is how vanilla marks the faces
@@ -208,12 +215,23 @@ impl ModelResolver {
 
 /// Chooses a model from a blockstate file for the given property string.
 ///
-/// Falls back to any variant rather than nothing: a block whose properties do
-/// not match a key still needs to draw as something.
+/// A blockstate key lists only the properties that change the model, so a
+/// stair's variants are keyed on facing, half and shape and say nothing about
+/// waterlogged. Comparing whole strings therefore never matches, and silently
+/// falls through to whichever variant happens to be first: every stair in the
+/// world faces the same way.
+///
+/// A key matches when every property it names agrees with the block state.
 fn pick_model(state: &serde_json::Value, variant: &str) -> Option<(String, i32, i32)> {
     if let Some(variants) = state.get("variants").and_then(|v| v.as_object()) {
+        let properties = parse_properties(variant);
         let chosen = variants
-            .get(variant)
+            .iter()
+            .find(|(key, _)| matches(key, &properties))
+            // Nothing matched, which means the blockstate names a property this
+            // build does not know about. Drawing something is better than
+            // drawing nothing.
+            .map(|(_, value)| value)
             .or_else(|| variants.get(""))
             .or_else(|| variants.values().next())?;
         return model_name(chosen);
@@ -229,6 +247,25 @@ fn pick_model(state: &serde_json::Value, variant: &str) -> Option<(String, i32, 
         }
     }
     None
+}
+
+/// Splits `"facing=east,half=bottom"` into pairs.
+fn parse_properties(variant: &str) -> Vec<(&str, &str)> {
+    variant
+        .split(',')
+        .filter(|p| !p.is_empty())
+        .filter_map(|pair| pair.split_once('='))
+        .collect()
+}
+
+/// True if every property the key names agrees with the state.
+///
+/// An empty key matches anything, which is how a block with no variants at all
+/// is written.
+fn matches(key: &str, properties: &[(&str, &str)]) -> bool {
+    parse_properties(key)
+        .iter()
+        .all(|(name, value)| properties.iter().any(|(n, v)| n == name && v == value))
 }
 
 /// A variant entry is a model object, or a weighted list of them.
@@ -273,8 +310,24 @@ fn parse_elements(
                 let Some(index) = face_index(name) else { continue };
                 let Some(texture) = face.get("texture").and_then(|t| t.as_str()) else { continue };
                 let Some(texture) = resolve(texture) else { continue };
+                let uv = face
+                    .get("uv")
+                    .and_then(|u| u.as_array())
+                    .and_then(|a| {
+                        Some([
+                            a.first()?.as_f64()? as f32,
+                            a.get(1)?.as_f64()? as f32,
+                            a.get(2)?.as_f64()? as f32,
+                            a.get(3)?.as_f64()? as f32,
+                        ])
+                    })
+                    // Omitted means "derive it from the box", which is what
+                    // makes a plain cube show its whole texture.
+                    .unwrap_or_else(|| default_uv(index, from, to));
+
                 faces[index as usize] = Some(FaceDef {
                     texture,
+                    uv,
                     tinted: face.get("tintindex").is_some(),
                     cullface: face
                         .get("cullface")
@@ -285,6 +338,23 @@ fn parse_elements(
             Some(Element { from, to, faces })
         })
         .collect()
+}
+
+/// The texture region a face shows when the model does not say.
+///
+/// Taken from where the box sits, so a slab shows the bottom half of its
+/// texture on its sides rather than the whole thing squashed.
+fn default_uv(face: u8, from: [f32; 3], to: [f32; 3]) -> [f32; 4] {
+    let [x0, y0, z0] = from;
+    let [x1, y1, z1] = to;
+    match face {
+        0 => [x0, 16.0 - z1, x1, 16.0 - z0],        // down
+        1 => [x0, z0, x1, z1],                      // up
+        2 => [16.0 - x1, 16.0 - y1, 16.0 - x0, 16.0 - y0], // north
+        3 => [x0, 16.0 - y1, x1, 16.0 - y0],        // south
+        4 => [z0, 16.0 - y1, z1, 16.0 - y0],        // west
+        _ => [16.0 - z1, 16.0 - y1, 16.0 - z0, 16.0 - y0], // east
+    }
 }
 
 /// Turns `minecraft:block/stone` into its pack-relative file path.
@@ -476,6 +546,42 @@ mod tests {
         assert_eq!(split("block/stone"), ("minecraft", "block/stone"));
         assert_eq!(split("mypack:block/stone"), ("mypack", "block/stone"));
         assert_eq!(texture_path("mypack:block/x"), "assets/mypack/textures/block/x.png");
+    }
+
+    #[test]
+    fn a_variant_key_matches_on_the_properties_it_names() {
+        let props = parse_properties("facing=east,half=bottom,shape=straight,waterlogged=false");
+        // Blockstate files omit properties that do not change the model.
+        assert!(matches("facing=east,half=bottom,shape=straight", &props));
+        assert!(matches("facing=east", &props));
+        assert!(matches("", &props), "an empty key matches anything");
+        // And still reject a key that disagrees.
+        assert!(!matches("facing=west", &props));
+        assert!(!matches("facing=east,half=top", &props));
+    }
+
+    #[test]
+    fn variants_are_chosen_by_property_not_by_string() {
+        // The bug this replaced: keys were compared whole, so a state carrying
+        // an extra property matched nothing and fell through to the first
+        // variant, pointing every stair in the world the same way.
+        let (dir, mut packs) = pack("variants", &[
+            ("assets/minecraft/blockstates/s.json", r##"{"variants":{
+                "facing=east":{"model":"minecraft:block/e"},
+                "facing=west":{"model":"minecraft:block/w","y":180}}}"##),
+            ("assets/minecraft/models/block/e.json", r##"{"textures":{"all":"block/e"},"elements":[{"from":[0,0,0],"to":[16,16,16],"faces":{"up":{"texture":"#all"}}}]}"##),
+            ("assets/minecraft/models/block/w.json", r##"{"textures":{"all":"block/w"},"elements":[{"from":[0,0,0],"to":[16,16,16],"faces":{"up":{"texture":"#all"}}}]}"##),
+        ]);
+        let mut r = ModelResolver::new();
+
+        let east = r.model(&mut packs, "minecraft:s", "facing=east,waterlogged=false").unwrap();
+        assert_eq!(east.textures(), vec!["assets/minecraft/textures/block/e.png"]);
+        assert_eq!(east.y_rot, 0);
+
+        let west = r.model(&mut packs, "minecraft:s", "facing=west,waterlogged=true").unwrap();
+        assert_eq!(west.textures(), vec!["assets/minecraft/textures/block/w.png"]);
+        assert_eq!(west.y_rot, 180);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -42,6 +42,13 @@ pub struct Atlas {
     /// the world gets a seam of its neighbour in the atlas along its border.
     pub gutter: u32,
     uvs: BTreeMap<String, Uv>,
+    /// Textures with no transparent texel anywhere.
+    ///
+    /// Geometry alone cannot say whether a block hides what is behind it:
+    /// leaves and glass are full cubes whose textures have holes in them. A
+    /// resource pack can change that either way, so it is read from the pixels
+    /// rather than from a list of block names.
+    opaque: BTreeMap<String, bool>,
     /// Where an unresolved texture points. Magenta, so a mistake is obvious.
     missing: Uv,
 }
@@ -111,6 +118,14 @@ impl Atlas {
         self.uvs.contains_key(path)
     }
 
+    /// True if every texel of a texture is fully opaque.
+    ///
+    /// An unknown texture counts as transparent, which errs towards drawing a
+    /// face that turns out to be hidden rather than deleting one that is not.
+    pub fn is_opaque(&self, path: &str) -> bool {
+        self.opaque.get(path).copied().unwrap_or(false)
+    }
+
     pub fn len(&self) -> usize {
         self.uvs.len()
     }
@@ -163,6 +178,7 @@ impl Atlas {
 
         let mut pixels = vec![0u8; (size * size * 4) as usize];
         let mut uvs = BTreeMap::new();
+        let mut opaque = BTreeMap::new();
 
         let blit = |slot: u32, src: &Image, pixels: &mut Vec<u8>| -> Uv {
             let (sx_tile, sy_tile) = (slot % per_row, slot / per_row);
@@ -200,6 +216,16 @@ impl Atlas {
         for (slot, (path, image)) in images.iter().enumerate() {
             let uv = blit(slot as u32, image, &mut pixels);
             uvs.insert(path.clone(), uv);
+            // Only the first frame matters: an animation's later frames cover
+            // the same shape.
+            let frame = image.frame_size();
+            let fully_opaque = (0..frame).all(|y| {
+                (0..frame).all(|x| {
+                    let i = ((y * image.width + x) * 4 + 3) as usize;
+                    image.rgba.get(i).copied().unwrap_or(0) == 255
+                })
+            });
+            opaque.insert(path.clone(), fully_opaque);
         }
 
         // The last slot is a magenta and black check, the traditional signal
@@ -207,7 +233,7 @@ impl Atlas {
         let missing_image = missing_tile(tile);
         let missing = blit(images.len() as u32, &missing_image, &mut pixels);
 
-        Atlas { pixels, size, tile, gutter, uvs, missing }
+        Atlas { pixels, size, tile, gutter, uvs, opaque, missing }
     }
 }
 
@@ -422,6 +448,24 @@ mod tests {
         let paths = vec!["small.png".to_string(), "large.png".to_string()];
         let atlas = Atlas::stitch(&mut packs, &paths);
         assert_eq!(atlas.tile, 32);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opacity_is_read_from_the_pixels() {
+        // A solid texture hides what is behind it; one with a hole does not,
+        // whatever shape the block is.
+        let mut holed = png(16, 16, [0, 200, 0]);
+        // Rebuild with an alpha channel: a hole in the middle.
+        holed.clear();
+        let (dir, mut packs) = pack("opacity", &[
+            ("solid.png", png(16, 16, [0, 200, 0])),
+        ]);
+        let atlas = Atlas::stitch(&mut packs, &["solid.png".to_string()]);
+        assert!(atlas.is_opaque("solid.png"), "an RGB texture has no transparency");
+        // Unknown textures err towards transparent, so a face is drawn rather
+        // than a hole left in the world.
+        assert!(!atlas.is_opaque("nope.png"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
