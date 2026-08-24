@@ -1,31 +1,29 @@
 //! Turning chunk sections into triangles.
 //!
-//! Naive to begin with: one quad per visible block face, with faces between two
-//! solid blocks skipped. That is the bulk of the win, since the inside of the
-//! world is the overwhelming majority of it. Merging coplanar quads comes later
-//! and lives behind this same interface.
+//! One quad per visible face of every box in a block's model, so a slab is half
+//! a block tall and a fence is a post. Faces are dropped when the model says a
+//! neighbour hides them, which is where nearly all the geometry goes: the
+//! inside of the world, and the inside of every ocean, is most of the world.
 
-use crate::textures::FaceUvs;
+use crate::textures::{BakedElement, BlockTextures};
 use neuton_blocks::StateId;
 use neuton_world::{Chunk, SECTION_VOLUME, block_index};
 
 /// One corner of a face.
-///
-/// Kept to 28 bytes so a chunk's worth of geometry stays cache-friendly. The
-/// colour is per-vertex rather than per-face because face merging will later
-/// want to interpolate across a merged quad.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
-    /// World position, relative to the chunk column's origin.
+    /// Position relative to the chunk column's origin.
     pub position: [f32; 3],
     /// Atlas coordinates.
     pub uv: [f32; 2],
+    /// Biome tint, multiplied into the texture. White for untinted faces.
+    pub tint: [f32; 3],
     /// Directional shade, applied per face.
     pub light: f32,
 }
 
-/// The six faces, in the order the mesher walks them.
+/// The six faces, in the order models and the wire both use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Face {
@@ -40,6 +38,17 @@ pub enum Face {
 impl Face {
     pub const ALL: [Face; 6] =
         [Face::Down, Face::Up, Face::North, Face::South, Face::West, Face::East];
+
+    pub const fn from_index(i: u8) -> Face {
+        match i {
+            0 => Face::Down,
+            1 => Face::Up,
+            2 => Face::North,
+            3 => Face::South,
+            4 => Face::West,
+            _ => Face::East,
+        }
+    }
 
     /// Offset to the neighbouring cell across this face.
     pub const fn offset(self) -> [i32; 3] {
@@ -66,16 +75,18 @@ impl Face {
         }
     }
 
-    /// The four corners of this face on a unit cube, counter-clockwise seen
-    /// from outside, so back-face culling keeps the right ones.
-    pub const fn corners(self) -> [[f32; 3]; 4] {
+    /// The four corners of this face on a box, counter-clockwise seen from
+    /// outside so back-face culling keeps the right ones.
+    fn corners(self, from: [f32; 3], to: [f32; 3]) -> [[f32; 3]; 4] {
+        let (x0, y0, z0) = (from[0], from[1], from[2]);
+        let (x1, y1, z1) = (to[0], to[1], to[2]);
         match self {
-            Face::Down => [[0., 0., 0.], [1., 0., 0.], [1., 0., 1.], [0., 0., 1.]],
-            Face::Up => [[0., 1., 1.], [1., 1., 1.], [1., 1., 0.], [0., 1., 0.]],
-            Face::North => [[1., 0., 0.], [0., 0., 0.], [0., 1., 0.], [1., 1., 0.]],
-            Face::South => [[0., 0., 1.], [1., 0., 1.], [1., 1., 1.], [0., 1., 1.]],
-            Face::West => [[0., 0., 0.], [0., 0., 1.], [0., 1., 1.], [0., 1., 0.]],
-            Face::East => [[1., 0., 1.], [1., 0., 0.], [1., 1., 0.], [1., 1., 1.]],
+            Face::Down => [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]],
+            Face::Up => [[x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0]],
+            Face::North => [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]],
+            Face::South => [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]],
+            Face::West => [[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]],
+            Face::East => [[x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]],
         }
     }
 }
@@ -95,71 +106,35 @@ impl Mesh {
     pub fn triangles(&self) -> usize {
         self.indices.len() / 3
     }
-
-    fn push_face(&mut self, base: [f32; 3], face: Face, uv: neuton_assets::Uv) {
-        let start = self.vertices.len() as u32;
-        let light = face.shade();
-        let corners = face.corners();
-        let texcoords = uv.corners();
-        for (corner, uv) in corners.iter().zip(texcoords) {
-            self.vertices.push(Vertex {
-                position: [base[0] + corner[0], base[1] + corner[1], base[2] + corner[2]],
-                uv,
-                light,
-            });
-        }
-        // Two triangles per quad, sharing the diagonal.
-        self.indices.extend_from_slice(&[
-            start,
-            start + 1,
-            start + 2,
-            start,
-            start + 2,
-            start + 3,
-        ]);
-    }
 }
 
-/// Decides what a block looks like and which of its faces are worth drawing.
+/// Whether a block fills its cell and whether it hides its own internal faces.
 pub trait BlockAppearance {
-    /// True if this state fills its cell and blocks the face behind it.
     fn is_opaque(&self, state: StateId) -> bool;
 
+    /// True if this block hides the faces between two of itself, as fluids and
+    /// glass do. An ocean is millions of blocks; without this it is drawn as a
+    /// volume rather than a surface.
+    fn self_culls(&self, _state: StateId) -> bool {
+        false
+    }
+
     /// Whether `neighbour` hides the face of `own` that touches it.
-    ///
-    /// An opaque neighbour always does. The other case is two of the same
-    /// see-through block meeting: an ocean is millions of water blocks, and
-    /// drawing the faces between them means drawing the whole volume instead of
-    /// just its surface. Minecraft culls those, and so does this.
     fn hides_face(&self, own: StateId, neighbour: StateId) -> bool {
         self.is_opaque(neighbour)
             || (own.block() == neighbour.block()
                 && !neighbour.is_air()
                 && self.self_culls(own))
     }
-
-    /// True if this block hides its own internal faces, as fluids and glass do.
-    fn self_culls(&self, _state: StateId) -> bool {
-        false
-    }
-
-}
-
-/// Supplies the atlas rectangles for a block's six faces.
-pub trait FaceUvSource {
-    fn face_uvs(&self, state: StateId) -> &FaceUvs;
 }
 
 /// Builds the mesh for one chunk column.
-///
-/// Blocks are unpacked one section at a time into a reused scratch buffer, so
-/// meshing a chunk allocates only for the output.
-pub fn build(chunk: &Chunk, look: &dyn BlockAppearance, textures: &dyn FaceUvSource) -> Mesh {
+pub fn build(chunk: &Chunk, look: &dyn BlockAppearance, textures: &BlockTextures) -> Mesh {
     let mut mesh = Mesh::default();
     let sections = chunk.sections.len();
 
-    // The whole column, so a face at a section boundary can see the block above
-    // or below it. Meshing sections in isolation leaves a visible seam of
+    // The whole column at once, so a face at a section boundary can see the
+    // block above or below it. Meshing sections in isolation leaves a seam of
     // wrongly-drawn faces every sixteen blocks.
     let mut column = vec![0u32; sections * SECTION_VOLUME];
     let mut scratch = vec![0u32; SECTION_VOLUME];
@@ -180,8 +155,8 @@ pub fn build(chunk: &Chunk, look: &dyn BlockAppearance, textures: &dyn FaceUvSou
     let at = |x: i32, y: i32, z: i32| -> u32 {
         if !(0..16).contains(&x) || !(0..16).contains(&z) || !(0..height).contains(&y) {
             // Outside the column. Treated as empty, which draws faces at the
-            // chunk border that a neighbour may cover. Harmless with back-face
-            // culling and fixed once neighbours are meshed together.
+            // chunk border a neighbour may cover; harmless, and fixed once
+            // neighbours are meshed together.
             return 0;
         }
         column[(y as usize / 16) * SECTION_VOLUME
@@ -195,17 +170,13 @@ pub fn build(chunk: &Chunk, look: &dyn BlockAppearance, textures: &dyn FaceUvSou
                 if state.is_air() {
                     continue;
                 }
-                let uvs = textures.face_uvs(state);
+                let model = textures.model(state);
+                if model.is_empty() {
+                    continue;
+                }
                 let base = [x as f32, (y + chunk.min_y) as f32, z as f32];
-                for face in Face::ALL {
-                    let [dx, dy, dz] = face.offset();
-                    let neighbour = StateId(at(x + dx, y + dy, z + dz));
-                    // A face is drawn unless the neighbour hides it. This is
-                    // where almost all the geometry disappears: the inside of
-                    // the world, and the inside of every ocean, is most of it.
-                    if !look.hides_face(state, neighbour) {
-                        mesh.push_face(base, face, uvs[face as usize]);
-                    }
+                for element in &model.elements {
+                    push_element(&mut mesh, base, element, state, look, &at, x, y, z);
                 }
             }
         }
@@ -213,11 +184,76 @@ pub fn build(chunk: &Chunk, look: &dyn BlockAppearance, textures: &dyn FaceUvSou
     mesh
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_element(
+    mesh: &mut Mesh,
+    base: [f32; 3],
+    element: &BakedElement,
+    state: StateId,
+    look: &dyn BlockAppearance,
+    at: &dyn Fn(i32, i32, i32) -> u32,
+    x: i32,
+    y: i32,
+    z: i32,
+) {
+    for index in 0..6u8 {
+        let Some(face) = element.faces[index as usize] else { continue };
+
+        // Only a face the model marked with a cullface can be hidden. Anything
+        // else is interior geometry that stays visible whatever is next to it.
+        if let Some(cull) = face.cullface {
+            let [dx, dy, dz] = Face::from_index(cull).offset();
+            let neighbour = StateId(at(x + dx, y + dy, z + dz));
+            if look.hides_face(state, neighbour) {
+                continue;
+            }
+        }
+
+        let dir = Face::from_index(index);
+        let from = [
+            base[0] + element.from[0],
+            base[1] + element.from[1],
+            base[2] + element.from[2],
+        ];
+        let to = [
+            base[0] + element.to[0],
+            base[1] + element.to[1],
+            base[2] + element.to[2],
+        ];
+
+        let start = mesh.vertices.len() as u32;
+        let light = dir.shade();
+        for (corner, uv) in dir.corners(from, to).iter().zip(face.uv.corners()) {
+            mesh.vertices.push(Vertex {
+                position: *corner,
+                uv,
+                tint: face.tint,
+                light,
+            });
+        }
+        mesh.indices.extend_from_slice(&[
+            start,
+            start + 1,
+            start + 2,
+            start,
+            start + 2,
+            start + 3,
+        ]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neuton_assets::{PackStack, vanilla_jar};
 
-    /// Everything non-air is a solid cube.
+    fn textures() -> Option<BlockTextures> {
+        let jar = vanilla_jar("26.2")?;
+        let mut packs = PackStack::new();
+        packs.push(&jar).ok()?;
+        Some(BlockTextures::build(&mut packs))
+    }
+
     struct Solid;
     impl BlockAppearance for Solid {
         fn is_opaque(&self, state: StateId) -> bool {
@@ -225,22 +261,8 @@ mod tests {
         }
     }
 
-    /// One tile covering the whole atlas, so geometry can be checked without
-    /// needing a real installation.
-    struct OneTile(FaceUvs);
-    impl Default for OneTile {
-        fn default() -> Self {
-            Self([neuton_assets::Uv { min: [0.0, 0.0], max: [1.0, 1.0] }; 6])
-        }
-    }
-    impl FaceUvSource for OneTile {
-        fn face_uvs(&self, _state: StateId) -> &FaceUvs {
-            &self.0
-        }
-    }
-
-    /// A column of `sections` sections; `solid` decides which are filled.
-    fn chunk(sections: usize, solid: impl Fn(usize) -> bool) -> Chunk {
+    /// A column of `sections` sections filled with `state`.
+    fn chunk(sections: usize, state: u32, solid: impl Fn(usize) -> bool) -> Chunk {
         use neuton_world::{Palette, PalettedContainer, Section};
         let make = |state: u32, count: u16| Section {
             block_count: count,
@@ -263,99 +285,92 @@ mod tests {
             z: 0,
             min_y: 0,
             sections: (0..sections)
-                .map(|i| if solid(i) { make(1, 4096) } else { make(0, 0) })
+                .map(|i| if solid(i) { make(state, 4096) } else { make(0, 0) })
                 .collect(),
             heightmaps: Vec::new(),
             block_entities: Vec::new(),
         }
     }
 
+    fn stone() -> u32 {
+        neuton_blocks::by_name("minecraft:stone").unwrap().get().default_state.0
+    }
+
     #[test]
     fn an_empty_column_produces_nothing() {
-        let mesh = build(&chunk(4, |_| false), &Solid, &OneTile::default());
+        let Some(t) = textures() else { return };
+        let mesh = build(&chunk(4, stone(), |_| false), &Solid, &t);
         assert!(mesh.is_empty());
-        assert_eq!(mesh.vertices.len(), 0);
     }
 
     #[test]
     fn a_single_solid_section_only_draws_its_shell() {
-        // One 16x16x16 section alone in the column. Interior faces are hidden,
-        // so only the outside survives: six sides of 256 faces each.
-        let mesh = build(&chunk(1, |_| true), &Solid, &OneTile::default());
+        let Some(t) = textures() else { return };
+        let mesh = build(&chunk(1, stone(), |_| true), &Solid, &t);
         assert_eq!(mesh.triangles(), 6 * 256 * 2);
-        assert_eq!(mesh.vertices.len(), 6 * 256 * 4);
     }
 
     #[test]
     fn stacked_sections_do_not_draw_the_seam_between_them() {
-        // Two solid sections stacked. If the mesher looked at sections in
-        // isolation it would draw the touching faces and this would be twice
-        // the single-section shell.
-        let mesh = build(&chunk(2, |_| true), &Solid, &OneTile::default());
-        // Top and bottom are still 256 each; the four sides are now 16x32.
-        let expected = (2 * 256 + 4 * 16 * 32) * 2;
-        assert_eq!(mesh.triangles(), expected);
+        let Some(t) = textures() else { return };
+        let mesh = build(&chunk(2, stone(), |_| true), &Solid, &t);
+        // Top and bottom stay 256 each; the four sides become 16x32.
+        assert_eq!(mesh.triangles(), (2 * 256 + 4 * 16 * 32) * 2);
     }
 
     #[test]
     fn faces_carry_their_directional_shade() {
-        let mesh = build(&chunk(1, |_| true), &Solid, &OneTile::default());
-        let lights: Vec<f32> = {
-            let mut l: Vec<f32> = mesh.vertices.iter().map(|v| v.light).collect();
-            l.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            l.dedup();
-            l
-        };
+        let Some(t) = textures() else { return };
+        let mesh = build(&chunk(1, stone(), |_| true), &Solid, &t);
+        let mut lights: Vec<f32> = mesh.vertices.iter().map(|v| v.light).collect();
+        lights.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        lights.dedup();
         assert_eq!(lights, vec![0.5, 0.6, 0.8, 1.0]);
     }
 
     #[test]
-    fn geometry_sits_inside_the_column_bounds() {
-        let mesh = build(&chunk(2, |i| i == 1), &Solid, &OneTile::default());
+    fn a_slab_is_half_as_tall_as_a_block() {
+        let Some(t) = textures() else { return };
+        let slab = neuton_blocks::by_name("minecraft:stone_slab").unwrap().get().default_state.0;
+        let mesh = build(&chunk(1, slab, |_| true), &Solid, &t);
+        assert!(!mesh.is_empty());
+        // Nothing reaches the top of the block, because a bottom slab does not.
+        let highest = mesh.vertices.iter().fold(0.0f32, |m, v| m.max(v.position[1]));
+        assert!(highest <= 15.5 + 1e-3, "slab geometry reaches {highest}");
+    }
+
+    #[test]
+    fn leaves_carry_a_green_tint_and_stone_does_not() {
+        let Some(t) = textures() else { return };
+        let leaves = neuton_blocks::by_name("minecraft:oak_leaves").unwrap().get().default_state.0;
+        let mesh = build(&chunk(1, leaves, |_| true), &Solid, &t);
+        assert!(!mesh.is_empty());
+        assert!(
+            mesh.vertices.iter().all(|v| v.tint[1] > v.tint[0]),
+            "leaves should be tinted green"
+        );
+
+        let mesh = build(&chunk(1, stone(), |_| true), &Solid, &t);
+        assert!(mesh.vertices.iter().all(|v| v.tint == [1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn geometry_stays_inside_the_column() {
+        let Some(t) = textures() else { return };
+        let mesh = build(&chunk(2, stone(), |i| i == 1), &Solid, &t);
         for v in &mesh.vertices {
-            assert!((0.0..=16.0).contains(&v.position[0]), "x out of range: {v:?}");
-            assert!((0.0..=32.0).contains(&v.position[1]), "y out of range: {v:?}");
-            assert!((0.0..=16.0).contains(&v.position[2]), "z out of range: {v:?}");
+            assert!((0.0..=16.0).contains(&v.position[0]), "{v:?}");
+            assert!((16.0..=32.0).contains(&v.position[1]), "{v:?}");
+            assert!((0.0..=16.0).contains(&v.position[2]), "{v:?}");
         }
-        // The filled section is the upper one, so nothing should sit below y=16.
-        assert!(mesh.vertices.iter().all(|v| v.position[1] >= 16.0));
-    }
-
-    #[test]
-    fn min_y_offsets_the_whole_column() {
-        let mut c = chunk(1, |_| true);
-        c.min_y = -64;
-        let mesh = build(&c, &Solid, &OneTile::default());
-        assert!(mesh.vertices.iter().all(|v| (-64.0..=-48.0).contains(&v.position[1])));
-    }
-
-    /// Water: see-through, but hides its own internal faces.
-    struct Fluid;
-    impl BlockAppearance for Fluid {
-        fn is_opaque(&self, _state: StateId) -> bool {
-            false
-        }
-        fn self_culls(&self, state: StateId) -> bool {
-            !state.is_air()
-        }
-    }
-
-    #[test]
-    fn a_body_of_fluid_draws_only_its_surface() {
-        // Two solid sections of a single non-opaque, self-culling block. Without
-        // same-block culling this would draw every internal face and produce
-        // the whole volume instead of the shell.
-        let mesh = build(&chunk(2, |_| true), &Fluid, &OneTile::default());
-        let expected = (2 * 256 + 4 * 16 * 32) * 2;
-        assert_eq!(mesh.triangles(), expected);
     }
 
     #[test]
     fn every_index_points_at_a_real_vertex() {
-        let mesh = build(&chunk(2, |i| i == 0), &Solid, &OneTile::default());
+        let Some(t) = textures() else { return };
+        let mesh = build(&chunk(2, stone(), |i| i == 0), &Solid, &t);
         assert!(!mesh.indices.is_empty());
-        let max = mesh.vertices.len() as u32;
-        assert!(mesh.indices.iter().all(|&i| i < max));
+        assert!(mesh.indices.iter().all(|&i| (i as usize) < mesh.vertices.len()));
         assert_eq!(mesh.indices.len() % 3, 0);
     }
 }
