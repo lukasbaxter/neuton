@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use neuton_render::{Camera, WorldRenderer};
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use crate::settings::{Action, Settings};
 use winit::keyboard::KeyCode;
 
@@ -38,6 +38,11 @@ pub struct WorldView {
     /// Time since the last physics tick, so physics runs at a fixed rate
     /// regardless of frame rate.
     accumulator: f64,
+    /// Where the body was at the previous tick, for interpolating the camera
+    /// between them.
+    previous: [f64; 3],
+    /// Chunk meshes waiting to go to the GPU, oldest first.
+    pending: std::collections::VecDeque<(i32, i32, Box<neuton_render::Mesh>)>,
     /// Set on the frame the jump key is pressed, for the double-tap to fly.
     last_jump: Option<Instant>,
     /// What the server says the player may do.
@@ -57,8 +62,7 @@ pub struct WorldView {
     pub settings_open: bool,
     /// The action waiting for a key, while rebinding one.
     pub rebinding: Option<Action>,
-    /// When the last movement update went out, and what it said.
-    last_move_sent: Option<Instant>,
+    /// What the last movement update said, so only changes are reported.
     last_position: Option<[f64; 3]>,
     last_rotation: Option<(f32, f32)>,
     /// Ticks since anything about the player changed.
@@ -84,6 +88,8 @@ impl WorldView {
             body: Body::default(),
             shapes,
             accumulator: 0.0,
+            previous: [0.0; 3],
+            pending: std::collections::VecDeque::new(),
             last_jump: None,
             abilities: Abilities::default(),
             paused: false,
@@ -95,7 +101,6 @@ impl WorldView {
             settings: Settings::load(),
             settings_open: false,
             rebinding: None,
-            last_move_sent: None,
             last_position: None,
             last_rotation: None,
             idle_ticks: 0,
@@ -228,53 +233,20 @@ impl WorldView {
         if self.paused {
             self.held.clear();
         }
+        // Corrections are applied before the step they correct, so a
+        // teleport does not spend a tick being walked away from.
+        self.pump_events(renderer, device);
         self.tick_physics(dt);
+    }
 
-        // The server is told where we are about twenty times a second, which is
-        // the rate the game itself uses. Less often and chunk loading lags
-        // behind the camera; more often is just traffic.
-        const MOVE_INTERVAL: Duration = Duration::from_millis(50);
-        if self.placed && self.last_move_sent.is_none_or(|t| t.elapsed() >= MOVE_INTERVAL) {
-            self.last_move_sent = Some(Instant::now());
+    /// How many chunk meshes go to the GPU in one frame.
+    ///
+    /// Enough that the world still fills in quickly, few enough that no single
+    /// frame runs long.
+    const UPLOADS_PER_FRAME: usize = 8;
 
-            let position = self.body.position;
-            let rotation = (self.camera.yaw, self.camera.pitch);
-
-            // Only report what changed. Claiming to have turned every tick when
-            // the view has not moved is what anti-cheat flags as a duplicate
-            // look, and it is a fair thing to flag.
-            let moved = self.last_position.is_none_or(|last| {
-                let d = [position[0] - last[0], position[1] - last[1], position[2] - last[2]];
-                d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 4.0e-8
-            });
-            let turned = self
-                .last_rotation
-                .is_none_or(|(yaw, pitch)| yaw != rotation.0 || pitch != rotation.1);
-
-            if moved {
-                self.last_position = Some(position);
-            }
-            if turned {
-                self.last_rotation = Some(rotation);
-            }
-            // Standing still and looking the same way needs no packet most
-            // ticks. The game sends a bare status update about once a second to
-            // show it is still there; sending one every tick is noise that
-            // anti-cheat reads as a client not running a real game loop.
-            self.idle_ticks = if moved || turned { 0 } else { self.idle_ticks + 1 };
-            if moved || turned || self.idle_ticks >= 20 {
-                if self.idle_ticks >= 20 {
-                    self.idle_ticks = 0;
-                }
-                self.session.send(Outgoing::Move {
-                    position: moved.then_some(position),
-                    rotation: turned.then_some(rotation),
-                });
-            }
-            // Every tick ends, whatever happened in it.
-            self.session.send(Outgoing::TickEnd);
-        }
-
+    /// Applies everything the server has said since the last frame.
+    fn pump_events(&mut self, renderer: &mut WorldRenderer, device: &wgpu::Device) {
         for event in self.session.drain() {
             match event {
                 WorldEvent::Joined { .. } => {
@@ -285,42 +257,77 @@ impl WorldView {
                         self.first_chunk = Some(Instant::now());
                     }
                     self.last_chunk = Some(Instant::now());
-                    renderer.upload(device, x, z, &mesh);
+                    // Uploading every mesh that arrived this frame is what
+                    // makes joining stutter: a hundred of them land at once and
+                    // the frame that takes them is long enough that the game
+                    // misses several ticks, which a server reads as a client
+                    // that stopped playing. They go up a few at a time instead.
+                    self.pending.push_back((x, z, mesh));
                     self.blocks.insert((x, z), blocks);
                 }
                 WorldEvent::Forget { x, z } => {
+                    self.pending.retain(|(px, pz, _)| (*px, *pz) != (x, z));
                     renderer.forget(x, z);
                     self.blocks.remove(&(x, z));
                 }
-                WorldEvent::Moved { x, y, z, yaw, pitch } => {
-                    // Every teleport, not just the first. The server moves a
-                    // player for all sorts of reasons, from a command to a
-                    // portal to being pushed, and ignoring those left the
-                    // client standing somewhere the server did not think it
-                    // was.
+                WorldEvent::Moved { x, y, z, yaw, pitch, relative } => {
+                    // Every teleport, not just the first: a player moved by a
+                    // command, a portal or a shove has to follow.
+                    //
+                    // But each field is either a destination or an offset. A
+                    // server nudging a player sends an entirely relative
+                    // teleport of nearly nothing, and reading that as a
+                    // destination sends them back to wherever the numbers
+                    // happen to name.
                     let first = !self.placed;
                     self.placed = true;
-                    self.body.position = [x, y, z];
-                    self.body.velocity = [0.0; 3];
-                    // Anything already sent about where we were is now wrong.
-                    self.last_position = None;
 
+                    // Offsets were already resolved against what the server
+                    // was last told, which is the base it used for them.
+                    let position = [x, y, z];
+                    let turned_to = (yaw, pitch);
+
+                    self.body.position = position;
+                    self.body.velocity = [0.0; 3];
+
+                    // A teleport is only accepted once the client reports
+                    // standing exactly where it was put. Anti-cheats compare
+                    // the very next position packet against the teleport with
+                    // no tolerance at all, so this goes out immediately after
+                    // the acknowledgement rather than waiting for the next
+                    // tick, by which time physics has already moved us.
+                    self.last_position = Some(position);
+                    self.last_rotation = Some(turned_to);
+
+                    // A rotation the server did not specify is the player's,
+                    // and overwriting it snaps the view every time the server
+                    // corrects a position.
+                    if first || relative.0 & 0b11000 == 0 {
+                        self.camera.yaw = turned_to.0;
+                        self.camera.pitch = turned_to.1;
+                    }
                     if first {
-                        // Walking, not flying: the whole point.
                         self.body.flying = self.abilities.flying;
-                        self.camera.yaw = yaw;
-                        self.camera.pitch = pitch;
                         self.session.send(Outgoing::Loaded);
                         self.reported_loaded = true;
                     }
                     self.camera.position = [
-                        x as f32,
-                        (y + neuton_world::physics::EYE_HEIGHT) as f32,
-                        z as f32,
+                        position[0] as f32,
+                        (position[1] + neuton_world::physics::EYE_HEIGHT) as f32,
+                        position[2] as f32,
                     ];
+
+                    if std::env::var_os("NEUTON_TIMING").is_some() {
+                        eprintln!(
+                            "teleport: t={:.2}s to {position:?} yaw {:.1} relative {:#07b}",
+                            self.joined_at.elapsed().as_secs_f32(), turned_to.0, relative.0
+                        );
+                    }
                 }
                 WorldEvent::Abilities(abilities) => {
                     self.abilities = abilities;
+                    self.body.walk_speed = abilities.walk_speed as f64;
+                    self.body.fly_speed = abilities.fly_speed as f64;
                     // The server has the final say: it can put a player into
                     // flight, and it can take it away mid-air.
                     self.body.flying = abilities.flying;
@@ -335,20 +342,33 @@ impl WorldView {
                 }
             }
         }
+
+        for _ in 0..Self::UPLOADS_PER_FRAME {
+            let Some((x, z, mesh)) = self.pending.pop_front() else { break };
+            renderer.upload(device, x, z, &mesh);
+        }
     }
 
-    /// Runs physics at a fixed rate, whatever the frame rate.
+    /// Runs physics at the game's own rate, whatever the frame rate.
     ///
-    /// A variable step changes how far a jump goes and how reliably a collision
-    /// is caught, so the simulation runs in fixed slices and the frame just
-    /// decides how many of them happen.
+    /// Twenty a second is not a rendering choice. It is the rate the server
+    /// simulates at, and a client that steps at any other rate walks a
+    /// different curve than the server predicts for it -- which servers read,
+    /// fairly, as a client that is not running the real game.
+    pub const TICK: f64 = physics::TICK;
+
     fn tick_physics(&mut self, dt: f32) {
-        const TICK: f64 = 1.0 / 60.0;
+        // Walks and turns by itself, so the movement path can be exercised
+        // without a person at the keyboard.
+        let auto = std::env::var_os("NEUTON_AUTOWALK").is_some();
+        if auto {
+            self.camera.yaw = (self.camera.yaw + 60.0 * dt).rem_euclid(360.0);
+        }
         let axis = |pos: Action, neg: Action| {
             (self.acting(pos) as i32 - self.acting(neg) as i32) as f32
         };
         let input = MoveInput {
-            forward: axis(Action::Forward, Action::Back),
+            forward: if auto { 1.0 } else { axis(Action::Forward, Action::Back) },
             strafe: axis(Action::Right, Action::Left),
             jump: self.acting(Action::Jump),
             sneak: self.acting(Action::Sneak),
@@ -364,29 +384,83 @@ impl WorldView {
             (self.body.position[2].floor() as i32).div_euclid(16),
         );
         if !self.blocks.contains_key(&here) {
+            // Saying nothing reads better to a server than repeating a position
+            // that is not falling when it expects one that is.
             self.accumulator = 0.0;
+            self.previous = self.body.position;
             return;
         }
-
         self.accumulator += dt as f64;
-        // Bounded, so a long stall does not make the player teleport when it
-        // ends.
-        self.accumulator = self.accumulator.min(0.25);
-        let world = ChunkWorld { chunks: &self.blocks };
-        while self.accumulator >= TICK {
-            self.accumulator -= TICK;
-            physics::step(&mut self.body, input, &world, self.shapes.as_ref(), TICK);
+
+        // A stall is time the player did not get to play. Catching all of it up
+        // at once covers ground in one step that no legitimate movement could,
+        // so past a few ticks the rest is dropped rather than sprinted through.
+        self.accumulator = self.accumulator.min(Self::TICK * 4.0);
+
+        while self.accumulator >= Self::TICK {
+            self.accumulator -= Self::TICK;
+            self.previous = self.body.position;
+            {
+                let world = ChunkWorld { chunks: &self.blocks };
+                physics::step(&mut self.body, input, &world, self.shapes.as_ref());
+            }
+            self.report_position();
         }
 
         // Settings that the camera owns.
         self.camera.fov_degrees = self.settings.fov;
 
-        // The camera sits at the eyes.
-        self.camera.position = [
-            self.body.position[0] as f32,
-            (self.body.position[1] + neuton_world::physics::EYE_HEIGHT) as f32,
-            self.body.position[2] as f32,
-        ];
+        // Twenty steps a second is visibly steppy at a hundred and sixty
+        // frames, so the camera sits between the last two of them.
+        let alpha = (self.accumulator / Self::TICK) as f32;
+        let at = |i: usize| {
+            self.previous[i] as f32 + (self.body.position[i] - self.previous[i]) as f32 * alpha
+        };
+        self.camera.position =
+            [at(0), at(1) + neuton_world::physics::EYE_HEIGHT as f32, at(2)];
+    }
+
+    /// Tells the server where we are, once per tick, the way the game does.
+    fn report_position(&mut self) {
+        if !self.placed {
+            return;
+        }
+        let position = self.body.position;
+        let rotation = (self.camera.yaw, self.camera.pitch);
+
+        // Only report what changed. Claiming to have turned every tick when the
+        // view has not moved is what anti-cheat flags as a duplicate look, and
+        // it is a fair thing to flag.
+        let moved = self.last_position.is_none_or(|last| {
+            let d = [position[0] - last[0], position[1] - last[1], position[2] - last[2]];
+            d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 4.0e-8
+        });
+        let turned = self
+            .last_rotation
+            .is_none_or(|(yaw, pitch)| yaw != rotation.0 || pitch != rotation.1);
+
+        if moved {
+            self.last_position = Some(position);
+        }
+        if turned {
+            self.last_rotation = Some(rotation);
+        }
+        // Standing still and looking the same way needs no packet most ticks.
+        // The game sends a bare status update about once a second to show it is
+        // still there; sending one every tick is noise that anti-cheat reads as
+        // a client not running a real game loop.
+        self.idle_ticks = if moved || turned { 0 } else { self.idle_ticks + 1 };
+        if moved || turned || self.idle_ticks >= 20 {
+            if self.idle_ticks >= 20 {
+                self.idle_ticks = 0;
+            }
+            self.session.send(Outgoing::Move {
+                position: moved.then_some(position),
+                rotation: turned.then_some(rotation),
+            });
+        }
+        // Every tick ends, whatever happened in it.
+        self.session.send(Outgoing::TickEnd);
     }
 
     /// Switches between walking and flying, where the server allows it.

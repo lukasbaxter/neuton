@@ -12,7 +12,7 @@ pub mod dns;
 pub mod registries;
 pub mod status;
 
-pub use connection::{Connection, Error, Event, Stats};
+pub use connection::{Connection, Error, Event, Relatives, Stats};
 pub use registries::{BiomeColors, DimensionShape, GrassModifier, Registries};
 pub use dns::{Resolution, Srv};
 pub use status::{ServerStatus, Span, ping};

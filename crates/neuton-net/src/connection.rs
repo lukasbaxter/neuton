@@ -65,6 +65,47 @@ impl From<neuton_auth::Error> for Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// Which fields of a teleport are offsets rather than destinations.
+///
+/// A bitmask over the game's `Relative` enum, in its declared order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Relatives(pub u32);
+
+impl Relatives {
+    const X: u32 = 1 << 0;
+    const Y: u32 = 1 << 1;
+    const Z: u32 = 1 << 2;
+    const YAW: u32 = 1 << 3;
+    const PITCH: u32 = 1 << 4;
+
+    pub fn x(self) -> bool {
+        self.0 & Self::X != 0
+    }
+    pub fn y(self) -> bool {
+        self.0 & Self::Y != 0
+    }
+    pub fn z(self) -> bool {
+        self.0 & Self::Z != 0
+    }
+    pub fn yaw(self) -> bool {
+        self.0 & Self::YAW != 0
+    }
+    pub fn pitch(self) -> bool {
+        self.0 & Self::PITCH != 0
+    }
+
+    /// Applies one field: an offset from `current`, or a destination.
+    pub fn resolve(relative: bool, value: f64, current: f64) -> f64 {
+        if relative { current + value } else { value }
+    }
+
+    /// True if nothing at all is absolute, which is how a server nudges a
+    /// player without moving them.
+    pub fn all_relative(self) -> bool {
+        self.x() && self.y() && self.z()
+    }
+}
+
 /// Something the caller might want to act on. Packets we do not model yet are
 /// reported as [`Event::Ignored`] rather than dropped, so it is visible what a
 /// real server actually sends.
@@ -74,8 +115,21 @@ pub enum Event {
     Joined { entity_id: i32, dimension: DimensionShape },
     Chunk(Box<Chunk>),
     ChunkForgotten { x: i32, z: i32 },
-    /// The server moved us. Already acknowledged; ignoring these gets us kicked.
-    Teleported { x: f64, y: f64, z: f64, yaw: f32, pitch: f32 },
+    /// The server moved us. Already acknowledged; ignoring these gets us
+    /// kicked.
+    ///
+    /// Each field is either where to go or how far to move, according to
+    /// `relative`. A server correcting a small drift sends a relative teleport
+    /// of nearly nothing, and reading that as absolute throws the player across
+    /// the world.
+    Teleported {
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+        relative: Relatives,
+    },
     /// A chat line, already flattened to styled runs.
     Chat(Vec<crate::Span>),
     /// What the server says the player may do. Sent on join and whenever the
@@ -105,6 +159,9 @@ pub struct Connection {
     dimension: DimensionShape,
     pub stats: Stats,
     started: Instant,
+    /// The last position and rotation the server was told about. Relative
+    /// teleports are offsets from this, and so are echoed back against it.
+    reported: ([f64; 3], (f32, f32)),
 }
 
 impl Connection {
@@ -120,6 +177,7 @@ impl Connection {
             dimension: DimensionShape::OVERWORLD,
             stats: Stats::default(),
             started,
+            reported: ([0.0; 3], (0.0, 0.0)),
         };
 
         conn.handshake(host, port)?;
@@ -386,13 +444,39 @@ impl Connection {
                     let _dz = r.read_f64().map_err(named)?;
                     let yaw = r.read_f32().map_err(named)?;
                     let pitch = r.read_f32().map_err(named)?;
+                    // A bitmask over the Relative enum, saying which of the
+                    // fields above are offsets rather than destinations.
+                    let relative = Relatives(r.read_i32().unwrap_or(0) as u32);
 
+                    // Offsets are applied to where the server last heard we
+                    // were, which is what it based them on.
+                    let last = self.reported;
+                    let x = Relatives::resolve(relative.x(), x, last.0[0]);
+                    let y = Relatives::resolve(relative.y(), y, last.0[1]);
+                    let z = Relatives::resolve(relative.z(), z, last.0[2]);
+                    let yaw = Relatives::resolve(relative.yaw(), yaw as f64, last.1.0 as f64) as f32;
+                    let pitch =
+                        Relatives::resolve(relative.pitch(), pitch as f64, last.1.1 as f64) as f32;
+
+                    if std::env::var_os("NEUTON_TRACE").is_some() {
+                        eprintln!("net: teleport #{teleport_id} rel {:#07b}", relative.0);
+                    }
                     // Not acknowledging a teleport gets the connection dropped,
                     // so this is answered here rather than left to the caller.
                     let mut w = Writer::new();
                     w.write_varint(teleport_id);
                     self.framed.write_packet(ids::play::serverbound::ACCEPT_TELEPORTATION, &w)?;
-                    return Ok(Event::Teleported { x, y, z, yaw, pitch });
+
+                    // A teleport is not settled until the client reports
+                    // standing exactly where it was put, and servers compare
+                    // that report against the teleport with no tolerance. It
+                    // goes out here, before another packet is read, because
+                    // anything answered in between -- a transaction, a ping --
+                    // makes the server give up waiting for it and teleport
+                    // again, forever.
+                    self.send_movement(Some([x, y, z]), Some((yaw, pitch)), false)?;
+
+                    return Ok(Event::Teleported { x, y, z, yaw, pitch, relative });
                 }
                 ids::play::clientbound::KEEP_ALIVE => {
                     let token = r.read_i64().map_err(named)?;
@@ -403,6 +487,9 @@ impl Connection {
                 }
                 ids::play::clientbound::PING => {
                     let token = r.read_i32().map_err(named)?;
+                    if std::env::var_os("NEUTON_TRACE").is_some() {
+                        eprintln!("net: ping {token}");
+                    }
                     let mut w = Writer::new();
                     w.write_i32(token);
                     self.framed.write_packet(ids::play::serverbound::PONG, &w)?;
@@ -558,6 +645,15 @@ impl Connection {
                 ids::play::serverbound::MOVE_PLAYER_STATUS_ONLY
             }
         };
+        if std::env::var_os("NEUTON_TRACE").is_some() {
+            eprintln!("net: move {position:?} {rotation:?} ground={on_ground}");
+        }
+        if let Some(p) = position {
+            self.reported.0 = p;
+        }
+        if let Some(r) = rotation {
+            self.reported.1 = r;
+        }
         self.framed.write_packet(id, &w)?;
         Ok(())
     }

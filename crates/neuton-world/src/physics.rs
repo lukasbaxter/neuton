@@ -66,6 +66,11 @@ pub trait BlockView {
 pub trait BlockShapes {
     /// Boxes in 0..1 block space. Empty means you pass straight through.
     fn collision(&self, state: StateId) -> &[Aabb];
+
+    /// How much grip a block gives underfoot. Ordinary blocks give 0.6.
+    fn friction(&self, _state: StateId) -> f64 {
+        DEFAULT_FRICTION
+    }
 }
 
 /// What the server says the player is allowed to do.
@@ -102,6 +107,11 @@ pub struct Body {
     pub on_ground: bool,
     /// Set while flying; gravity and ground friction stop applying.
     pub flying: bool,
+    /// The movement speed attribute, as the server sets it. A tenth of a block
+    /// per tick is the ordinary value.
+    pub walk_speed: f64,
+    /// The flying speed the server allows.
+    pub fly_speed: f64,
 }
 
 impl Default for Body {
@@ -111,6 +121,8 @@ impl Default for Body {
             velocity: [0.0; 3],
             on_ground: false,
             flying: true,
+            walk_speed: 0.1,
+            fly_speed: 0.05,
         }
     }
 }
@@ -133,112 +145,109 @@ pub const PLAYER_WIDTH: f64 = 0.6;
 pub const PLAYER_HEIGHT: f64 = 1.8;
 pub const EYE_HEIGHT: f64 = 1.62;
 
-/// Blocks per second.
-const WALK_SPEED: f64 = 4.317;
-const SPRINT_SPEED: f64 = 5.612;
-const SNEAK_SPEED: f64 = 1.3;
-const FLY_SPEED: f64 = 10.9;
-/// Blocks per second squared, matching the game's 32 blocks per second per
-/// second closely enough that jumps feel right.
-const GRAVITY: f64 = 32.0;
-const TERMINAL_VELOCITY: f64 = 78.4;
-/// Chosen so a jump clears one block with margin.
-///
-/// Higher than the closed-form figure would suggest, because stepping the
-/// integration in fixed slices loses a little height on the way up.
-const JUMP_SPEED: f64 = 9.2;
+/// One tick, in seconds. Everything below is expressed per tick, because the
+/// game is: the server simulates twenty times a second and predicts the client
+/// on the same schedule, so a client that integrates at any other rate walks a
+/// curve the server did not expect.
+pub const TICK: f64 = 0.05;
+
+/// Downward acceleration, blocks per tick per tick.
+const GRAVITY: f64 = 0.08;
+/// Vertical drag, applied after gravity. Terminal velocity falls out of these
+/// two at 3.92 blocks per tick.
+const DRAG: f64 = 0.98;
+/// Horizontal drag in the air, and the base the ground friction multiplies.
+const AIR_DRAG: f64 = 0.91;
+/// The friction of ordinary blocks. Ice is slipperier, slime less so.
+pub const DEFAULT_FRICTION: f64 = 0.6;
+/// Ties ground acceleration to friction so that walking on any surface reaches
+/// the same top speed, just at a different rate.
+const ACCELERATION_BASE: f64 = 0.216_000_02;
+/// How much of a hold you have in mid-air. Almost none, which is what stops a
+/// jump from being a steering opportunity.
+const AIR_CONTROL: f64 = 0.02;
+const AIR_CONTROL_SPRINTING: f64 = 0.026;
+/// Upward velocity of a jump, blocks per tick.
+const JUMP_POWER: f64 = 0.42;
+/// A jump taken while sprinting is thrown forward as well as up.
+const SPRINT_JUMP_BOOST: f64 = 0.2;
+/// Sprinting raises the movement speed attribute by this much.
+const SPRINT_MULTIPLIER: f64 = 1.3;
+/// Sneaking scales the input rather than the speed.
+const SNEAK_MULTIPLIER: f64 = 0.3;
 /// How high a step the player walks up without jumping.
 const STEP_HEIGHT: f64 = 0.6;
-/// How quickly the player reaches the speed they are asking for, per second.
+
+/// Advances the body by one tick.
 ///
-/// On the ground you take hold quickly but not instantly; in the air you have
-/// almost no say, which is what stops a jump from being a steering opportunity.
-const GROUND_ACCELERATION: f64 = 18.0;
-const AIR_ACCELERATION: f64 = 2.5;
-const FLY_ACCELERATION: f64 = 9.0;
-
-/// Advances the body by `dt` seconds.
-pub fn step(
-    body: &mut Body,
-    input: Input,
-    world: &dyn BlockView,
-    shapes: &dyn BlockShapes,
-    dt: f64,
-) {
-    let dt = dt.clamp(0.0, 0.1);
-
-    // Desired horizontal motion, in world axes.
-    let yaw = (input.yaw as f64).to_radians();
-    let (sin, cos) = yaw.sin_cos();
-    let speed = if body.flying {
-        FLY_SPEED
-    } else if input.sneak {
-        SNEAK_SPEED
-    } else if input.sprint {
-        SPRINT_SPEED
-    } else {
-        WALK_SPEED
-    };
-
-    // Forward is where the camera looks; right is ninety degrees clockwise
-    // from it, which on these axes is the negation of the usual cross product.
-    let forward = [-sin, cos];
-    let right = [-cos, -sin];
-    let mut wish = [
-        forward[0] * input.forward as f64 + right[0] * input.strafe as f64,
-        forward[1] * input.forward as f64 + right[1] * input.strafe as f64,
-    ];
-    // Normalised, or moving diagonally would be faster than moving straight.
-    let length = (wish[0] * wish[0] + wish[1] * wish[1]).sqrt();
-    if length > 1.0 {
+/// The order here is the game's order, and it matters: motion is applied first,
+/// then gravity and drag are folded in for the tick after. Applying them the
+/// other way round produces a jump that is a few hundredths of a block short,
+/// which is enough for a server to disagree with every step you take.
+pub fn step(body: &mut Body, input: Input, world: &dyn BlockView, shapes: &dyn BlockShapes) {
+    // Sneaking slows the input, not the speed, so a sneaking player still
+    // accelerates at the walking rate towards a slower target.
+    let scale = if input.sneak && !body.flying { SNEAK_MULTIPLIER } else { 1.0 };
+    let mut wish = [input.strafe as f64 * scale, input.forward as f64 * scale];
+    // Normalised only if it is over one, so a half-pressed stick stays half.
+    let length_squared = wish[0] * wish[0] + wish[1] * wish[1];
+    if length_squared > 1.0 {
+        let length = length_squared.sqrt();
         wish[0] /= length;
         wish[1] /= length;
     }
 
-    // Approach the target speed rather than snapping to it. Setting velocity
-    // directly makes movement feel like a camera on rails: instant to start,
-    // instant to stop, and nothing carries. Acceleration and drag are what make
-    // it feel like a player.
-    let target = [wish[0] * speed, wish[1] * speed];
-    let rate = if body.flying {
-        FLY_ACCELERATION
-    } else if body.on_ground {
-        GROUND_ACCELERATION
+    // The block underfoot decides how fast you take hold of the ground. It is
+    // sampled a little below the feet, as the game does, so standing exactly on
+    // a boundary picks the block you are standing on rather than the air.
+    let friction = if body.on_ground {
+        let below = [
+            body.position[0].floor() as i32,
+            (body.position[1] - 0.500_000_1).floor() as i32,
+            body.position[2].floor() as i32,
+        ];
+        shapes.friction(world.state_at(below[0], below[1], below[2]))
     } else {
-        // Barely any control in mid-air, which is what stops a jump being a
-        // steering opportunity.
-        AIR_ACCELERATION
+        1.0
     };
-    // Exponential approach, so the result does not depend on the tick length.
-    let blend = 1.0 - (-rate * dt).exp();
-    body.velocity[0] += (target[0] - body.velocity[0]) * blend;
-    body.velocity[2] += (target[1] - body.velocity[2]) * blend;
 
-    if body.flying {
-        // Vertical is driven directly rather than by gravity, and smoothed the
-        // same way as the horizontal axes.
-        let target = if input.jump {
-            FLY_SPEED
-        } else if input.sneak {
-            -FLY_SPEED
-        } else {
-            0.0
-        };
-        body.velocity[1] += (target - body.velocity[1]) * blend;
+    let acceleration = if body.flying {
+        body.fly_speed * if input.sprint { 2.0 } else { 1.0 }
+    } else if body.on_ground {
+        let speed = body.walk_speed * if input.sprint { SPRINT_MULTIPLIER } else { 1.0 };
+        speed * (ACCELERATION_BASE / (friction * friction * friction))
+    } else if input.sprint {
+        AIR_CONTROL_SPRINTING
     } else {
-        if input.jump && body.on_ground {
-            body.velocity[1] = JUMP_SPEED;
-            body.on_ground = false;
+        AIR_CONTROL
+    };
+
+    // A jump is taken before the tick moves, off the ground state the last tick
+    // ended on.
+    if input.jump && body.on_ground && !body.flying {
+        body.velocity[1] = JUMP_POWER;
+        if input.sprint {
+            let yaw = (input.yaw as f64).to_radians();
+            body.velocity[0] -= yaw.sin() * SPRINT_JUMP_BOOST;
+            body.velocity[2] += yaw.cos() * SPRINT_JUMP_BOOST;
         }
-        body.velocity[1] -= GRAVITY * dt;
-        body.velocity[1] = body.velocity[1].max(-TERMINAL_VELOCITY);
+        body.on_ground = false;
+    }
+    if body.flying {
+        let up = f64::from(input.jump) - f64::from(input.sneak);
+        if up != 0.0 {
+            body.velocity[1] += up * body.fly_speed * 3.0;
+        }
     }
 
-    let motion = [
-        body.velocity[0] * dt,
-        body.velocity[1] * dt,
-        body.velocity[2] * dt,
-    ];
+    // Forward is where the camera looks; right is ninety degrees clockwise from
+    // it, which on these axes is the negation of the usual cross product.
+    let yaw = (input.yaw as f64).to_radians();
+    let (sin, cos) = yaw.sin_cos();
+    body.velocity[0] += (wish[1] * -sin - wish[0] * -cos) * acceleration;
+    body.velocity[2] += (wish[1] * cos + wish[0] * -sin) * acceleration;
+
+    let motion = body.velocity;
     let moved = move_with_collision(body, motion, world, shapes);
 
     // Running into something takes the speed out of that axis, or the player
@@ -255,6 +264,18 @@ pub fn step(
         body.velocity[1] = 0.0;
     } else if motion[1] < 0.0 {
         body.on_ground = false;
+    }
+
+    // Gravity and drag land at the end of the tick, for the next one to use.
+    if body.flying {
+        body.velocity[1] *= 0.6;
+        body.velocity[0] *= AIR_DRAG;
+        body.velocity[2] *= AIR_DRAG;
+    } else {
+        body.velocity[1] = (body.velocity[1] - GRAVITY) * DRAG;
+        let horizontal = if body.on_ground { friction * AIR_DRAG } else { AIR_DRAG };
+        body.velocity[0] *= horizontal;
+        body.velocity[2] *= horizontal;
     }
 }
 
@@ -440,13 +461,28 @@ mod tests {
             velocity: [0.0; 3],
             on_ground: false,
             flying: false,
+            walk_speed: 0.1,
+            fly_speed: 0.05,
         }
+    }
+
+    /// What walking flat out comes to, in blocks per tick. The game's 4.317
+    /// blocks a second.
+    const WALK_SPEED: f64 = 0.2158;
+
+    /// How far one more tick actually carries the player, which is what the
+    /// server measures. The stored velocity has already had drag taken off it.
+    fn step_distance(body: &mut Body, input: Input, world: &dyn BlockView) -> f64 {
+        let before = body.position;
+        step(body, input, world, &Cubes);
+        let d = [body.position[0] - before[0], body.position[2] - before[2]];
+        (d[0] * d[0] + d[1] * d[1]).sqrt()
     }
 
     /// Runs a number of 50 ms ticks.
     fn run(body: &mut Body, input: Input, world: &dyn BlockView, ticks: usize) {
         for _ in 0..ticks {
-            step(body, input, world, &Cubes, 0.05);
+            step(body, input, world, &Cubes);
         }
     }
 
@@ -460,7 +496,13 @@ mod tests {
             "feet should rest on the block top: {}",
             body.position[1]
         );
-        assert!(body.velocity[1].abs() < 1e-6, "vertical speed should be spent");
+        // A player standing on the ground still carries one tick of gravity,
+        // exactly as the game does: it is what keeps them pressed down.
+        assert!(
+            (body.velocity[1] + GRAVITY * DRAG).abs() < 1e-9,
+            "resting speed was {}",
+            body.velocity[1]
+        );
     }
 
     #[test]
@@ -514,7 +556,7 @@ mod tests {
         let input = Input { jump: true, yaw: 0.0, ..Default::default() };
         let mut highest = body.position[1];
         for _ in 0..30 {
-            step(&mut body, input, &Floor, &Cubes, 0.05);
+            step(&mut body, input, &Floor, &Cubes);
             highest = highest.max(body.position[1]);
         }
         assert!(highest >= 2.0, "jump only reached {highest}");
@@ -536,18 +578,16 @@ mod tests {
         let input = Input { forward: 1.0, yaw: 270.0, ..Default::default() };
 
         // One tick in, the player is moving but nowhere near full speed.
-        step(&mut body, input, &Floor, &Cubes, 1.0 / 60.0);
-        let first = body.velocity[0].abs();
+        let before = body.position[0];
+        step(&mut body, input, &Floor, &Cubes);
+        let first = (body.position[0] - before).abs();
         assert!(first > 0.0, "should have started moving");
-        assert!(first < WALK_SPEED * 0.5, "reached {first} in a single tick");
+        assert!(first < WALK_SPEED * 0.6, "reached {first} in a single tick");
 
         // And after a moment it is there.
         run(&mut body, input, &Floor, 30);
-        assert!(
-            (body.velocity[0].abs() - WALK_SPEED).abs() < 0.1,
-            "settled at {}",
-            body.velocity[0].abs()
-        );
+        let settled = step_distance(&mut body, input, &Floor);
+        assert!((settled - WALK_SPEED).abs() < 0.02, "settled at {settled}");
     }
 
     #[test]
@@ -558,7 +598,7 @@ mod tests {
         let moving = body.velocity[0].abs();
 
         // One tick of no input does not stop a player dead.
-        step(&mut body, Input { yaw: 270.0, ..Default::default() }, &Floor, &Cubes, 1.0 / 60.0);
+        step(&mut body, Input { yaw: 270.0, ..Default::default() }, &Floor, &Cubes);
         assert!(body.velocity[0].abs() > 0.0, "stopped instantly");
         assert!(body.velocity[0].abs() < moving, "did not slow down");
 
@@ -568,20 +608,48 @@ mod tests {
     }
 
     #[test]
-    fn the_tick_length_does_not_change_the_result() {
-        // Exponential approach rather than a fixed fraction per tick, so
-        // halving the step does not halve the acceleration.
-        let settle = |dt: f64, ticks: usize| {
-            let mut b = walker(0.5, 1.0);
-            b.on_ground = true;
-            for _ in 0..ticks {
-                step(&mut b, Input { forward: 1.0, yaw: 270.0, ..Default::default() }, &Floor, &Cubes, dt);
-            }
-            b.velocity[0].abs()
+    fn walking_settles_at_the_speed_the_game_walks_at() {
+        // Not a round number anyone chose: it falls out of an acceleration of a
+        // tenth of a block a tick against a drag of 0.6 * 0.91.
+        let mut body = walker(0.5, 1.0);
+        body.on_ground = true;
+        let input = Input { forward: 1.0, yaw: 270.0, ..Default::default() };
+        run(&mut body, input, &Floor, 60);
+        let blocks_per_second = step_distance(&mut body, input, &Floor) / TICK;
+        assert!(
+            (blocks_per_second - 4.317).abs() < 0.15,
+            "walked at {blocks_per_second} blocks a second"
+        );
+    }
+
+    #[test]
+    fn sprinting_is_a_third_faster_than_walking() {
+        let settle = |sprint: bool| {
+            let mut body = walker(0.5, 1.0);
+            body.on_ground = true;
+            let input = Input { forward: 1.0, yaw: 270.0, sprint, ..Default::default() };
+            run(&mut body, input, &Floor, 60);
+            step_distance(&mut body, input, &Floor)
         };
-        let coarse = settle(1.0 / 30.0, 6);
-        let fine = settle(1.0 / 60.0, 12);
-        assert!((coarse - fine).abs() < 0.05, "{coarse} against {fine}");
+        let ratio = settle(true) / settle(false);
+        assert!((ratio - 1.3).abs() < 0.02, "sprint was {ratio} times walking");
+    }
+
+    #[test]
+    fn falling_reaches_the_game_terminal_velocity() {
+        // Gravity and drag together, not a clamp: 0.08 * 0.98 / 0.02.
+        struct Void;
+        impl BlockView for Void {
+            fn state_at(&self, _x: i32, _y: i32, _z: i32) -> StateId {
+                StateId(0)
+            }
+        }
+        let mut body = walker(0.5, 500.0);
+        run(&mut body, Input::default(), &Void, 400);
+        let fell = body.position[1];
+        step(&mut body, Input::default(), &Void, &Cubes);
+        let per_tick = fell - body.position[1];
+        assert!((per_tick - 3.92).abs() < 0.01, "fell at {per_tick} blocks a tick");
     }
 
     #[test]
