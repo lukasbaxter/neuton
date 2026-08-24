@@ -182,6 +182,8 @@ pub struct Connection {
     /// The player's own entity ID, so packets addressed to it can be told apart
     /// from the ones about everything else in the world.
     entity_id: i32,
+    /// How fast this client would like chunks. The server waits to be told.
+    batches: crate::batches::BatchRate,
 }
 
 impl Connection {
@@ -199,6 +201,7 @@ impl Connection {
             started,
             reported: ([0.0; 3], (0.0, 0.0)),
             entity_id: 0,
+            batches: crate::batches::BatchRate::new(),
         };
 
         conn.handshake(host, port)?;
@@ -528,6 +531,35 @@ impl Connection {
                 ids::play::clientbound::SET_HELD_SLOT => {
                     let slot = r.read_varint().map_err(named)?;
                     return Ok(Event::HeldSlot(slot));
+                }
+                ids::play::clientbound::CHUNK_BATCH_START => {
+                    self.batches.start();
+                    return Ok(Event::Ignored {
+                        id: ids::play::clientbound::CHUNK_BATCH_START,
+                        name: "minecraft:chunk_batch_start",
+                        len,
+                    });
+                }
+                ids::play::clientbound::CHUNK_BATCH_FINISHED => {
+                    let chunks = r.read_varint().map_err(named)?;
+                    self.batches.finish(chunks);
+                    // Until this goes out the server will not send another
+                    // batch. Ten unanswered and it stops sending chunks at all.
+                    let mut w = Writer::new();
+                    w.write_f32(self.batches.desired_per_tick());
+                    self.framed
+                        .write_packet(ids::play::serverbound::CHUNK_BATCH_RECEIVED, &w)?;
+                    if std::env::var_os("NEUTON_TRACE").is_some() {
+                        eprintln!(
+                            "net: chunk batch of {chunks}, asking for {:.1} a tick",
+                            self.batches.desired_per_tick()
+                        );
+                    }
+                    return Ok(Event::Ignored {
+                        id: ids::play::clientbound::CHUNK_BATCH_FINISHED,
+                        name: "minecraft:chunk_batch_finished",
+                        len,
+                    });
                 }
                 ids::play::clientbound::KEEP_ALIVE => {
                     let token = r.read_i64().map_err(named)?;
