@@ -55,11 +55,13 @@ pub fn run_screenshot(
     path: std::path::PathBuf,
     after: std::time::Duration,
     view: Option<([f32; 3], f32, f32)>,
+    bench_frames: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App {
         direct: Some(app::PendingJoin { host, port, session }),
         shot: Some((path, after)),
         view,
+        bench: bench_frames,
         ..Default::default()
     };
     let event_loop = EventLoop::new()?;
@@ -101,6 +103,8 @@ struct App {
     view: Option<([f32; 3], f32, f32)>,
     /// Frames drawn after the screenshot deadline, before capturing.
     warmup: u32,
+    /// Frames to time before capturing, if benchmarking.
+    bench: u32,
     started: Option<Instant>,
 }
 
@@ -273,6 +277,19 @@ impl ApplicationHandler for App {
                             width,
                             height,
                         );
+                        if self.bench > 0 {
+                            let ms = bench(state, launcher, world, renderer, self.bench);
+                            let tris = renderer.as_ref().map(|r| r.triangles()).unwrap_or(0);
+                            println!(
+                                "bench: {ms:.2} ms/frame ({:.0} fps) at {}x{}, {} chunks, {:.2}M triangles",
+                                1000.0 / ms,
+                                state.gpu.config.width,
+                                state.gpu.config.height,
+                                renderer.as_ref().map(|r| r.drawn.get()).unwrap_or(0),
+                                tris as f64 / 1.0e6,
+                            );
+                        }
+
                         match shot {
                             Some(pixels) => {
                                 let png =
@@ -674,6 +691,58 @@ fn crosshair(ui: &mut egui::Ui) {
     for arm in arms {
         painter.rect_filled(arm, 0.0, egui::Color32::from_white_alpha(220));
     }
+}
+
+/// Times how long the renderer takes per frame, off-screen.
+///
+/// Measured without the read-back a screenshot needs: copying a full frame into
+/// a buffer and waiting on the GPU costs more than drawing it, so timing the
+/// screenshot path measures the screenshot machinery rather than the renderer.
+fn bench(
+    state: &mut State,
+    launcher: &mut Launcher,
+    world: &mut Option<WorldView>,
+    renderer: &mut Option<WorldRenderer>,
+    frames: u32,
+) -> f64 {
+    let (width, height) = (state.gpu.config.width, state.gpu.config.height);
+    let texture = state.gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("bench"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: state.gpu.format(),
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    // One frame first, so shader compilation and buffer warm-up are not
+    // counted as rendering.
+    draw_into(
+        state,
+        launcher,
+        world.as_mut(),
+        renderer.as_mut(),
+        Some(CaptureTarget { view: &view, width, height }),
+    );
+    let _ = state.gpu.device.poll(wgpu::PollType::wait_indefinitely());
+
+    let start = Instant::now();
+    for _ in 0..frames {
+        draw_into(
+            state,
+            launcher,
+            world.as_mut(),
+            renderer.as_mut(),
+            Some(CaptureTarget { view: &view, width, height }),
+        );
+    }
+    // Waited on once at the end rather than per frame: syncing every frame
+    // would serialise the CPU against the GPU and measure the stall.
+    let _ = state.gpu.device.poll(wgpu::PollType::wait_indefinitely());
+    start.elapsed().as_secs_f64() * 1000.0 / frames as f64
 }
 
 /// Renders one whole frame off-screen and reads it back as RGBA8.
