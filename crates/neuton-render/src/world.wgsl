@@ -15,14 +15,18 @@ struct Globals {
 struct VertexIn {
     @location(0) position: vec3<f32>,
     @location(1) uv: vec2<f32>,
-    @location(2) light: f32,
+    // Biome colour for grass and leaves, which ship greyscale and are tinted at
+    // render time. White for everything else.
+    @location(2) tint: vec3<f32>,
+    @location(3) light: f32,
 };
 
 struct VertexOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) light: f32,
-    @location(2) view_distance: f32,
+    @location(1) tint: vec3<f32>,
+    @location(2) light: f32,
+    @location(3) view_distance: f32,
 };
 
 @vertex
@@ -30,6 +34,7 @@ fn vs_main(in: VertexIn) -> VertexOut {
     var out: VertexOut;
     out.clip = globals.view_projection * vec4<f32>(in.position, 1.0);
     out.uv = in.uv;
+    out.tint = in.tint;
     out.light = in.light;
     // Distance in clip space rather than world space: the vertex shader does
     // not know where the camera is, and w after projection is exactly the
@@ -48,7 +53,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         discard;
     }
 
-    color = vec4<f32>(color.rgb * in.light, color.a);
+    color = vec4<f32>(color.rgb * in.tint * in.light, color.a);
 
     let fog = clamp(
         (in.view_distance - globals.fog.x) / max(globals.fog.y - globals.fog.x, 0.001),
