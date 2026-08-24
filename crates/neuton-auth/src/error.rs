@@ -14,6 +14,12 @@ pub enum Error {
     NotEntitled(String),
     /// The user did not finish the browser step in time.
     DeviceCodeExpired,
+    /// Microsoft and Xbox accepted the sign-in, but Mojang has not approved
+    /// this Azure application for the Minecraft services API.
+    ///
+    /// Distinct from the other failures because nothing the user does can fix
+    /// it: it is a one-time review of the application itself.
+    AppNotApproved,
     /// The cached refresh token is no longer accepted.
     RefreshRejected,
 }
@@ -22,6 +28,7 @@ impl Error {
     /// Whether retrying could plausibly succeed. Callers use this to decide
     /// between falling back to an interactive login and giving up.
     pub fn is_recoverable(&self) -> bool {
+        // AppNotApproved is deliberately absent: retrying it can never help.
         matches!(self, Error::RefreshRejected | Error::DeviceCodeExpired | Error::Http(_))
     }
 }
@@ -45,6 +52,18 @@ impl fmt::Display for Error {
             }
             Error::NotEntitled(why) => write!(f, "{why}"),
             Error::DeviceCodeExpired => f.write_str("sign-in timed out before it was approved"),
+            Error::AppNotApproved => f.write_str(
+                "Mojang has not approved this application for Minecraft sign-in\n\
+                 \n\
+                 the Microsoft and Xbox Live steps succeeded; only the final\n\
+                 Minecraft services call was refused. third-party launchers must\n\
+                 have their Azure application reviewed once before it can be used:\n\
+                 \n\
+                     https://aka.ms/mce-reviewappid\n\
+                 \n\
+                 approval applies to the application, not to any account, so this\n\
+                 affects every user of this build until it is granted",
+            ),
             Error::RefreshRejected => f.write_str("the saved sign-in expired and must be redone"),
         }
     }

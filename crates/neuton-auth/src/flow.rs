@@ -235,10 +235,17 @@ impl DeviceCodeFlow {
         let status = res.status().as_u16();
         let body: Value = res.body_mut().read_json()?;
         if status >= 400 {
+            let message = describe(&body);
+            // Mojang gates the Minecraft API on a one-time review of the Azure
+            // application. The raw message is four words and a link, which
+            // reads like a misconfiguration rather than a policy gate.
+            if message.contains("Invalid app registration") {
+                return Err(Error::AppNotApproved);
+            }
             return Err(Error::Upstream {
                 stage: "minecraft services",
                 code: status.to_string(),
-                message: describe(&body),
+                message,
             });
         }
         let token = string_field(&body, "access_token", "minecraft services")?;
@@ -310,6 +317,19 @@ mod tests {
         let body = json!({ "DisplayClaims": { "xui": [ { "uhs": "12345" } ] } });
         assert_eq!(user_hash(&body), "12345");
         assert_eq!(user_hash(&json!({})), "");
+    }
+
+    #[test]
+    fn mojangs_app_registration_refusal_is_recognised() {
+        // The exact body Minecraft services returns for an unapproved app.
+        let body = json!({
+            "path": "/authentication/login_with_xbox",
+            "errorMessage": "Invalid app registration, see https://aka.ms/AppRegInfo for more information"
+        });
+        assert!(describe(&body).contains("Invalid app registration"));
+        // And it must not be reported as retryable.
+        assert!(!Error::AppNotApproved.is_recoverable());
+        assert!(Error::AppNotApproved.to_string().contains("mce-reviewappid"));
     }
 
     #[test]

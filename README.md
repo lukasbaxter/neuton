@@ -90,7 +90,12 @@ chunk    #1 at (12, -30)  8214 non-air, 9 sections used
 ```
 
 Players just run `neuton login` and sign in with the Microsoft account that owns
-the game. Release builds bake in the project's Azure application ID
+the game.
+
+> **Sign-in is not live yet.** Mojang reviews an Azure application once before it
+> may use the Minecraft services API, and that review is pending. Microsoft, Xbox
+> Live and XSTS all succeed today; the final call is refused until approval.
+> Development uses `--offline` against a local server in the meantime. Release builds bake in the project's Azure application ID
 (`NEUTON_CLIENT_ID=<id> cargo build --release`); it is a public OAuth client with
 no secret, so nobody but the publisher touches Azure. See
 [docs/AUTH.md](docs/AUTH.md).

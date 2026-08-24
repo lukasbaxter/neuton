@@ -71,6 +71,7 @@ To revoke from Microsoft's side instead, remove the app at
 | `child account` | Needs adding to a Microsoft family group first |
 | `does not own Minecraft: Java Edition` | The sign-in worked, but there is no game licence on that account |
 | The code expired | Codes last about 15 minutes. Run `neuton login` again |
+| `Mojang has not approved this application` | Not your account. The build's application is awaiting review; see the publisher section |
 
 ---
 
@@ -143,12 +144,34 @@ local build at their own registration without rebuilding:
 2. a `client_id` file in the config directory
 3. the value compiled in at build time
 
-### Worth checking before publishing
+### Getting the application approved by Mojang
 
-Microsoft and Mojang publish guidance for third-party launchers that use
-Microsoft accounts, and it has changed over time. I have not verified the
-current terms, so confirm what applies before distributing builds publicly
-rather than treating a working sign-in as permission.
+**A new Azure application cannot sign into Minecraft until Mojang reviews it.**
+This is not optional and not a setting you can toggle. Registering the app
+correctly gets you through Microsoft OAuth, Xbox Live and XSTS; the final call
+to `api.minecraftservices.com` then returns:
+
+```
+403: Invalid app registration, see https://aka.ms/AppRegInfo
+```
+
+Apply once, here:
+
+> **<https://aka.ms/mce-reviewappid>**
+
+Points worth knowing:
+
+- Approval attaches to the **application**, not to an account. Until it is
+  granted, nobody can sign in with this build, including whoever registered it.
+- Established launchers such as Prism and MultiMC have been through the same
+  process, so it is a normal thing to be granted rather than an exception.
+- Turnaround is not published. Plan for it taking a while.
+- Approval is also the point at which the usage terms are agreed, so this
+  doubles as the permission check before distributing builds. A working sign-in
+  is not the same as permission; this is.
+
+The client detects this specific refusal and explains it, rather than passing
+Mojang's four-word message through.
 
 ---
 
