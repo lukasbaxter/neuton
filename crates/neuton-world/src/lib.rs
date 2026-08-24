@@ -5,6 +5,8 @@
 
 pub mod chunk;
 pub mod palette;
+pub mod physics;
 
 pub use chunk::{BlockEntity, Chunk, Heightmap, Section, SectionScratch};
+pub use physics::{Aabb, Body, BlockShapes, BlockView, Input};
 pub use palette::{BIOME_VOLUME, Palette, PalettedContainer, SECTION_VOLUME, block_index, words_for};

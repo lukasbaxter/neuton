@@ -17,7 +17,10 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 pub enum WorldEvent {
     Joined { entity_id: i32, sections: usize, min_y: i32 },
     /// Geometry for one chunk column, already meshed.
-    Chunk { x: i32, z: i32, mesh: Box<Mesh> },
+    ///
+    /// The blocks come with it: collision needs them, and the meshing thread
+    /// already holds them for re-meshing, so sharing costs a pointer.
+    Chunk { x: i32, z: i32, mesh: Box<Mesh>, blocks: Arc<Chunk> },
     Forget { x: i32, z: i32 },
     Moved { x: f64, y: f64, z: f64, yaw: f32, pitch: f32 },
     Chat(Vec<neuton_net::Span>),
@@ -113,7 +116,11 @@ impl WorldSession {
                         let Some(chunk) = world.get(&(x, z)) else { continue };
                         let mesh =
                             mesh_chunk(chunk, &world, &appearance, &textures, &biome_tints);
-                        if tx.send(WorldEvent::Chunk { x, z, mesh: Box::new(mesh) }).is_err() {
+                        let blocks = chunk.clone();
+                        if tx
+                            .send(WorldEvent::Chunk { x, z, mesh: Box::new(mesh), blocks })
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -130,11 +137,13 @@ impl WorldSession {
                     Ok(Event::Chunk(chunk)) => {
                         let (x, z) = (chunk.x, chunk.z);
                         world.insert((x, z), Arc::from(*chunk));
-                        let chunk = world.get(&(x, z)).expect("just inserted");
+                        let chunk = world.get(&(x, z)).expect("just inserted").clone();
+                        let chunk = &chunk;
                         let mesh =
                             mesh_chunk(chunk, &world, &appearance, &textures, &biome_tints);
+                        let blocks = chunk.clone();
                         if tx
-                            .send(WorldEvent::Chunk { x, z, mesh: Box::new(mesh) })
+                            .send(WorldEvent::Chunk { x, z, mesh: Box::new(mesh), blocks })
                             .is_err()
                         {
                             return; // the window closed

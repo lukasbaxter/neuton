@@ -90,6 +90,7 @@ impl Default for BiomeTints {
     }
 }
 use neuton_blocks::{BLOCK_COUNT, STATE_COUNT, StateId};
+use neuton_world::Aabb;
 
 /// One face, ready to draw.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -124,6 +125,13 @@ pub struct BakedElement {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BakedModel {
     pub elements: Vec<BakedElement>,
+    /// Boxes to walk into, in 0..1 block space.
+    ///
+    /// Taken from the render geometry. The game keeps a separate collision
+    /// shape, which differs for a handful of blocks, but for stairs, slabs,
+    /// fences and walls the render boxes are the right answer and everything
+    /// else is close enough to stand on.
+    pub collision: Vec<Aabb>,
     /// True if this block fills its cell and hides what is behind it.
     ///
     /// Taken from the geometry rather than guessed from the name. A block whose
@@ -152,6 +160,13 @@ struct Pending {
     tint: TintSource,
     /// The still texture, for water and lava.
     fluid: Option<String>,
+}
+
+impl neuton_world::BlockShapes for BlockTextures {
+    #[inline]
+    fn collision(&self, state: StateId) -> &[Aabb] {
+        &self.model(state).collision
+    }
 }
 
 /// Baked models for every block state.
@@ -240,7 +255,7 @@ impl BlockTextures {
 
 /// Turns a resolved model into block-space boxes with atlas coordinates.
 fn bake(model: &BlockModel, atlas: &Atlas, tint: TintSource) -> BakedModel {
-    let elements = model
+    let elements: Vec<BakedElement> = model
         .elements
         .iter()
         .map(|element| {
@@ -283,7 +298,40 @@ fn bake(model: &BlockModel, atlas: &Atlas, tint: TintSource) -> BakedModel {
                 f.as_ref().is_some_and(|face| atlas.is_opaque(&face.texture))
             })
     });
-    BakedModel { elements, fluid: false, occludes }
+    let collision = if passes_through(model) {
+        Vec::new()
+    } else {
+        elements
+            .iter()
+            .map(|e| Aabb::new([e.from[0] as f64, e.from[1] as f64, e.from[2] as f64],
+                               [e.to[0] as f64, e.to[1] as f64, e.to[2] as f64]))
+            .collect()
+    };
+    BakedModel { elements, fluid: false, occludes, collision }
+}
+
+/// Whether a block can be walked through.
+///
+/// Not in the data anywhere: the game decides it in code per block. Flowers,
+/// torches, rails and signs all have geometry and none of them stop you, and
+/// walking into a tulip as though it were a fence post is worse than passing
+/// through a block that should have held you.
+fn passes_through(model: &BlockModel) -> bool {
+    // Model space here is 0..16.
+    model.elements.iter().all(|e| {
+        let size = [
+            e.to[0] - e.from[0],
+            e.to[1] - e.from[1],
+            e.to[2] - e.from[2],
+        ];
+        // A plant is a cross: two planes with no thickness at all.
+        let flat = size.iter().any(|s| *s <= 0.1);
+        // A torch, button or lever is a small prop stuck to a surface. A fence
+        // post has the same footprint but runs the full height of the block,
+        // and does stop you.
+        let small_prop = size[0].max(size[2]) < 8.0 && size[1] < 14.0;
+        flat || small_prop
+    })
 }
 
 /// Places a model face's texture region inside its atlas tile.
@@ -341,6 +389,8 @@ fn bake_fluid(texture: &str, atlas: &Atlas, tint: TintSource) -> BakedModel {
         fluid: true,
         // A fluid is see-through: it must not hide the seabed behind it.
         occludes: false,
+        // And you swim through it rather than standing on it.
+        collision: Vec::new(),
     }
 }
 
@@ -646,6 +696,48 @@ mod tests {
         );
         // And the two axes are genuinely different orientations.
         assert!((east[0] - north[0]).abs() > 0.2 || (east[1] - north[1]).abs() > 0.2);
+    }
+
+    #[test]
+    fn you_walk_through_plants_and_into_fences() {
+        let Some(mut packs) = packs() else { return };
+        let t = BlockTextures::build(&mut packs);
+        let solid = |name: &str| {
+            !t.model(neuton_blocks::by_name(name).unwrap().get().default_state)
+                .collision
+                .is_empty()
+        };
+
+        // Things you stand on or bump into.
+        assert!(solid("minecraft:stone"));
+        assert!(solid("minecraft:oak_slab"));
+        assert!(solid("minecraft:oak_stairs"));
+        assert!(solid("minecraft:oak_fence"), "a fence post is thin but full height");
+        assert!(solid("minecraft:cobblestone_wall"));
+
+        // Things you walk through.
+        assert!(!solid("minecraft:poppy"));
+        assert!(!solid("minecraft:short_grass"));
+        assert!(!solid("minecraft:torch"));
+        assert!(!solid("minecraft:water"), "you swim, not stand");
+    }
+
+    #[test]
+    fn collision_boxes_match_the_shape() {
+        let Some(mut packs) = packs() else { return };
+        let t = BlockTextures::build(&mut packs);
+
+        let stone = neuton_blocks::by_name("minecraft:stone").unwrap().get().default_state;
+        let full = &t.model(stone).collision;
+        assert_eq!(full.len(), 1);
+        assert_eq!(full[0].min, [0.0, 0.0, 0.0]);
+        assert_eq!(full[0].max, [1.0, 1.0, 1.0]);
+
+        // A bottom slab is half a block tall, so you stand at 0.5.
+        let slab = neuton_blocks::by_name("minecraft:stone_slab").unwrap().get().default_state;
+        let boxes = &t.model(slab).collision;
+        assert_eq!(boxes.len(), 1);
+        assert!((boxes[0].max[1] - 0.5).abs() < 1e-6, "slab top at {}", boxes[0].max[1]);
     }
 
     #[test]

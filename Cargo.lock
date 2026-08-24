@@ -1614,6 +1614,7 @@ dependencies = [
  "egui-winit",
  "neuton-assets",
  "neuton-auth",
+ "neuton-blocks",
  "neuton-net",
  "neuton-protocol",
  "neuton-render",
