@@ -152,6 +152,15 @@ pub enum Event {
     /// The server moved the hotbar selection, which it does on join and when a
     /// plugin sets it.
     HeldSlot(i32),
+    /// Blocks that changed, in world coordinates. One packet may carry many.
+    BlocksChanged(Vec<([i32; 3], u32)>),
+    /// The player's health and hunger.
+    Health { health: f32, food: i32, saturation: f32 },
+    /// Motion the server is imposing on the player, in blocks per tick. This is
+    /// knockback: being hit, shoved, or thrown by an explosion.
+    Knockback([f64; 3]),
+    /// The player died and the server is waiting to be told to respawn them.
+    Died,
     Disconnect(String),
     /// Answered automatically; surfaced so latency can be tracked.
     KeepAlive,
@@ -184,6 +193,9 @@ pub struct Connection {
     entity_id: i32,
     /// How fast this client would like chunks. The server waits to be told.
     batches: crate::batches::BatchRate,
+    /// Counts the world-changing actions sent, so the server can tell the
+    /// client which of its guesses about the world it is confirming.
+    sequence: i32,
 }
 
 impl Connection {
@@ -202,6 +214,7 @@ impl Connection {
             reported: ([0.0; 3], (0.0, 0.0)),
             entity_id: 0,
             batches: crate::batches::BatchRate::new(),
+            sequence: 0,
         };
 
         conn.handshake(host, port)?;
@@ -532,6 +545,68 @@ impl Connection {
                     let slot = r.read_varint().map_err(named)?;
                     return Ok(Event::HeldSlot(slot));
                 }
+                ids::play::clientbound::SET_HEALTH => {
+                    let health = r.read_f32().map_err(named)?;
+                    let food = r.read_varint().map_err(named)?;
+                    let saturation = r.read_f32().map_err(named)?;
+                    return Ok(Event::Health { health, food, saturation });
+                }
+                ids::play::clientbound::SET_ENTITY_MOTION => {
+                    let who = r.read_varint().map_err(named)?;
+                    if who != self.entity_id {
+                        return Ok(Event::Ignored {
+                            id: ids::play::clientbound::SET_ENTITY_MOTION,
+                            name: "minecraft:set_entity_motion",
+                            len,
+                        });
+                    }
+                    // Three shorts at eight thousandths of a block each, which
+                    // is all the precision a shove needs.
+                    const SCALE: f64 = 8000.0;
+                    let axis = |r: &mut Reader<'_>| -> Result<f64> {
+                        Ok(f64::from(r.read_i16().map_err(named)?) / SCALE)
+                    };
+                    let x = axis(&mut r)?;
+                    let y = axis(&mut r)?;
+                    let z = axis(&mut r)?;
+                    return Ok(Event::Knockback([x, y, z]));
+                }
+                ids::play::clientbound::PLAYER_COMBAT_KILL => {
+                    // The player ID and the death message follow, neither of
+                    // which changes what has to happen next.
+                    return Ok(Event::Died);
+                }
+                ids::play::clientbound::BLOCK_UPDATE => {
+                    let at = decode_block_pos(r.read_i64().map_err(named)?);
+                    let state = r.read_varint().map_err(named)? as u32;
+                    return Ok(Event::BlocksChanged(vec![(at, state)]));
+                }
+                ids::play::clientbound::SECTION_BLOCKS_UPDATE => {
+                    // A section's origin, then one varlong per block holding the
+                    // state and the position within the section together.
+                    let packed = r.read_i64().map_err(named)?;
+                    let section = [
+                        (packed >> 42) as i32,
+                        ((packed << 44) >> 44) as i32,
+                        ((packed << 22) >> 42) as i32,
+                    ];
+                    let count = r.read_varint_len(4096).map_err(named)?;
+                    let mut out = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let entry = r.read_varlong().map_err(named)?;
+                        let state = (entry >> 12) as u32;
+                        let local = (entry & 0xFFF) as i32;
+                        out.push((
+                            [
+                                section[0] * 16 + ((local >> 8) & 0xF),
+                                section[1] * 16 + (local & 0xF),
+                                section[2] * 16 + ((local >> 4) & 0xF),
+                            ],
+                            state,
+                        ));
+                    }
+                    return Ok(Event::BlocksChanged(out));
+                }
                 ids::play::clientbound::CHUNK_BATCH_START => {
                     self.batches.start();
                     return Ok(Event::Ignored {
@@ -711,6 +786,84 @@ impl Connection {
         let mut w = Writer::new();
         w.write_i16(slot as i16);
         self.framed.write_packet(ids::play::serverbound::SET_CARRIED_ITEM, &w)?;
+        Ok(())
+    }
+
+    /// Asks to be put back in the world after dying.
+    pub fn send_respawn(&mut self) -> Result<()> {
+        let mut w = Writer::new();
+        w.write_varint(0); // perform respawn, rather than request stats
+        self.framed.write_packet(ids::play::serverbound::CLIENT_COMMAND, &w)?;
+        Ok(())
+    }
+
+    /// Starts, gives up on, or finishes breaking a block.
+    ///
+    /// `action` is the game's own ordering: 0 starts, 1 gives up, 2 finishes.
+    pub fn send_player_action(&mut self, action: i32, at: [i32; 3], face: u8) -> Result<()> {
+        self.sequence += 1;
+        let mut w = Writer::new();
+        w.write_varint(action);
+        w.write_i64(encode_block_pos(at));
+        w.write_u8(face);
+        w.write_varint(self.sequence);
+        self.framed.write_packet(ids::play::serverbound::PLAYER_ACTION, &w)?;
+        Ok(())
+    }
+
+    /// Uses whatever is in hand against a block: placing, opening, flipping.
+    ///
+    /// `cursor` is where on the face the player is pointing, from zero to one
+    /// across the block. Servers use it to decide which half of a slab you get.
+    pub fn send_use_item_on(
+        &mut self,
+        at: [i32; 3],
+        face: u8,
+        cursor: [f32; 3],
+        inside: bool,
+    ) -> Result<()> {
+        self.sequence += 1;
+        let mut w = Writer::new();
+        w.write_varint(0); // main hand
+        w.write_i64(encode_block_pos(at));
+        w.write_varint(i32::from(face));
+        w.write_f32(cursor[0]);
+        w.write_f32(cursor[1]);
+        w.write_f32(cursor[2]);
+        w.write_bool(inside);
+        w.write_bool(false); // not a world border hit
+        w.write_varint(self.sequence);
+        self.framed.write_packet(ids::play::serverbound::USE_ITEM_ON, &w)?;
+        Ok(())
+    }
+
+    /// Uses what is in hand with nothing in front of it: eating, drawing a bow.
+    pub fn send_use_item(&mut self, yaw: f32, pitch: f32) -> Result<()> {
+        self.sequence += 1;
+        let mut w = Writer::new();
+        w.write_varint(0); // main hand
+        w.write_varint(self.sequence);
+        w.write_f32(yaw);
+        w.write_f32(pitch);
+        self.framed.write_packet(ids::play::serverbound::USE_ITEM, &w)?;
+        Ok(())
+    }
+
+    /// The arm swing everyone else sees.
+    pub fn send_swing(&mut self) -> Result<()> {
+        let mut w = Writer::new();
+        w.write_varint(0); // main hand
+        self.framed.write_packet(ids::play::serverbound::SWING, &w)?;
+        Ok(())
+    }
+
+    /// Hits an entity.
+    pub fn send_attack(&mut self, entity: i32, sneaking: bool) -> Result<()> {
+        let mut w = Writer::new();
+        w.write_varint(entity);
+        w.write_varint(1); // attack, rather than interact
+        w.write_bool(sneaking);
+        self.framed.write_packet(ids::play::serverbound::INTERACT, &w)?;
         Ok(())
     }
 
@@ -902,5 +1055,32 @@ fn describe(name: Option<&'static str>, id: i32) -> String {
     match name {
         Some(n) => format!("{n} ({id})"),
         None => format!("packet {id}"),
+    }
+}
+
+/// Unpacks the game's block position: 26 bits of x, 26 of z, 12 of y.
+fn decode_block_pos(packed: i64) -> [i32; 3] {
+    [
+        (packed >> 38) as i32,
+        ((packed << 52) >> 52) as i32,
+        ((packed << 26) >> 38) as i32,
+    ]
+}
+
+fn encode_block_pos(at: [i32; 3]) -> i64 {
+    ((at[0] as i64 & 0x3FF_FFFF) << 38)
+        | ((at[2] as i64 & 0x3FF_FFFF) << 12)
+        | (at[1] as i64 & 0xFFF)
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+
+    #[test]
+    fn block_positions_survive_a_round_trip() {
+        for at in [[0, 0, 0], [1, 2, 3], [-1587, 71, -2111], [-30_000_000, -64, 30_000_000]] {
+            assert_eq!(decode_block_pos(encode_block_pos(at)), at, "{at:?}");
+        }
     }
 }

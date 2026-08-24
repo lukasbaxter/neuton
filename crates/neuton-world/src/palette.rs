@@ -108,6 +108,69 @@ impl PalettedContainer {
         }
     }
 
+    /// Replaces one cell, growing the palette if the value is new to it.
+    ///
+    /// Placing and breaking blocks is the only thing that calls this, so it is
+    /// written for correctness rather than speed: a value the palette cannot
+    /// hold promotes the whole container to direct registry IDs rather than
+    /// trying to be clever about widening in place.
+    pub fn set(&mut self, index: usize, value: u32) {
+        if index >= self.len {
+            return;
+        }
+        match &mut self.palette {
+            Palette::Single(v) if *v == value => return,
+            Palette::Indirect(entries) => {
+                if let Some(slot) = entries.iter().position(|e| *e == value) {
+                    self.set_raw(index, slot as u32);
+                    return;
+                }
+                if entries.len() < (1usize << self.bits) {
+                    entries.push(value);
+                    let slot = entries.len() as u32 - 1;
+                    self.set_raw(index, slot);
+                    return;
+                }
+            }
+            Palette::Direct => {
+                self.set_raw(index, value);
+                return;
+            }
+            Palette::Single(_) => {}
+        }
+        self.make_direct();
+        self.set_raw(index, value);
+    }
+
+    /// Rewrites every cell as a registry ID at the full width.
+    fn make_direct(&mut self) {
+        let mut values = vec![0u32; self.len];
+        self.unpack_into(&mut values);
+        // Wide enough for any block state the server can name. Vanilla sizes
+        // this from the registry too; being a bit generous costs a few bits a
+        // cell in the one section the player is editing.
+        let bits = 32 - (neuton_blocks::STATE_COUNT as u32).max(1).leading_zeros();
+        self.bits = bits.max(1) as u8;
+        self.palette = Palette::Direct;
+        self.data = vec![0; words_for(self.bits, self.len)];
+        for (index, value) in values.iter().enumerate() {
+            self.set_raw(index, *value);
+        }
+    }
+
+    #[inline]
+    fn set_raw(&mut self, index: usize, raw: u32) {
+        let bits = self.bits as usize;
+        if bits == 0 {
+            return;
+        }
+        let per_word = 64 / bits;
+        let Some(word) = self.data.get_mut(index / per_word) else { return };
+        let shift = (index % per_word) * bits;
+        let mask = (1u64 << bits) - 1;
+        *word = (*word & !(mask << shift)) | ((u64::from(raw) & mask) << shift);
+    }
+
     #[inline]
     fn raw(&self, index: usize) -> Option<u32> {
         let bits = self.bits as usize;
