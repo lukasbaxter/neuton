@@ -25,6 +25,8 @@ pub enum WorldEvent {
     Moved { x: f64, y: f64, z: f64, yaw: f32, pitch: f32 },
     Chat(Vec<neuton_net::Span>),
     Abilities(neuton_world::physics::Abilities),
+    /// Where the time went while the world arrived.
+    Timing(Timing),
     Disconnected(String),
 }
 
@@ -39,6 +41,18 @@ pub enum Outgoing {
     Loaded,
     /// End of a client tick.
     TickEnd,
+}
+
+/// How the world's arrival was spent, for telling network from client.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Timing {
+    /// Wall time inside the mesher.
+    pub meshing_ms: f64,
+    /// Meshes produced, including re-meshes when a neighbour arrives.
+    pub meshes: u64,
+    /// Wall time blocked on the socket, waiting for the server to say
+    /// something.
+    pub waiting_ms: f64,
 }
 
 pub struct WorldSession {
@@ -84,6 +98,13 @@ impl WorldSession {
             // when a neighbour turns up, and that needs the block data back.
             let mut world: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
             let mut dirty: HashSet<(i32, i32)> = HashSet::new();
+            // How many neighbours each column had when it was last meshed. A
+            // chunk only needs re-meshing when that number goes up; without
+            // this a column is meshed once per neighbour that arrives, which on
+            // a fresh join is nearly three times more work than it needs.
+            let mut meshed_with: HashMap<(i32, i32), usize> = HashMap::new();
+            let mut timing = Timing::default();
+            let mut last_report = std::time::Instant::now();
 
             loop {
                 if thread_stop.load(Ordering::Relaxed) {
@@ -115,8 +136,16 @@ impl WorldSession {
                     let batch: Vec<(i32, i32)> = dirty.drain().collect();
                     for (x, z) in batch {
                         let Some(chunk) = world.get(&(x, z)) else { continue };
+                        let present = neighbours_present(x, z, &world);
+                        if meshed_with.get(&(x, z)).is_some_and(|had| *had >= present) {
+                            continue;
+                        }
+                        meshed_with.insert((x, z), present);
+                        let t = std::time::Instant::now();
                         let mesh =
                             mesh_chunk(chunk, &world, &appearance, &textures, &biome_tints);
+                        timing.meshing_ms += t.elapsed().as_secs_f64() * 1000.0;
+                        timing.meshes += 1;
                         let blocks = chunk.clone();
                         if tx
                             .send(WorldEvent::Chunk { x, z, mesh: Box::new(mesh), blocks })
@@ -127,7 +156,14 @@ impl WorldSession {
                     }
                 }
 
-                match conn.poll() {
+                let waited = std::time::Instant::now();
+                let polled = conn.poll();
+                timing.waiting_ms += waited.elapsed().as_secs_f64() * 1000.0;
+                if last_report.elapsed().as_millis() > 250 {
+                    last_report = std::time::Instant::now();
+                    let _ = tx.send(WorldEvent::Timing(timing));
+                }
+                match polled {
                     Ok(Event::Joined { entity_id, dimension }) => {
                         let _ = tx.send(WorldEvent::Joined {
                             entity_id,
@@ -140,8 +176,12 @@ impl WorldSession {
                         world.insert((x, z), Arc::from(*chunk));
                         let chunk = world.get(&(x, z)).expect("just inserted").clone();
                         let chunk = &chunk;
+                        meshed_with.insert((x, z), neighbours_present(x, z, &world));
+                        let t = std::time::Instant::now();
                         let mesh =
                             mesh_chunk(chunk, &world, &appearance, &textures, &biome_tints);
+                        timing.meshing_ms += t.elapsed().as_secs_f64() * 1000.0;
+                        timing.meshes += 1;
                         let blocks = chunk.clone();
                         if tx
                             .send(WorldEvent::Chunk { x, z, mesh: Box::new(mesh), blocks })
@@ -159,6 +199,7 @@ impl WorldSession {
                     Ok(Event::ChunkForgotten { x, z }) => {
                         world.remove(&(x, z));
                         dirty.remove(&(x, z));
+                        meshed_with.remove(&(x, z));
                         let _ = tx.send(WorldEvent::Forget { x, z });
                     }
                     Ok(Event::Teleported { x, y, z, yaw, pitch }) => {
@@ -236,6 +277,14 @@ impl Drop for WorldSession {
         // until then, which is fine: it holds nothing the UI needs back.
         self.stop.store(true, Ordering::Relaxed);
     }
+}
+
+/// How many of a column's four neighbours are loaded.
+fn neighbours_present(x: i32, z: i32, world: &HashMap<(i32, i32), Arc<Chunk>>) -> usize {
+    [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)]
+        .iter()
+        .filter(|key| world.contains_key(key))
+        .count()
 }
 
 /// Meshes one column against whichever of its neighbours are loaded.
