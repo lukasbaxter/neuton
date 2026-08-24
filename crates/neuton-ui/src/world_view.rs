@@ -22,6 +22,11 @@ pub struct WorldView {
     placed: bool,
     pub frames: u32,
     pub last_frame_ms: f32,
+    /// Whether the debug panel is up. F3, as in the game.
+    pub show_debug: bool,
+    /// Smoothed frame time, so the number on screen is readable rather than
+    /// flickering through every stutter.
+    frame_ms_avg: f32,
 }
 
 impl WorldView {
@@ -34,10 +39,16 @@ impl WorldView {
             placed: false,
             frames: 0,
             last_frame_ms: 0.0,
+            show_debug: true,
+            frame_ms_avg: 0.0,
         }
     }
 
     pub fn key(&mut self, code: KeyCode, pressed: bool) {
+        if pressed && code == KeyCode::F3 {
+            self.show_debug = !self.show_debug;
+            return;
+        }
         if pressed {
             self.held.insert(code);
         } else {
@@ -95,18 +106,50 @@ impl WorldView {
         }
     }
 
-    /// One line of stats for the overlay.
-    pub fn stats(&self, renderer: &WorldRenderer) -> String {
+    /// Folds this frame's time into the smoothed average.
+    pub fn record_frame(&mut self, dt: f32) {
+        self.last_frame_ms = dt * 1000.0;
+        self.frames += 1;
+        // Exponential average: responsive enough to show a real slowdown,
+        // steady enough that the number can be read.
+        self.frame_ms_avg = if self.frame_ms_avg == 0.0 {
+            self.last_frame_ms
+        } else {
+            self.frame_ms_avg * 0.9 + self.last_frame_ms * 0.1
+        };
+    }
+
+    pub fn fps(&self) -> f32 {
+        if self.frame_ms_avg > 0.0 { 1000.0 / self.frame_ms_avg } else { 0.0 }
+    }
+
+    /// The debug panel's contents, in the order they are shown.
+    pub fn debug_lines(&self, renderer: &WorldRenderer) -> Vec<String> {
         let [x, y, z] = self.camera.position;
-        format!(
-            "{}  |  {:.0} fps ({:.1} ms)  |  {}/{} chunks drawn, {:.1}M tris  |  {x:.1} {y:.1} {z:.1}  |  {:.0} deg",
-            self.session.status,
-            if self.last_frame_ms > 0.0 { 1000.0 / self.last_frame_ms } else { 0.0 },
-            self.last_frame_ms,
-            renderer.drawn.get(),
-            renderer.chunk_count(),
-            self.session.triangles as f64 / 1.0e6,
-            self.camera.yaw,
-        )
+        let (bx, by, bz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
+        vec![
+            format!("neuton {}  ({} fps)", env!("CARGO_PKG_VERSION"), self.fps().round()),
+            format!("{:.1} ms/frame", self.frame_ms_avg),
+            String::new(),
+            format!("XYZ: {x:.3} / {y:.3} / {z:.3}"),
+            format!("Block: {bx} {by} {bz}"),
+            format!("Chunk: {} {} in {} {}", bx & 15, bz & 15, bx >> 4, bz >> 4),
+            format!("Facing: {} ({:.1} / {:.1})", self.facing(), self.camera.yaw, self.camera.pitch),
+            String::new(),
+            format!("Chunks: {} drawn / {} loaded", renderer.drawn.get(), renderer.chunk_count()),
+            format!("Triangles: {:.2}M", self.session.triangles as f64 / 1.0e6),
+            format!("Server: {}", self.session.server),
+            format!("Status: {}", self.session.status),
+        ]
+    }
+
+    /// Compass direction and the axis it faces, the way the game words it.
+    fn facing(&self) -> &'static str {
+        match self.camera.yaw.rem_euclid(360.0) {
+            y if !(45.0..315.0).contains(&y) => "south (+Z)",
+            y if y < 135.0 => "west (-X)",
+            y if y < 225.0 => "north (-Z)",
+            _ => "east (+X)",
+        }
     }
 }

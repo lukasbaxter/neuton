@@ -211,8 +211,7 @@ impl ApplicationHandler for App {
 
                 if let (Some(w), Some(r)) = (world.as_mut(), renderer.as_mut()) {
                     w.update(dt, r, &state.gpu.device);
-                    w.last_frame_ms = dt * 1000.0;
-                    w.frames += 1;
+                    w.record_frame(dt);
                 }
                 let animating = world.is_some();
 
@@ -221,29 +220,39 @@ impl ApplicationHandler for App {
                 if let Some((path, after)) = &self.shot {
                     let elapsed = started.get_or_insert_with(Instant::now).elapsed();
                     if elapsed >= *after {
-                        if let (Some(w), Some(r)) = (world.as_mut(), renderer.as_mut()) {
-                            let (width, height) = (1280u32, 720u32);
-                            let mut cam = w.camera.clone();
-                            cam.aspect = width as f32 / height as f32;
-                            match r.capture(&state.gpu.device, &state.gpu.queue, &cam, width, height)
-                            {
-                                Some(pixels) => {
-                                    let png = neuton_render::png::encode_rgba(&pixels, width, height);
-                                    match std::fs::write(path, png) {
-                                        Ok(()) => println!(
-                                            "wrote {} ({}/{} chunks drawn, {:.1}M triangles held)",
+                        // The window's own size, so the capture matches what
+                        // is on screen rather than laying the interface out for
+                        // one resolution and rendering it at another.
+                        let (width, height) = (state.gpu.config.width, state.gpu.config.height);
+                        let shot = capture_frame(
+                            state,
+                            launcher,
+                            world.as_mut(),
+                            renderer.as_mut(),
+                            width,
+                            height,
+                        );
+                        match shot {
+                            Some(pixels) => {
+                                let png =
+                                    neuton_render::png::encode_rgba(&pixels, width, height);
+                                match std::fs::write(path, png) {
+                                    Ok(()) => {
+                                        let held = renderer
+                                            .as_ref()
+                                            .map(|r| (r.drawn.get(), r.chunk_count()))
+                                            .unwrap_or((0, 0));
+                                        println!(
+                                            "wrote {} ({}/{} chunks drawn)",
                                             path.display(),
-                                            r.drawn.get(),
-                                            r.chunk_count(),
-                                            w.session.triangles as f64 / 1.0e6
-                                        ),
-                                        Err(e) => eprintln!("neuton: could not write: {e}"),
+                                            held.0,
+                                            held.1
+                                        );
                                     }
+                                    Err(e) => eprintln!("neuton: could not write: {e}"),
                                 }
-                                None => eprintln!("neuton: capture failed"),
                             }
-                        } else {
-                            eprintln!("neuton: no world to capture");
+                            None => eprintln!("neuton: capture failed"),
                         }
                         event_loop.exit();
                         return;
@@ -370,19 +379,43 @@ fn set_capture(window: &Window, world: &mut WorldView, capture: bool) {
     }
 }
 
+/// Somewhere other than the window to draw into.
+struct CaptureTarget<'a> {
+    view: &'a wgpu::TextureView,
+    width: u32,
+    height: u32,
+}
+
 fn draw(
     state: &mut State,
     launcher: &mut Launcher,
     world: Option<&mut WorldView>,
     renderer: Option<&mut WorldRenderer>,
 ) {
+    draw_into(state, launcher, world, renderer, None);
+}
+
+/// Draws one frame, to the window or to `capture`.
+///
+/// A screenshot goes through here rather than rendering the world on its own,
+/// so what lands in the file is the frame a player would see, interface
+/// included.
+fn draw_into(
+    state: &mut State,
+    launcher: &mut Launcher,
+    world: Option<&mut WorldView>,
+    renderer: Option<&mut WorldRenderer>,
+    capture: Option<CaptureTarget<'_>>,
+) {
     use wgpu::CurrentSurfaceTexture as Cst;
 
     let raw_input = state.egui_winit.take_egui_input(&state.gpu.window);
-    let stats = world.as_ref().and_then(|w| renderer.as_ref().map(|r| w.stats(r)));
-    let mut output = state.egui_ctx.run_ui(raw_input, |ui| match &stats {
+    let hud = world.as_ref().zip(renderer.as_ref()).map(|(w, r)| Hud {
+        debug: w.show_debug.then(|| w.debug_lines(r)),
+    });
+    let mut output = state.egui_ctx.run_ui(raw_input, |ui| match &hud {
         // In a world, egui draws only the overlay.
-        Some(line) => overlay(ui, line),
+        Some(hud) => overlay(ui, hud),
         None => launcher.update(ui),
     });
     state.egui_winit.handle_platform_output(&state.gpu.window, output.platform_output.clone());
@@ -408,7 +441,12 @@ fn draw(
         }
     };
 
-    let frame = match state.gpu.surface.get_current_texture() {
+    // An offscreen target skips the surface entirely: there is nothing to
+    // acquire and nothing to present.
+    let frame = if capture.is_some() {
+        None
+    } else {
+        Some(match state.gpu.surface.get_current_texture() {
         Cst::Success(f) => f,
         // Usable, but the surface wants reconfiguring before the next frame.
         Cst::Suboptimal(f) => {
@@ -434,9 +472,21 @@ fn draw(
             free_all(&mut state.egui_renderer);
             return;
         }
+        })
     };
 
-    let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let owned_view = frame
+        .as_ref()
+        .map(|f| f.texture.create_view(&wgpu::TextureViewDescriptor::default()));
+    let view = match (&owned_view, &capture) {
+        (Some(v), _) => v,
+        (None, Some(c)) => c.view,
+        (None, None) => return,
+    };
+    let (target_width, target_height) = match &capture {
+        Some(c) => (c.width, c.height),
+        None => (state.gpu.config.width, state.gpu.config.height),
+    };
     let mut encoder = state
         .gpu
         .device
@@ -445,15 +495,17 @@ fn draw(
     // The world goes down first and clears the frame; egui composites over it.
     let world_drawn = match (world, renderer) {
         (Some(w), Some(r)) => {
-            r.resize(&state.gpu.device, state.gpu.config.width, state.gpu.config.height);
-            r.render(&mut encoder, &state.gpu.queue, &view, &w.camera);
+            r.resize(&state.gpu.device, target_width, target_height);
+            let mut camera = w.camera.clone();
+            camera.aspect = target_width as f32 / target_height.max(1) as f32;
+            r.render(&mut encoder, &state.gpu.queue, view, &camera);
             true
         }
         _ => false,
     };
 
     let desc = egui_wgpu::ScreenDescriptor {
-        size_in_pixels: [state.gpu.config.width, state.gpu.config.height],
+        size_in_pixels: [target_width, target_height],
         pixels_per_point,
     };
     state.egui_renderer.update_buffers(
@@ -468,7 +520,7 @@ fn draw(
         let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("egui"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
+                view,
                 resolve_target: None,
                 depth_slice: None,
                 ops: wgpu::Operations {
@@ -497,32 +549,181 @@ fn draw(
     // textures, and destroying them first fails validation at submit time.
     free_all(&mut state.egui_renderer);
     // Presentation moved onto the queue in wgpu 30.
-    state.gpu.queue.present(frame);
+    if let Some(frame) = frame {
+        state.gpu.queue.present(frame);
+    }
 }
 
-/// The in-world overlay: one line of stats and how to get out.
-fn overlay(ui: &mut egui::Ui, stats: &str) {
+/// What the in-world overlay draws.
+struct Hud {
+    /// Present when the debug panel is up.
+    debug: Option<Vec<String>>,
+}
+
+/// The in-world overlay: a crosshair, and the debug panel when it is up.
+fn overlay(ui: &mut egui::Ui, hud: &Hud) {
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show(ui, |ui| {
-            egui::Frame::new()
-                .fill(egui::Color32::from_black_alpha(150))
-                .corner_radius(6)
-                .inner_margin(egui::Margin::symmetric(10, 6))
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(stats)
-                            .monospace()
-                            .size(12.0)
-                            .color(theme::FG),
-                    );
-                });
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("WASD to move, space and ctrl for height, shift to sprint, escape to release the mouse")
+            crosshair(ui);
+
+            let Some(lines) = &hud.debug else { return };
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                for line in lines {
+                    if line.is_empty() {
+                        ui.add_space(6.0);
+                        continue;
+                    }
+                    // Each line on its own shaded strip, as the game does, so
+                    // text stays readable over both sky and terrain.
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_black_alpha(130))
+                        .inner_margin(egui::Margin::symmetric(4, 1))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(line)
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(0xE8, 0xE8, 0xE8)),
+                            );
+                        });
+                }
+            });
+
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "WASD move  ·  space/ctrl height  ·  shift sprint  ·  F3 debug  ·  esc release",
+                    )
                     .monospace()
                     .size(11.0)
-                    .color(theme::DIM),
-            );
+                    .color(egui::Color32::from_white_alpha(120)),
+                );
+            });
         });
+}
+
+/// A thin cross at the centre of the screen.
+///
+/// Drawn as light strokes with a dark backing rather than the game's inverting
+/// blend, which egui cannot express; the outline is what keeps it visible
+/// against both a bright sky and dark stone.
+fn crosshair(ui: &mut egui::Ui) {
+    // The panel fills the window, so its clip rect is the screen.
+    let rect = ui.clip_rect();
+    let centre = rect.center();
+    let painter = ui.painter();
+
+    const ARM: f32 = 7.0;
+    const THICK: f32 = 1.5;
+    let arms = [
+        egui::Rect::from_min_max(
+            egui::pos2(centre.x - ARM, centre.y - THICK / 2.0),
+            egui::pos2(centre.x + ARM, centre.y + THICK / 2.0),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(centre.x - THICK / 2.0, centre.y - ARM),
+            egui::pos2(centre.x + THICK / 2.0, centre.y + ARM),
+        ),
+    ];
+    for arm in arms {
+        painter.rect_filled(arm.expand(1.0), 0.0, egui::Color32::from_black_alpha(90));
+    }
+    for arm in arms {
+        painter.rect_filled(arm, 0.0, egui::Color32::from_white_alpha(220));
+    }
+}
+
+/// Renders one whole frame off-screen and reads it back as RGBA8.
+fn capture_frame(
+    state: &mut State,
+    launcher: &mut Launcher,
+    world: Option<&mut WorldView>,
+    renderer: Option<&mut WorldRenderer>,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    let format = state.gpu.format();
+    let texture = state.gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("capture"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    draw_into(
+        state,
+        launcher,
+        world,
+        renderer,
+        Some(CaptureTarget { view: &view, width, height }),
+    );
+
+    // Texture copies need rows aligned to 256 bytes, so the buffer is usually
+    // wider than the image and is trimmed on the way out.
+    let unpadded = width * 4;
+    let padded = unpadded.div_ceil(256) * 256;
+    let buffer = state.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("capture readback"),
+        size: (padded * height) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = state
+        .gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+    );
+    state.gpu.queue.submit(Some(encoder.finish()));
+
+    let slice = buffer.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    state.gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+    rx.recv().ok()?.ok()?;
+
+    let mapped = slice.get_mapped_range().ok()?;
+    let mut out = Vec::with_capacity((unpadded * height) as usize);
+    for row in 0..height {
+        let start = (row * padded) as usize;
+        out.extend_from_slice(&mapped[start..start + unpadded as usize]);
+    }
+    drop(mapped);
+    buffer.unmap();
+
+    // Surfaces are usually BGRA; a PNG is RGBA.
+    if matches!(
+        format,
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+    ) {
+        for px in out.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+    }
+    Some(out)
 }
