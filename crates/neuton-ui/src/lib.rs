@@ -265,7 +265,7 @@ impl ApplicationHandler for App {
                     .min(0.25);
 
                 if let (Some(w), Some(r)) = (world.as_mut(), renderer.as_mut()) {
-                    w.update(dt, r, &state.gpu.device);
+                    w.update(dt, r, &state.gpu.device, &state.gpu.queue);
                     w.record_frame(dt);
                     // Settings that live outside the world view.
                     r.min_light = w.settings.min_light();
@@ -511,13 +511,28 @@ impl ApplicationHandler for App {
                     state.gpu.window.request_redraw();
                 }
             }
-            WindowEvent::MouseInput { state: button_state, .. } => {
+            WindowEvent::MouseInput { state: button_state, button, .. } => {
+                if let Some(w) = world.as_mut() {
+                    let pressed = button_state == ElementState::Pressed;
+                    if pressed && !w.captured && !w.chat.is_open() {
+                        // The first click is what takes the mouse, not an
+                        // action in the world.
+                        set_capture(&state.gpu.window, w, true);
+                    } else if w.captured && !w.paused {
+                        w.mouse_button(button, pressed);
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(w) = world.as_mut()
-                    && button_state == ElementState::Pressed
-                    && !w.captured
-                    && !w.chat.is_open()
+                    && w.captured
+                    && !w.paused
                 {
-                    set_capture(&state.gpu.window, w, true);
+                    let steps = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                        winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
+                    };
+                    w.scroll(steps);
                 }
             }
             WindowEvent::Focused(false) => {
@@ -664,6 +679,7 @@ fn draw_into(
         server: w.session.server.clone(),
         settings: w.settings_open.then(|| w.settings.clone()),
         rebinding: w.rebinding,
+        dead: w.dead,
     });
     let mut pause_action = PauseAction::None;
     let mut output = state.egui_ctx.run_ui(raw_input, |ui| match &hud {
@@ -678,6 +694,7 @@ fn draw_into(
                 w.settings_open = false;
             }
             PauseAction::Leave => w.leaving = true,
+            PauseAction::Respawn => w.respawn(),
             PauseAction::OpenSettings => w.settings_open = true,
             PauseAction::CloseSettings => {
                 w.settings_open = false;
@@ -842,6 +859,8 @@ struct Hud {
     settings: Option<crate::settings::Settings>,
     /// The action waiting for a key press, if the player is rebinding one.
     rebinding: Option<crate::settings::Action>,
+    /// Set while the player is dead and waiting to come back.
+    dead: bool,
 }
 
 /// What the player picked on the pause menu.
@@ -851,6 +870,7 @@ enum PauseAction {
     Leave,
     OpenSettings,
     CloseSettings,
+    Respawn,
     /// Settings were changed and should be applied and saved.
     Apply(Box<crate::settings::Settings>),
     Rebind(crate::settings::Action),
@@ -869,8 +889,18 @@ fn overlay(ui: &mut egui::Ui, hud: &Hud, world: Option<&mut WorldView>) -> Pause
                 // The hotbar stays up while paused, as it does in the game: the
                 // pause menu sits over the world, it does not replace it.
                 let scale = crate::inventory::interface_scale(ui.clip_rect().size());
+                let (health, food, survival) =
+                    (world.health, world.food, !world.abilities.instant_build);
+                // Two and a bit strides to a full cycle, as the game bobs.
+                let bob = world.walked * 2.2;
                 let WorldView { inventory, art, .. } = world;
+                crate::inventory::held_item(ui, inventory, art, scale, bob);
                 crate::inventory::hotbar(ui, inventory, art, scale);
+                // Creative shows neither: nothing can hurt you and nothing
+                // makes you hungry.
+                if survival {
+                    crate::inventory::vitals(ui, art, scale, health, food);
+                }
             }
 
             let Some(lines) = &hud.debug else { return };
@@ -903,12 +933,51 @@ fn overlay(ui: &mut egui::Ui, hud: &Hud, world: Option<&mut WorldView>) -> Pause
                 chat_panel(ui, hud);
             });
 
-            if hud.paused {
+            if hud.dead {
+                action = death_screen(ui);
+            } else if hud.paused {
                 action = match &hud.settings {
                     Some(settings) => settings_menu(ui, settings, hud.rebinding),
                     None => pause_menu(ui, hud),
                 };
             }
+        });
+    action
+}
+
+/// Shown when the player has died, in place of the pause menu.
+fn death_screen(ui: &mut egui::Ui) -> PauseAction {
+    let mut action = PauseAction::None;
+    // The game tints the world red rather than dimming it.
+    ui.painter().rect_filled(
+        ui.clip_rect(),
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0x7F, 0x00, 0x00, 0xB0),
+    );
+    egui::Window::new("died")
+        .title_bar(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .frame(egui::Frame::NONE)
+        .show(ui.ctx(), |ui| {
+            ui.set_width(260.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("You died")
+                        .size(34.0)
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                );
+                ui.add_space(20.0);
+                let wide = egui::vec2(ui.available_width(), 34.0);
+                if ui.add_sized(wide, egui::Button::new("Respawn")).clicked() {
+                    action = PauseAction::Respawn;
+                }
+                ui.add_space(6.0);
+                if ui.add_sized(wide, egui::Button::new("Disconnect")).clicked() {
+                    action = PauseAction::Leave;
+                }
+            });
         });
     action
 }

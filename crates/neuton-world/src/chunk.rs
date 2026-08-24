@@ -42,6 +42,27 @@ impl Section {
     pub fn state_at(&self, x: usize, y: usize, z: usize) -> Option<StateId> {
         self.blocks.get(block_index(x, y, z)).map(StateId)
     }
+
+    /// Places a block, keeping the counts the mesher relies on honest.
+    ///
+    /// `block_count` is what decides whether a section is skipped outright, so
+    /// a section that gains its first block has to stop being empty or the
+    /// block will never be drawn.
+    pub fn set_state(&mut self, x: usize, y: usize, z: usize, state: StateId) {
+        let index = block_index(x, y, z);
+        let before = self.blocks.get(index).unwrap_or(0);
+        if before == state.0 {
+            return;
+        }
+        let was_air = StateId(before).is_air();
+        let is_air = state.is_air();
+        self.blocks.set(index, state.0);
+        match (was_air, is_air) {
+            (true, false) => self.block_count = self.block_count.saturating_add(1),
+            (false, true) => self.block_count = self.block_count.saturating_sub(1),
+            _ => {}
+        }
+    }
 }
 
 /// One heightmap, kept packed.
@@ -191,6 +212,17 @@ impl Chunk {
         }
         let section = self.sections.get(dy as usize / 16)?;
         section.state_at(x & 15, dy as usize % 16, z & 15)
+    }
+
+    /// Places a block, in coordinates relative to this column with `y` in the
+    /// world's own range.
+    pub fn set_state(&mut self, x: usize, y: i32, z: usize, state: StateId) {
+        let dy = y - self.min_y;
+        if dy < 0 {
+            return;
+        }
+        let Some(section) = self.sections.get_mut(dy as usize / 16) else { return };
+        section.set_state(x & 15, dy as usize % 16, z & 15, state);
     }
 
     /// Sections that could contribute geometry.

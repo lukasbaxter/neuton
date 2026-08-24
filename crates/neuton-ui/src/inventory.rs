@@ -235,6 +235,93 @@ pub fn hotbar(ui: &egui::Ui, inventory: &Inventory, art: &mut ItemArt, scale: f3
     }
 }
 
+/// What the player is holding, in the corner of the screen.
+///
+/// The game builds this from the item's model in a little scene of its own.
+/// This draws the same picture the inventory uses, which for a block is already
+/// that block seen from a corner, scaled up and sat where a hand would be. It
+/// bobs with the walk, because a held item that never moves reads as painted on
+/// the screen rather than carried.
+pub fn held_item(
+    ui: &egui::Ui,
+    inventory: &Inventory,
+    art: &mut ItemArt,
+    scale: f32,
+    bob: f32,
+) {
+    let Some(stack) = inventory.held() else { return };
+    if stack.is_empty() {
+        return;
+    }
+    let ctx = ui.ctx().clone();
+    let Some(id) = art.item(&ctx, stack) else { return };
+
+    let screen = ui.clip_rect();
+    let size = 56.0 * scale;
+    // Sat in from the corner, and low enough that most of it is on screen but
+    // its bottom edge is not.
+    let centre = egui::pos2(
+        screen.right() - size * 0.72 + bob.cos() * 3.0 * scale,
+        screen.bottom() - size * 0.42 + bob.sin() * 4.0 * scale,
+    );
+    let rect = egui::Rect::from_center_size(centre, egui::vec2(size, size));
+    ui.painter().image(id, rect, full_uv(), egui::Color32::WHITE);
+}
+
+/// Hearts and hunger, above the hotbar, drawn from the pack's own sprites.
+///
+/// Twenty points is ten icons, and a point is half an icon, which is why a
+/// player at nineteen health shows nine and a half hearts rather than a bar
+/// that is ninety five percent full.
+pub fn vitals(ui: &egui::Ui, art: &mut ItemArt, scale: f32, health: f32, food: i32) {
+    let screen = ui.clip_rect();
+    let ctx = ui.ctx().clone();
+    let painter = ui.painter();
+
+    let bar_w = 182.0 * scale;
+    let left = (screen.width() - bar_w) / 2.0 + screen.left();
+    let top = screen.bottom() - 22.0 * scale - 4.0 * scale - 10.0 * scale;
+    let icon = 9.0 * scale;
+
+    let mut row = |x: f32, points: f32, full: &str, half: &str, empty: &str, rightwards: bool| {
+        for i in 0..10 {
+            let slot = if rightwards { i } else { 9 - i };
+            let cell = egui::Rect::from_min_size(
+                egui::pos2(x + slot as f32 * 8.0 * scale, top),
+                egui::vec2(icon, icon),
+            );
+            let filled = points - i as f32 * 2.0;
+            let sprite = if filled >= 2.0 {
+                full
+            } else if filled >= 1.0 {
+                half
+            } else {
+                empty
+            };
+            // The empty icon goes down first, so a half icon has a socket
+            // behind it rather than a hole.
+            for name in [empty, sprite] {
+                if let Some((id, _)) = art.sprite(&ctx, name) {
+                    painter.image(id, cell, full_uv(), egui::Color32::WHITE);
+                }
+                if name == sprite {
+                    break;
+                }
+            }
+        }
+    };
+
+    row(left, health, "hud/heart/full", "hud/heart/half", "hud/heart/container", true);
+    row(
+        left + bar_w - 9.0 * 8.0 * scale - icon,
+        food as f32,
+        "hud/food_full",
+        "hud/food_half",
+        "hud/food_empty",
+        false,
+    );
+}
+
 /// One slot's contents: the picture, the count, and a durability bar.
 fn draw_slot(
     ui: &egui::Ui,

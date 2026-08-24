@@ -39,6 +39,10 @@ pub enum WorldEvent {
     Slot { window: i32, slot: i32, stack: Option<Stack> },
     /// The server picked a hotbar slot for us.
     HeldSlot(i32),
+    Health { health: f32, food: i32 },
+    /// A shove from the server: being hit, or thrown by an explosion.
+    Knockback([f64; 3]),
+    Died,
     /// Where the time went while the world arrived.
     Timing(Timing),
     Disconnected(String),
@@ -58,6 +62,18 @@ pub enum Outgoing {
     TickEnd,
     /// The hotbar slot the player selected.
     HeldSlot(i32),
+    /// The arm swing everyone else sees.
+    Swing,
+    /// Start breaking a block.
+    StartBreaking { at: [i32; 3], face: u8 },
+    /// Tell the server the swing is finished and the block should give.
+    FinishBreaking { at: [i32; 3] },
+    /// Use what is in hand against a block: placing, opening, flipping.
+    UseOn { at: [i32; 3], face: u8, cursor: [f32; 3] },
+    /// Use what is in hand with nothing in front of it.
+    Use { yaw: f32, pitch: f32 },
+    /// Ask to be put back in the world after dying.
+    Respawn,
 }
 
 /// How the world's arrival was spent, for telling network from client.
@@ -139,6 +155,18 @@ impl WorldSession {
                         Outgoing::Loaded => conn.send_loaded(),
                         Outgoing::TickEnd => conn.send_tick_end(),
                         Outgoing::HeldSlot(slot) => conn.send_held_slot(*slot),
+                        Outgoing::Swing => conn.send_swing(),
+                        Outgoing::StartBreaking { at, face } => {
+                            conn.send_player_action(0, *at, *face)
+                        }
+                        Outgoing::FinishBreaking { at } => {
+                            conn.send_player_action(2, *at, 1)
+                        }
+                        Outgoing::UseOn { at, face, cursor } => {
+                            conn.send_use_item_on(*at, *face, *cursor, false)
+                        }
+                        Outgoing::Use { yaw, pitch } => conn.send_use_item(*yaw, *pitch),
+                        Outgoing::Respawn => conn.send_respawn(),
                     };
                     if let Err(e) = result {
                         let _ = tx.send(WorldEvent::Disconnected(e.to_string()));
@@ -211,6 +239,37 @@ impl WorldSession {
                         for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
                             if world.contains_key(&(nx, nz)) {
                                 dirty.insert((nx, nz));
+                            }
+                        }
+                    }
+                    Ok(Event::Health { health, food, .. }) => {
+                        let _ = tx.send(WorldEvent::Health { health, food });
+                    }
+                    Ok(Event::Knockback(v)) => {
+                        let _ = tx.send(WorldEvent::Knockback(v));
+                    }
+                    Ok(Event::Died) => {
+                        let _ = tx.send(WorldEvent::Died);
+                    }
+                    Ok(Event::BlocksChanged(changes)) => {
+                        // A change on a column's edge changes what its
+                        // neighbour's edge faces look like too.
+                        for (at, state) in changes {
+                            let column = (at[0].div_euclid(16), at[2].div_euclid(16));
+                            let Some(chunk) = world.get_mut(&column) else { continue };
+                            Arc::make_mut(chunk).set_state(
+                                at[0].rem_euclid(16) as usize,
+                                at[1],
+                                at[2].rem_euclid(16) as usize,
+                                neuton_blocks::StateId(state),
+                            );
+                            dirty.insert(column);
+                            meshed_with.remove(&column);
+                            for (nx, nz) in neighbours_of(at, column) {
+                                if world.contains_key(&(nx, nz)) {
+                                    dirty.insert((nx, nz));
+                                    meshed_with.remove(&(nx, nz));
+                                }
                             }
                         }
                     }
@@ -336,4 +395,24 @@ fn mesh_chunk(
         south: get(0, 1),
     };
     neuton_render::build_full(chunk, neighbours, appearance, textures, biomes, 1.0)
+}
+
+/// The columns a change at `at` also affects: only the ones it touches the edge
+/// of, since an interior block cannot change a neighbour's outward faces.
+fn neighbours_of(at: [i32; 3], column: (i32, i32)) -> Vec<(i32, i32)> {
+    let mut out = Vec::new();
+    let (x, z) = (at[0].rem_euclid(16), at[2].rem_euclid(16));
+    if x == 0 {
+        out.push((column.0 - 1, column.1));
+    }
+    if x == 15 {
+        out.push((column.0 + 1, column.1));
+    }
+    if z == 0 {
+        out.push((column.0, column.1 - 1));
+    }
+    if z == 15 {
+        out.push((column.0, column.1 + 1));
+    }
+    out
 }

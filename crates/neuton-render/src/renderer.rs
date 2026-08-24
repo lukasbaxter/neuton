@@ -52,6 +52,10 @@ pub struct WorldRenderer {
     pub fog_scale: f32,
     /// The lowest light any surface is drawn at. One is fullbright.
     pub min_light: f32,
+    outline_pipeline: wgpu::RenderPipeline,
+    outline_buffer: wgpu::Buffer,
+    /// Line ends in the outline buffer this frame.
+    outline_vertices: u32,
 }
 
 impl WorldRenderer {
@@ -207,6 +211,68 @@ impl WorldRenderer {
             cache: None,
         });
 
+        // The selection box: lines, blended, and not written to depth, so it
+        // never hides anything behind it.
+        let outline_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("outline"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("outline.wgsl").into()),
+        });
+        let outline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("outline"),
+            bind_group_layouts: &[Some(&globals_layout)],
+            immediate_size: 0,
+        });
+        let outline_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("outline"),
+            layout: Some(&outline_layout),
+            vertex: wgpu::VertexState {
+                module: &outline_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: 12,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                })],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                // No depth bias: it is only defined for triangles. An edge
+                // flush with a block face is kept out of the depth fight by
+                // nudging the box outwards instead, in `set_outline`.
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &outline_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::COLOR,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        // Room for a handful of boxes: a block's outline is rarely more than
+        // two or three, and a fence is the worst case.
+        const OUTLINE_CAPACITY: u64 = 24 * 12 * 16;
+        let outline_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("outline"),
+            size: OUTLINE_CAPACITY,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Same geometry and same shader, but blended and without depth writes,
         // so two translucent surfaces do not hide each other depending on which
         // chunk happened to be drawn first.
@@ -264,6 +330,9 @@ impl WorldRenderer {
             translucent_pipeline,
             globals_buffer,
             globals_bind_group,
+            outline_pipeline,
+            outline_buffer,
+            outline_vertices: 0,
             atlas_bind_group,
             depth: create_depth(device, width, height),
             depth_size: (width, height),
@@ -336,6 +405,43 @@ impl WorldRenderer {
                 max,
             },
         );
+    }
+
+    /// Sets the box or boxes drawn around the block being pointed at.
+    ///
+    /// Each is a world-space minimum and maximum. An empty list draws nothing,
+    /// which is what pointing at the sky means.
+    pub fn set_outline(&mut self, queue: &wgpu::Queue, boxes: &[([f32; 3], [f32; 3])]) {
+        let mut lines: Vec<f32> = Vec::with_capacity(boxes.len() * 24 * 3);
+        for (min, max) in boxes {
+            // Nudged outwards so the wireframe sits just off the surface rather
+            // than inside it.
+            const OUT: f32 = 0.0035;
+            let a = [min[0] - OUT, min[1] - OUT, min[2] - OUT];
+            let b = [max[0] + OUT, max[1] + OUT, max[2] + OUT];
+            let corner = |i: usize| {
+                [
+                    if i & 1 == 0 { a[0] } else { b[0] },
+                    if i & 2 == 0 { a[1] } else { b[1] },
+                    if i & 4 == 0 { a[2] } else { b[2] },
+                ]
+            };
+            // The twelve edges of a box, as pairs of corner indices.
+            const EDGES: [(usize, usize); 12] = [
+                (0, 1), (2, 3), (4, 5), (6, 7),
+                (0, 2), (1, 3), (4, 6), (5, 7),
+                (0, 4), (1, 5), (2, 6), (3, 7),
+            ];
+            for (from, to) in EDGES {
+                lines.extend_from_slice(&corner(from));
+                lines.extend_from_slice(&corner(to));
+            }
+        }
+        let bytes = bytemuck::cast_slice(&lines);
+        let capacity = self.outline_buffer.size() as usize;
+        let bytes = &bytes[..bytes.len().min(capacity)];
+        queue.write_buffer(&self.outline_buffer, 0, bytes);
+        self.outline_vertices = (bytes.len() / 12) as u32;
     }
 
     pub fn forget(&mut self, x: i32, z: i32) {
@@ -466,6 +572,15 @@ impl WorldRenderer {
             pass.set_vertex_buffer(0, chunk.vertices.slice(..));
             pass.set_index_buffer(chunk.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..chunk.index_count, 0, 0..1);
+        }
+
+        // The selection box, before the translucent pass so glass and water
+        // still read as being in front of it.
+        if self.outline_vertices > 0 {
+            pass.set_pipeline(&self.outline_pipeline);
+            pass.set_bind_group(0, &self.globals_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.outline_buffer.slice(..));
+            pass.draw(0..self.outline_vertices, 0..1);
         }
 
         // Second: water and glass, over everything solid, so what is behind

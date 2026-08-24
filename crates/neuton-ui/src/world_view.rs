@@ -41,6 +41,22 @@ pub struct WorldView {
     /// Where the body was at the previous tick, for interpolating the camera
     /// between them.
     previous: [f64; 3],
+    /// How far the player has walked, for bobbing what they are holding.
+    pub walked: f32,
+    /// Health and hunger, as the server reports them.
+    pub health: f32,
+    pub food: i32,
+    /// Set when the player has died and has not yet asked to come back.
+    pub dead: bool,
+    /// The block under the crosshair, if any is in reach.
+    pub target: Option<neuton_world::raycast::Hit>,
+    /// The block being broken, and when the swing at it started.
+    mining: Option<([i32; 3], Instant)>,
+    /// Whether the use button is held, for placing a run of blocks.
+    using: bool,
+    /// When the last placement went out, so holding the button does not send
+    /// one a frame.
+    last_use: Option<Instant>,
     /// What the player is carrying, and which slot is in hand.
     pub inventory: crate::inventory::Inventory,
     /// Item pictures and interface sprites, rendered as they are first needed.
@@ -97,6 +113,14 @@ impl WorldView {
             shapes,
             accumulator: 0.0,
             previous: [0.0; 3],
+            walked: 0.0,
+            health: 20.0,
+            food: 20,
+            dead: false,
+            target: None,
+            mining: None,
+            using: false,
+            last_use: None,
             inventory: crate::inventory::Inventory::default(),
             art: crate::inventory::ItemArt::new(),
             pending: std::collections::VecDeque::new(),
@@ -137,6 +161,13 @@ impl WorldView {
                 KeyCode::ArrowUp => self.chat.history_back(),
                 KeyCode::ArrowDown => self.chat.history_forward(),
                 _ => {}
+            }
+            return false;
+        }
+
+        if self.dead {
+            if pressed && matches!(code, KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space) {
+                self.respawn();
             }
             return false;
         }
@@ -250,7 +281,13 @@ impl WorldView {
     }
 
     /// Advances the player and the world for a frame of `dt` seconds.
-    pub fn update(&mut self, dt: f32, renderer: &mut WorldRenderer, device: &wgpu::Device) {
+    pub fn update(
+        &mut self,
+        dt: f32,
+        renderer: &mut WorldRenderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
         // A paused world holds still, and holding a key while pausing must not
         // leave the player walking into a wall.
         if self.paused {
@@ -260,6 +297,27 @@ impl WorldView {
         // teleport does not spend a tick being walked away from.
         self.pump_events(renderer, device);
         self.tick_physics(dt);
+        self.aim();
+        self.show_target(renderer, queue);
+
+        // Holding the use button lays a run of blocks, at the rate the game
+        // uses rather than one a frame.
+        const USE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+        if self.using
+            && !self.paused
+            && self.last_use.is_none_or(|t| t.elapsed() >= USE_INTERVAL)
+        {
+            self.use_item();
+        }
+        // Holding the break button on a block keeps the swing going, and the
+        // server decides when it gives.
+        if let Some((at, since)) = self.mining
+            && since.elapsed() >= std::time::Duration::from_millis(200)
+        {
+            self.session.send(Outgoing::FinishBreaking { at });
+            self.mining = Some((at, Instant::now()));
+            self.session.send(Outgoing::Swing);
+        }
     }
 
     /// How many chunk meshes go to the GPU in one frame.
@@ -384,6 +442,39 @@ impl WorldView {
                         self.inventory.selected = slot;
                     }
                 }
+                WorldEvent::Health { health, food } => {
+                    self.health = health;
+                    self.food = food;
+                    // Death is a health of zero, not a packet. A player who
+                    // joins already dead is never sent the death message again,
+                    // and a client that waits for one waits forever: the server
+                    // holds a dead player out of the world entirely, ignoring
+                    // their movement and sending them no chunks, until it is
+                    // asked to bring them back.
+                    if health <= 0.0 && !self.dead {
+                        self.dead = true;
+                        self.held.clear();
+                        self.chat.note("You died");
+                        // A client driving itself has nobody to press the
+                        // button for it.
+                        if std::env::var_os("NEUTON_AUTOWALK").is_some() {
+                            self.respawn();
+                        }
+                    }
+                }
+                WorldEvent::Knockback(velocity) => {
+                    // Blocks per tick, the same units the body carries, so a
+                    // shove simply replaces what the player was doing.
+                    self.body.velocity = velocity;
+                    self.body.on_ground = false;
+                }
+                WorldEvent::Died => {
+                    if !self.dead {
+                        self.dead = true;
+                        self.held.clear();
+                        self.chat.note("You died");
+                    }
+                }
                 WorldEvent::Disconnected(why) => {
                     self.chat.note(format!("Disconnected: {why}"));
                 }
@@ -410,6 +501,9 @@ impl WorldView {
         let auto = std::env::var_os("NEUTON_AUTOWALK").is_some();
         if auto {
             self.camera.yaw = (self.camera.yaw + 60.0 * dt).rem_euclid(360.0);
+            // Looking down a little, so what is under the crosshair is ground
+            // within reach rather than the horizon.
+            self.camera.pitch = 40.0;
         }
         let axis = |pos: Action, neg: Action| {
             (self.acting(pos) as i32 - self.acting(neg) as i32) as f32
@@ -451,6 +545,11 @@ impl WorldView {
                 let world = ChunkWorld { chunks: &self.blocks };
                 physics::step(&mut self.body, input, &world, self.shapes.as_ref());
             }
+            let step = [
+                self.body.position[0] - self.previous[0],
+                self.body.position[2] - self.previous[2],
+            ];
+            self.walked += (step[0] * step[0] + step[1] * step[1]).sqrt() as f32;
             self.report_position();
         }
 
@@ -519,6 +618,175 @@ impl WorldView {
 
         // Every tick ends, whatever happened in it.
         self.session.send(Outgoing::TickEnd);
+    }
+
+    /// Asks the server to put the player back in the world.
+    pub fn respawn(&mut self) {
+        if !self.dead {
+            return;
+        }
+        self.dead = false;
+        self.session.send(Outgoing::Respawn);
+    }
+
+    /// Left breaks, right places. The world has to be in reach for either.
+    pub fn mouse_button(&mut self, button: winit::event::MouseButton, pressed: bool) {
+        use winit::event::MouseButton;
+        if self.dead {
+            return;
+        }
+        match button {
+            MouseButton::Left => {
+                if pressed {
+                    self.begin_breaking();
+                } else {
+                    self.stop_breaking();
+                }
+            }
+            MouseButton::Right => {
+                self.using = pressed;
+                if pressed {
+                    self.last_use = None;
+                    self.use_item();
+                }
+            }
+            MouseButton::Middle if pressed => self.pick_block(),
+            _ => {}
+        }
+    }
+
+    /// Starts breaking whatever is under the crosshair.
+    fn begin_breaking(&mut self) {
+        let Some(hit) = self.target else {
+            // Swinging at nothing is still a swing, and everyone else sees it.
+            self.session.send(Outgoing::Swing);
+            return;
+        };
+        self.session.send(Outgoing::Swing);
+        self.session.send(Outgoing::StartBreaking { at: hit.block, face: hit.face });
+        // In creative the server breaks it on the first packet; in survival it
+        // wants to be told when the swing finished.
+        if self.abilities.instant_build {
+            self.mining = None;
+        } else {
+            self.mining = Some((hit.block, Instant::now()));
+        }
+    }
+
+    fn stop_breaking(&mut self) {
+        if let Some((at, _)) = self.mining.take() {
+            self.session.send(Outgoing::FinishBreaking { at });
+        }
+    }
+
+    /// Uses what is in hand: placing a block, or using the item on its own.
+    fn use_item(&mut self) {
+        self.last_use = Some(Instant::now());
+        match self.target {
+            Some(hit) => {
+                self.session.send(Outgoing::UseOn {
+                    at: hit.block,
+                    face: hit.face,
+                    cursor: hit.cursor,
+                });
+                self.session.send(Outgoing::Swing);
+            }
+            None => {
+                let (yaw, pitch) = (self.camera.yaw, self.camera.pitch);
+                self.session.send(Outgoing::Use { yaw, pitch });
+            }
+        }
+    }
+
+    /// Puts the block being looked at into the hand, where the player has one.
+    fn pick_block(&mut self) {
+        let Some(hit) = self.target else { return };
+        let Some(chunk) = self.blocks.get(&(hit.block[0].div_euclid(16), hit.block[2].div_euclid(16)))
+        else {
+            return;
+        };
+        let state = chunk
+            .state_at(hit.block[0].rem_euclid(16) as usize, hit.block[1], hit.block[2].rem_euclid(16) as usize)
+            .unwrap_or(neuton_blocks::StateId(0));
+        let name = neuton_blocks::BLOCKS[neuton_blocks::STATE_TO_BLOCK[state.0 as usize] as usize].name;
+        // Only if it is already somewhere on the hotbar: asking the server for
+        // an item is a creative-mode packet this client does not send yet.
+        for slot in 0..crate::inventory::HOTBAR.len() {
+            if self
+                .inventory
+                .slot(crate::inventory::HOTBAR.start + slot)
+                .is_some_and(|stack| stack.name == name)
+            {
+                self.select_slot(slot);
+                return;
+            }
+        }
+    }
+
+    /// Draws the box around whatever is being pointed at.
+    fn show_target(&self, renderer: &mut WorldRenderer, queue: &wgpu::Queue) {
+        let mut boxes: Vec<([f32; 3], [f32; 3])> = Vec::new();
+        if let Some(hit) = self.target {
+            let column = (hit.block[0].div_euclid(16), hit.block[2].div_euclid(16));
+            if let Some(chunk) = self.blocks.get(&column) {
+                let state = chunk
+                    .state_at(
+                        hit.block[0].rem_euclid(16) as usize,
+                        hit.block[1],
+                        hit.block[2].rem_euclid(16) as usize,
+                    )
+                    .unwrap_or(neuton_blocks::StateId(0));
+                let base = [hit.block[0] as f32, hit.block[1] as f32, hit.block[2] as f32];
+                for shape in neuton_world::physics::BlockShapes::collision(
+                    self.shapes.as_ref(),
+                    state,
+                ) {
+                    boxes.push((
+                        [
+                            base[0] + shape.min[0] as f32,
+                            base[1] + shape.min[1] as f32,
+                            base[2] + shape.min[2] as f32,
+                        ],
+                        [
+                            base[0] + shape.max[0] as f32,
+                            base[1] + shape.max[1] as f32,
+                            base[2] + shape.max[2] as f32,
+                        ],
+                    ));
+                }
+            }
+        }
+        renderer.set_outline(queue, &boxes);
+    }
+
+    /// Works out what the player is pointing at.
+    fn aim(&mut self) {
+        if !self.placed {
+            self.target = None;
+            return;
+        }
+        let eye = [
+            self.body.position[0],
+            self.body.position[1] + neuton_world::physics::EYE_HEIGHT,
+            self.body.position[2],
+        ];
+        let (yaw, pitch) = (
+            (self.camera.yaw as f64).to_radians(),
+            (self.camera.pitch as f64).to_radians(),
+        );
+        let (sin_yaw, cos_yaw) = yaw.sin_cos();
+        let (sin_pitch, cos_pitch) = pitch.sin_cos();
+        // The camera looks along negative pitch upwards, matching the game.
+        let direction = [-sin_yaw * cos_pitch, -sin_pitch, cos_yaw * cos_pitch];
+
+        let world = ChunkWorld { chunks: &self.blocks };
+        self.target = neuton_world::raycast::cast(
+            eye,
+            direction,
+            neuton_world::raycast::REACH,
+            &world,
+            self.shapes.as_ref(),
+        );
     }
 
     /// Picks a hotbar slot and tells the server, which otherwise keeps handing

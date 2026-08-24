@@ -6,6 +6,7 @@
 pub mod chunk;
 pub mod palette;
 pub mod physics;
+pub mod raycast;
 
 pub use chunk::{BlockEntity, Chunk, Heightmap, Section, SectionScratch};
 pub use physics::{Aabb, Body, BlockShapes, BlockView, Input};
