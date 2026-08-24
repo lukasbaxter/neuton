@@ -18,6 +18,8 @@ pub enum Error {
     BadEnum { got: i32 },
     /// A packet ID we have no decoder for, in the given state.
     UnknownPacket { state: &'static str, id: i32 },
+    /// Key exchange or cipher setup failed.
+    Crypto(String),
 }
 
 impl fmt::Display for Error {
@@ -33,6 +35,7 @@ impl fmt::Display for Error {
             Error::UnknownPacket { state, id } => {
                 write!(f, "unknown packet id {id:#04x} in state {state}")
             }
+            Error::Crypto(msg) => write!(f, "encryption failed: {msg}"),
         }
     }
 }
