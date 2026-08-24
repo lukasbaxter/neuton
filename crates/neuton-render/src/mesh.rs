@@ -512,7 +512,7 @@ fn push_element(
         let alpha = look.alpha(state);
         let tint = biomes.get(biome, face.tint);
         let start = mesh.vertices.len() as u32;
-        for (i, (corner, uv)) in dir.corners(from, to).iter().zip(face.uv.corners()).enumerate() {
+        for (i, (corner, uv)) in dir.corners(from, to).iter().zip(face.uv).enumerate() {
             mesh.vertices.push(Vertex {
                 position: *corner,
                 uv,

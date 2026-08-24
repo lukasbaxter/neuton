@@ -70,7 +70,8 @@ impl WorldSession {
                     return;
                 }
             };
-            let appearance = Appearance::new();
+            // Occlusion comes from the baked geometry rather than from block names.
+            let appearance = Appearance::from_models(&textures);
             // Biome colours are only known once the server has sent its
             // registries, which it does before the first chunk.
             let biome_tints = BiomeTints::build(&conn.registries().biomes, &tints);
