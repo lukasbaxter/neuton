@@ -211,14 +211,36 @@ pub trait BlockAppearance {
     }
 }
 
-/// Builds the mesh for one chunk column.
+/// The four columns around a chunk, where they are loaded.
+///
+/// Without them a chunk cannot tell whether a block at its edge is against open
+/// air or against its neighbour's stone. Guessing either way is visibly wrong:
+/// assume air and every column draws its full depth at all four borders, assume
+/// solid and a cliff at a chunk boundary has a hole in it.
+#[derive(Default, Clone, Copy)]
+pub struct Neighbours<'a> {
+    pub west: Option<&'a Chunk>,
+    pub east: Option<&'a Chunk>,
+    pub north: Option<&'a Chunk>,
+    pub south: Option<&'a Chunk>,
+}
+
+impl Neighbours<'_> {
+    /// How many of the four are present.
+    pub fn count(&self) -> usize {
+        [self.west, self.east, self.north, self.south].iter().filter(|n| n.is_some()).count()
+    }
+}
+
+/// Builds the mesh for one chunk column, with no neighbours loaded.
 pub fn build(chunk: &Chunk, look: &dyn BlockAppearance, textures: &BlockTextures) -> Mesh {
-    build_at(chunk, look, textures, 1.0)
+    build_at(chunk, Neighbours::default(), look, textures, 1.0)
 }
 
 /// Builds a chunk's mesh at a given daylight level, 0 for night and 1 for noon.
 pub fn build_at(
     chunk: &Chunk,
+    neighbours: Neighbours<'_>,
     look: &dyn BlockAppearance,
     textures: &BlockTextures,
     daylight: f32,
@@ -256,6 +278,28 @@ pub fn build_at(
             + block_index(x as usize, y as usize % 16, z as usize)]
     };
 
+    /// Which neighbouring column a position falls into, and where in it.
+    fn across<'a>(
+        n: &Neighbours<'a>,
+        x: i32,
+        z: i32,
+    ) -> Option<(&'a Chunk, usize, usize)> {
+        // Only one step out is ever asked for, so a diagonal is not a case.
+        if x < 0 {
+            return n.west.map(|c| (c, 15usize, z as usize));
+        }
+        if x > 15 {
+            return n.east.map(|c| (c, 0usize, z as usize));
+        }
+        if z < 0 {
+            return n.north.map(|c| (c, x as usize, 15usize));
+        }
+        if z > 15 {
+            return n.south.map(|c| (c, x as usize, 0usize));
+        }
+        None
+    }
+
     /// What sits across a face when it is not in this column.
     ///
     /// Sideways, the neighbouring chunk does, and its own mesh will draw
@@ -277,7 +321,20 @@ pub fn build_at(
         if inside(x, y, z) {
             return look.hides_face(own, StateId(at(x, y, z)));
         }
-        outside(y) == Outside::Hidden
+        if !(0..height).contains(&y) {
+            return outside(y) == Outside::Hidden;
+        }
+        match across(&neighbours, x, z) {
+            // The real block next door.
+            Some((chunk, nx, nz)) => {
+                let state = chunk.state_at(nx, y + chunk.min_y, nz).unwrap_or(StateId(0));
+                look.hides_face(own, state)
+            }
+            // Not loaded yet. Hiding is the better guess: the neighbour will
+            // arrive and draw whatever belongs there, and until it does a
+            // missing face is less obvious than a wall.
+            None => true,
+        }
     };
 
     for y in 0..height {
@@ -708,6 +765,52 @@ mod tests {
 
         let mesh = build(&chunk(1, stone(), |_| true), &Solid, &t);
         assert!(mesh.vertices.iter().all(|v| v.tint[..3] == [1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn a_loaded_neighbour_decides_the_border() {
+        let Some(t) = textures() else { return };
+        let s = stone();
+        let solid = chunk(1, s, |_| true);
+        let empty = chunk(1, s, |_| false);
+
+        // Against open air next door, the whole west face is drawn.
+        let exposed = build_at(
+            &solid,
+            Neighbours { west: Some(&empty), ..Default::default() },
+            &Solid,
+            &t,
+            1.0,
+        );
+        // Against more stone, it is not.
+        let buried = build_at(
+            &solid,
+            Neighbours { west: Some(&solid), ..Default::default() },
+            &Solid,
+            &t,
+            1.0,
+        );
+        assert_eq!(
+            exposed.triangles() - buried.triangles(),
+            16 * 16 * 2,
+            "one face of the column should appear"
+        );
+    }
+
+    #[test]
+    fn an_unloaded_neighbour_hides_rather_than_walls() {
+        let Some(t) = textures() else { return };
+        let s = stone();
+        let solid = chunk(1, s, |_| true);
+        let alone = build(&solid, &Solid, &t);
+        let with_air = build_at(
+            &solid,
+            Neighbours { west: Some(&chunk(1, s, |_| false)), ..Default::default() },
+            &Solid,
+            &t,
+            1.0,
+        );
+        assert!(alone.triangles() < with_air.triangles());
     }
 
     #[test]

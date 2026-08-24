@@ -346,6 +346,18 @@ impl WorldRenderer {
         self.chunks.len()
     }
 
+    /// Triangles currently held, across every loaded chunk.
+    ///
+    /// Counted from the buffers rather than accumulated as chunks arrive: a
+    /// chunk is re-meshed whenever a neighbour loads, and a running total would
+    /// count it again every time.
+    pub fn triangles(&self) -> usize {
+        self.chunks
+            .values()
+            .map(|c| (c.index_count + c.translucent_count) as usize / 3)
+            .sum()
+    }
+
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         if (width, height) != self.depth_size && width > 0 && height > 0 {
             self.depth = create_depth(device, width, height);

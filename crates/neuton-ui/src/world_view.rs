@@ -137,7 +137,7 @@ impl WorldView {
             format!("Facing: {} ({:.1} / {:.1})", self.facing(), self.camera.yaw, self.camera.pitch),
             String::new(),
             format!("Chunks: {} drawn / {} loaded", renderer.drawn.get(), renderer.chunk_count()),
-            format!("Triangles: {:.2}M", self.session.triangles as f64 / 1.0e6),
+            format!("Triangles: {:.2}M", renderer.triangles() as f64 / 1.0e6),
             format!("Server: {}", self.session.server),
             format!("Status: {}", self.session.status),
         ]

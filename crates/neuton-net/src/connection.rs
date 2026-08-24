@@ -481,6 +481,14 @@ impl Connection {
         self.framed.is_encrypted()
     }
 
+    /// Whether a packet is already waiting to be read.
+    ///
+    /// Lets a caller finish draining a burst before doing work that only makes
+    /// sense once the burst is over.
+    pub fn has_pending(&mut self) -> bool {
+        self.framed.has_pending()
+    }
+
     pub fn compression(&self) -> Option<i32> {
         self.framed.compression()
     }
