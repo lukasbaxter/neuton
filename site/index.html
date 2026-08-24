@@ -192,13 +192,15 @@ play.notmiji.com:25565
 
 <section><div class="w">
   <h2>Layout</h2>
-  <p class="lede">5,393 lines written, 5,399 generated, 60 tests.</p>
+  <p class="lede">Ten crates, no engine, no framework.</p>
   <div class="tw"><table>
     <tr><th>crate</th><th></th></tr>
     <tr><td>neuton-protocol</td><td>wire types, framing, zlib, AES-128-CFB8</td></tr>
     <tr><td>neuton-nbt</td><td>network NBT, modified UTF-8, allocation-free skipper</td></tr>
     <tr><td>neuton-blocks</td><td>generated block and state tables</td></tr>
-    <tr><td>neuton-world</td><td>paletted containers, chunk decoding</td></tr>
+    <tr><td>neuton-world</td><td>paletted containers, chunk decoding, light</td></tr>
+    <tr><td>neuton-assets</td><td>resource packs, blockstates, models, atlas</td></tr>
+    <tr><td>neuton-render</td><td>meshing, camera, wgpu pipeline</td></tr>
     <tr><td>neuton-net</td><td>login, configuration and play state machine</td></tr>
     <tr><td>neuton-auth</td><td>Microsoft, Xbox Live, XSTS, Minecraft services</td></tr>
     <tr><td>neuton-datagen</td><td>vanilla jar to Rust source</td></tr>
@@ -246,6 +248,7 @@ opening the launcher</pre>
 
 <section id="status"><div class="w">
   <h2>Status</h2>
+  <p class="lede">It renders. You can fly around a server and look at it. You cannot yet interact with anything.</p>
   <div class="cols">
     <div>
       <h3>works</h3>
@@ -255,7 +258,9 @@ opening the launcher</pre>
         <li>Joining real servers, staying joined</li>
         <li>Chunk and palette decoding</li>
         <li>Tables generated from the vanilla jar</li>
-        <li>Launcher window on wgpu, account management</li>
+        <li>Launcher window on wgpu, accounts and a server list</li>
+        <li>Renderer: real block shapes, biome tinting, smooth lighting</li>
+        <li>Resource packs, layered over the vanilla jar</li>
       </ul>
     </div>
     <div>
