@@ -1,6 +1,6 @@
 //! The world pipeline: one shader, one atlas, one draw call per chunk.
 
-use crate::camera::{Camera, Mat4};
+use crate::camera::{Camera, Frustum, Mat4};
 use crate::mesh::{Mesh, Vertex};
 use crate::textures::BlockTextures;
 use std::collections::HashMap;
@@ -20,8 +20,11 @@ struct ChunkBuffers {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
-    /// Column origin in world space, added in when the mesh is built.
-    _origin: [i32; 2],
+    /// World-space bounds, for frustum culling. Taken from the geometry rather
+    /// than assumed, so a column holding one layer of bedrock does not claim to
+    /// be 384 blocks tall.
+    min: [f32; 3],
+    max: [f32; 3],
 }
 
 /// Draws the world.
@@ -36,6 +39,8 @@ pub struct WorldRenderer {
     /// or the render pass is rejected.
     format: wgpu::TextureFormat,
     chunks: HashMap<(i32, i32), ChunkBuffers>,
+    /// Chunks drawn on the last frame, against chunks held.
+    pub drawn: std::cell::Cell<usize>,
     pub sky_color: [f32; 4],
     pub fog_start: f32,
     pub fog_end: f32,
@@ -203,6 +208,7 @@ impl WorldRenderer {
             depth_size: (width, height),
             format,
             chunks: HashMap::new(),
+            drawn: std::cell::Cell::new(0),
             sky_color: [0.62, 0.74, 0.94, 1.0],
             fog_start: 120.0,
             fog_end: 380.0,
@@ -223,9 +229,15 @@ impl WorldRenderer {
         // group change on every draw.
         let mut vertices = mesh.vertices.clone();
         let (ox, oz) = ((x * 16) as f32, (z * 16) as f32);
+        let mut min = [f32::MAX; 3];
+        let mut max = [f32::MIN; 3];
         for v in &mut vertices {
             v.position[0] += ox;
             v.position[2] += oz;
+            for axis in 0..3 {
+                min[axis] = min[axis].min(v.position[axis]);
+                max[axis] = max[axis].max(v.position[axis]);
+            }
         }
 
         let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -244,7 +256,8 @@ impl WorldRenderer {
                 vertices,
                 indices,
                 index_count: mesh.indices.len() as u32,
-                _origin: [x, z],
+                min,
+                max,
             },
         );
     }
@@ -316,11 +329,22 @@ impl WorldRenderer {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.globals_bind_group, &[]);
         pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+
+        // Most of the world is behind the camera at any moment, and a chunk
+        // that fails this test costs a plane comparison instead of a draw call
+        // and a few thousand triangles.
+        let frustum = Frustum::from_matrix(camera.view_projection());
+        let mut drawn = 0;
         for chunk in self.chunks.values() {
+            if !frustum.intersects(chunk.min, chunk.max) {
+                continue;
+            }
+            drawn += 1;
             pass.set_vertex_buffer(0, chunk.vertices.slice(..));
             pass.set_index_buffer(chunk.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..chunk.index_count, 0, 0..1);
         }
+        self.drawn.set(drawn);
     }
 }
 
