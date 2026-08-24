@@ -797,6 +797,14 @@ impl Launcher {
             )
     }
 
+    /// True if the user asked to dismiss whatever is open, by Escape.
+    ///
+    /// Every modal honours it. A dialog you cannot get out of without finding
+    /// the right button is the kind of thing that makes an app feel broken.
+    fn dismissed(ctx: &egui::Context) -> bool {
+        ctx.input(|i| i.key_pressed(egui::Key::Escape))
+    }
+
     fn edit_server_modal(&mut self, ctx: &egui::Context) {
         let Modal::EditServer { id, mut name, mut address, mut error } =
             std::mem::replace(&mut self.modal, Modal::None)
@@ -804,10 +812,13 @@ impl Launcher {
             return;
         };
         let editing = id.is_some();
-        let mut keep_open = true;
+        let mut keep_open = !Self::dismissed(ctx);
         let mut commit = false;
+        let mut open = true;
 
-        Self::window(if editing { "Edit server" } else { "Add server" }).show(ctx, |ui| {
+        Self::window(if editing { "Edit server" } else { "Add server" })
+            .open(&mut open)
+            .show(ctx, |ui| {
             ui.set_width(360.0);
             ui.label(RichText::new("Name").color(MID).size(12.5));
             ui.add(
@@ -876,7 +887,7 @@ impl Launcher {
             }
         }
 
-        if keep_open {
+        if keep_open && open {
             self.modal = Modal::EditServer { id, name, address, error };
         }
     }
@@ -887,8 +898,9 @@ impl Launcher {
         else {
             return;
         };
-        let mut keep = true;
-        Self::window("Remove server").show(ctx, |ui| {
+        let mut keep = !Self::dismissed(ctx);
+        let mut open = true;
+        Self::window("Remove server").open(&mut open).show(ctx, |ui| {
             ui.set_width(320.0);
             ui.label(RichText::new(format!("Remove {name} from the list?")).color(MID).size(13.5));
             ui.add_space(14.0);
@@ -907,17 +919,23 @@ impl Launcher {
                 }
             });
         });
-        if keep {
+        if keep && open {
             self.modal = Modal::ConfirmRemoveServer { id, name };
         }
     }
 
     fn accounts_modal(&mut self, ctx: &egui::Context) {
-        let mut keep = true;
+        // Taken out first. Leaving it set and only re-setting it on the
+        // keep-open path meant Close had nothing to clear, so the dialog could
+        // never be dismissed.
+        self.modal = Modal::None;
+
+        let mut keep = !Self::dismissed(ctx);
         let mut switch_to: Option<String> = None;
         let mut remove: Option<(u128, String)> = None;
+        let mut open = true;
 
-        Self::window("Accounts").show(ctx, |ui| {
+        Self::window("Accounts").open(&mut open).show(ctx, |ui| {
             ui.set_width(420.0);
             if self.accounts.is_empty() {
                 ui.label(RichText::new("No accounts signed in.").color(MID).size(14.0));
@@ -979,7 +997,7 @@ impl Launcher {
             self.modal = Modal::ConfirmRemoveAccount { uuid, name };
             return;
         }
-        if keep {
+        if keep && open {
             self.modal = Modal::Accounts;
         }
     }
@@ -990,8 +1008,9 @@ impl Launcher {
         else {
             return;
         };
-        let mut decided = false;
-        Self::window("Sign out").show(ctx, |ui| {
+        let mut decided = Self::dismissed(ctx);
+        let mut open = true;
+        Self::window("Sign out").open(&mut open).show(ctx, |ui| {
             ui.set_width(320.0);
             ui.label(
                 RichText::new(format!("Sign {name} out of this computer?")).color(MID).size(13.5),
@@ -1008,7 +1027,9 @@ impl Launcher {
                 }
             });
         });
-        if decided {
+        if decided || !open {
+            // Cancelling a sign-out goes back to the account list rather than
+            // closing everything, since that is where the user came from.
             self.modal = Modal::Accounts;
         } else {
             self.modal = Modal::ConfirmRemoveAccount { uuid, name };
