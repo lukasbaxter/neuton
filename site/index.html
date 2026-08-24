@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>neuton — a Minecraft client built from nothing</title>
+<meta name="description" content="A from-scratch Minecraft: Java Edition client for 26.2. Written in Rust. Instant boot, high frame rates, shader pack support. Multiplayer only.">
+<meta property="og:title" content="neuton — a Minecraft client built from nothing">
+<meta property="og:description" content="A from-scratch Minecraft: Java Edition client for 26.2, written in Rust. Instant boot, high frame rates, shader pack support.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://neuton.baxtergroup.io">
+<meta name="theme-color" content="#07090c">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<style>
+:root{
+  --bg:#07090c;
+  --bg-raise:#0d1117;
+  --card:#0f1520;
+  --line:#1c2634;
+  --line-bright:#2b3a4f;
+  --text:#e8edf5;
+  --muted:#8b9bb0;
+  --dim:#5c6b80;
+  --accent:#4de6c4;
+  --accent-2:#3b9dff;
+  --accent-glow:rgba(77,230,196,.16);
+  --warn:#ffb454;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  background:var(--bg);color:var(--text);font-family:var(--sans);
+  line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden;
+}
+a{color:inherit}
+.wrap{max-width:1120px;margin:0 auto;padding:0 24px}
+
+/* ---------- nav ---------- */
+nav{
+  position:sticky;top:0;z-index:50;
+  background:rgba(7,9,12,.72);backdrop-filter:blur(14px);
+  border-bottom:1px solid var(--line);
+}
+nav .wrap{display:flex;align-items:center;justify-content:space-between;height:64px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:-.02em;font-size:18px;text-decoration:none}
+.brand .dot{
+  width:9px;height:9px;border-radius:50%;background:var(--accent);
+  box-shadow:0 0 12px var(--accent);
+}
+.navlinks{display:flex;gap:28px;align-items:center}
+.navlinks a{color:var(--muted);text-decoration:none;font-size:14px;font-weight:500;transition:color .15s}
+.navlinks a:hover{color:var(--text)}
+@media(max-width:720px){.navlinks a:not(.nav-cta){display:none}}
+.nav-cta{
+  border:1px solid var(--line-bright);border-radius:8px;padding:7px 14px;
+  color:var(--text)!important;
+}
+.nav-cta:hover{border-color:var(--accent);color:var(--accent)!important}
+
+/* ---------- hero ---------- */
+header{position:relative;padding:120px 0 96px;text-align:center;overflow:hidden}
+header::before{
+  content:"";position:absolute;inset:-40% 0 auto 50%;transform:translateX(-50%);
+  width:min(1100px,150vw);aspect-ratio:1;pointer-events:none;
+  background:radial-gradient(circle,var(--accent-glow) 0%,transparent 62%);
+}
+header::after{
+  content:"";position:absolute;left:0;right:0;bottom:0;height:1px;
+  background:linear-gradient(90deg,transparent,var(--line-bright),transparent);
+}
+header .wrap{position:relative}
+.eyebrow{
+  display:inline-flex;align-items:center;gap:9px;
+  font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--accent);border:1px solid var(--line-bright);border-radius:100px;
+  padding:7px 16px;margin-bottom:32px;background:var(--bg-raise);
+}
+.eyebrow .pulse{width:6px;height:6px;border-radius:50%;background:var(--accent);animation:pulse 2.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+h1{
+  font-size:clamp(44px,7.5vw,86px);line-height:1.03;letter-spacing:-.035em;font-weight:800;
+  margin-bottom:24px;
+}
+h1 .grad{
+  background:linear-gradient(102deg,var(--accent) 0%,var(--accent-2) 68%);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.lede{font-size:clamp(17px,2.1vw,21px);color:var(--muted);max-width:660px;margin:0 auto 40px}
+.lede strong{color:var(--text);font-weight:600}
+.cta-row{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-bottom:20px}
+.btn{
+  display:inline-flex;align-items:center;gap:9px;
+  padding:14px 28px;border-radius:10px;font-weight:600;font-size:15px;
+  text-decoration:none;border:1px solid transparent;transition:all .16s;
+}
+.btn-primary{
+  background:linear-gradient(102deg,var(--accent),var(--accent-2));color:#04140f;
+  box-shadow:0 6px 30px rgba(77,230,196,.2);
+}
+.btn-primary:hover{transform:translateY(-1px);box-shadow:0 10px 38px rgba(77,230,196,.3)}
+.btn-ghost{border-color:var(--line-bright);color:var(--text);background:var(--bg-raise)}
+.btn-ghost:hover{border-color:var(--dim)}
+.cta-note{font-size:13px;color:var(--dim);font-family:var(--mono)}
+
+/* ---------- stats ---------- */
+.stats{
+  display:grid;grid-template-columns:repeat(4,1fr);gap:1px;
+  background:var(--line);border:1px solid var(--line);border-radius:14px;
+  overflow:hidden;margin:72px 0;
+}
+@media(max-width:760px){.stats{grid-template-columns:repeat(2,1fr)}}
+.stat{background:var(--bg-raise);padding:28px 20px;text-align:center}
+.stat b{display:block;font-size:clamp(24px,3.4vw,34px);font-weight:800;letter-spacing:-.03em;color:var(--text);font-family:var(--mono)}
+.stat span{display:block;font-size:12.5px;color:var(--dim);margin-top:6px;letter-spacing:.04em}
+
+/* ---------- sections ---------- */
+section{padding:88px 0}
+.section-head{max-width:680px;margin-bottom:52px}
+.section-head.center{margin-left:auto;margin-right:auto;text-align:center}
+.kicker{
+  font-family:var(--mono);font-size:12px;letter-spacing:.15em;text-transform:uppercase;
+  color:var(--accent);margin-bottom:14px;
+}
+h2{font-size:clamp(30px,4.2vw,44px);line-height:1.12;letter-spacing:-.03em;font-weight:800;margin-bottom:18px}
+h3{font-size:19px;font-weight:700;letter-spacing:-.01em;margin-bottom:10px}
+.sub{color:var(--muted);font-size:17px}
+
+/* ---------- feature cards ---------- */
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+@media(max-width:900px){.grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:620px){.grid{grid-template-columns:1fr}}
+.card{
+  background:var(--card);border:1px solid var(--line);border-radius:14px;padding:28px;
+  transition:border-color .18s,transform .18s;
+}
+.card:hover{border-color:var(--line-bright);transform:translateY(-2px)}
+.card .ico{
+  width:38px;height:38px;border-radius:10px;display:grid;place-items:center;
+  background:rgba(77,230,196,.09);border:1px solid rgba(77,230,196,.2);
+  margin-bottom:18px;font-size:19px;
+}
+.card p{color:var(--muted);font-size:14.5px}
+
+/* ---------- comparison table ---------- */
+.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:14px;background:var(--card)}
+table{width:100%;border-collapse:collapse;font-size:14.5px;min-width:560px}
+th,td{padding:15px 20px;text-align:left;border-bottom:1px solid var(--line)}
+tbody tr:last-child td{border-bottom:none}
+th{
+  font-family:var(--mono);font-size:11.5px;letter-spacing:.11em;text-transform:uppercase;
+  color:var(--dim);font-weight:600;background:var(--bg-raise);
+}
+td:first-child{font-weight:600}
+.v-old{color:var(--muted)}
+.v-new{color:var(--accent);font-family:var(--mono);font-size:13.5px}
+
+/* ---------- status ---------- */
+.status-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+@media(max-width:760px){.status-grid{grid-template-columns:1fr}}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:28px}
+.panel h3{display:flex;align-items:center;gap:9px;margin-bottom:18px}
+.tick{color:var(--accent)}
+.todo{color:var(--warn)}
+.panel ul{list-style:none;display:flex;flex-direction:column;gap:11px}
+.panel li{display:flex;gap:11px;font-size:14.5px;color:var(--muted);align-items:flex-start}
+.panel li::before{content:"";flex:0 0 6px;height:6px;border-radius:50%;background:var(--line-bright);margin-top:9px}
+.panel.done li::before{background:var(--accent)}
+.panel.next li::before{background:var(--warn);opacity:.65}
+
+/* ---------- download ---------- */
+.dl{
+  border:1px solid var(--line-bright);border-radius:18px;padding:52px 40px;text-align:center;
+  background:
+    radial-gradient(ellipse at 50% 0%,rgba(59,157,255,.09),transparent 68%),
+    var(--bg-raise);
+}
+.dl h2{margin-bottom:14px}
+.platforms{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin:34px 0 22px}
+.plat{
+  border:1px solid var(--line);background:var(--card);border-radius:11px;
+  padding:16px 26px;min-width:150px;
+}
+.plat b{display:block;font-size:15px;margin-bottom:3px}
+.plat span{font-size:12px;color:var(--dim);font-family:var(--mono)}
+.notice{
+  display:flex;gap:13px;align-items:flex-start;text-align:left;
+  border:1px solid rgba(255,180,84,.26);background:rgba(255,180,84,.05);
+  border-radius:11px;padding:17px 19px;max-width:640px;margin:0 auto;
+  font-size:14px;color:var(--muted);
+}
+.notice b{color:var(--warn);display:block;margin-bottom:3px;font-size:14px}
+
+/* ---------- privacy list ---------- */
+.plist{display:flex;flex-direction:column;gap:2px;border:1px solid var(--line);border-radius:14px;overflow:hidden;background:var(--line)}
+.prow{background:var(--card);padding:20px 24px;display:grid;grid-template-columns:190px 1fr;gap:20px;align-items:start}
+@media(max-width:700px){.prow{grid-template-columns:1fr;gap:6px}}
+.prow dt{font-weight:600;font-size:14.5px}
+.prow dd{color:var(--muted);font-size:14.5px}
+code{font-family:var(--mono);font-size:.9em;background:var(--bg-raise);border:1px solid var(--line);border-radius:5px;padding:1.5px 6px;color:var(--accent)}
+
+/* ---------- footer ---------- */
+footer{border-top:1px solid var(--line);padding:56px 0 72px;margin-top:40px}
+.foot-top{display:flex;justify-content:space-between;gap:32px;flex-wrap:wrap;margin-bottom:38px}
+.foot-links{display:flex;gap:34px;flex-wrap:wrap}
+.foot-links a{color:var(--muted);text-decoration:none;font-size:14px}
+.foot-links a:hover{color:var(--text)}
+.disclaimer{
+  border:1px solid var(--line);border-radius:11px;padding:19px 22px;
+  font-size:12.5px;color:var(--dim);line-height:1.75;
+}
+.disclaimer strong{color:var(--muted);font-family:var(--mono);font-size:12px;letter-spacing:.03em}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#top"><span class="dot"></span>neuton</a>
+    <div class="navlinks">
+      <a href="#how">How it works</a>
+      <a href="#status">Status</a>
+      <a href="#privacy">Your account</a>
+      <a class="nav-cta" href="#download">Download</a>
+    </div>
+  </div>
+</nav>
+
+<header id="top">
+  <div class="wrap">
+    <div class="eyebrow"><span class="pulse"></span>In development · Java Edition 26.2</div>
+    <h1>A Minecraft client<br>built from <span class="grad">nothing</span>.</h1>
+    <p class="lede">
+      Not a mod. Not a modpack. Not a launcher wrapper.
+      <strong>neuton</strong> replaces the game client itself — the protocol, the world,
+      the renderer — written from scratch in Rust for one purpose: to be the fastest
+      way to play on a server.
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="#download">See release status →</a>
+      <a class="btn btn-ghost" href="#how">How it works</a>
+    </div>
+    <p class="cta-note">No public builds yet · Windows · macOS · Linux</p>
+
+    <div class="stats">
+      <div class="stat"><b>0</b><span>lines of Mojang code at runtime</span></div>
+      <div class="stat"><b>26.2</b><span>protocol 776, exactly</span></div>
+      <div class="stat"><b>3</b><span>platforms, one codebase</span></div>
+      <div class="stat"><b>100%</b><span>open source</span></div>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <div class="section-head center">
+      <div class="kicker">What you get</div>
+      <h2>Everything rebuilt, nothing inherited.</h2>
+      <p class="sub">Starting from zero is only worth it if the result is genuinely different. Here is what that buys.</p>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <div class="ico">⚡</div>
+        <h3>Boots instantly</h3>
+        <p>The goal is click to title screen with no perceptible delay. Not "faster than vanilla" — fast enough that the loading step stops existing.</p>
+      </div>
+      <div class="card">
+        <div class="ico">🎯</div>
+        <h3>Frames, not excuses</h3>
+        <p>A renderer designed for modern GPUs from the first line, rather than a decade of compatibility layers stacked on immediate-mode OpenGL.</p>
+      </div>
+      <div class="card">
+        <div class="ico">🌄</div>
+        <h3>Shader packs</h3>
+        <p>Shader support is part of the renderer's design rather than something bolted on afterwards by intercepting the game's draw calls.</p>
+      </div>
+      <div class="card">
+        <div class="ico">🌐</div>
+        <h3>Servers only, on purpose</h3>
+        <p>No world generation, no save format, no integrated server. Cutting everything single-player removes an enormous amount of work that never draws a frame.</p>
+      </div>
+      <div class="card">
+        <div class="ico">👥</div>
+        <h3>Multiple accounts</h3>
+        <p>Shared machines, alts, a second player on the same computer. Sign in as many accounts as you like and switch between them instantly.</p>
+      </div>
+      <div class="card">
+        <div class="ico">🔍</div>
+        <h3>Nothing hidden</h3>
+        <p>Every line is public. No telemetry, no analytics, no account on our side, no server of ours between you and the game.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <div class="section-head">
+      <div class="kicker">How it works</div>
+      <h2>The trick is doing the work early.</h2>
+      <p class="sub">
+        Most of what Minecraft does at startup produces exactly the same answer every
+        single launch: parsing 1,199 block state files, baking 2,658 block models,
+        building registries, stitching texture atlases, compiling shaders. neuton does
+        all of it once, when the client is built, and ships the result.
+      </p>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>Startup work</th><th>Normally</th><th>In neuton</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Registries &amp; block states</td><td class="v-old">Parsed from JSON at launch</td><td class="v-new">Static tables in the binary</td></tr>
+          <tr><td>Packet definitions</td><td class="v-old">Built by reflection</td><td class="v-new">Compile-time constants</td></tr>
+          <tr><td>Block models</td><td class="v-old">Parsed, then baked</td><td class="v-new">Pre-baked to geometry</td></tr>
+          <tr><td>Texture atlas</td><td class="v-old">Stitched every launch</td><td class="v-new">Pre-stitched, GPU-ready</td></tr>
+          <tr><td>Shaders</td><td class="v-old">Compiled every launch</td><td class="v-new">Cached pipelines</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sub" style="margin-top:28px;max-width:680px">
+      What is left at startup is little more than mapping a few files into memory and
+      drawing. The data itself still comes from the real game — neuton reads your own
+      legitimate Minecraft installation to generate those tables, so it stays exactly
+      in step with the version it targets.
+    </p>
+  </div>
+</section>
+
+<section id="status">
+  <div class="wrap">
+    <div class="section-head center">
+      <div class="kicker">Where it is</div>
+      <h2>Honest progress.</h2>
+      <p class="sub">This is a real project in the middle of being built, not a launch page. Here is exactly what works today.</p>
+    </div>
+    <div class="status-grid">
+      <div class="panel done">
+        <h3><span class="tick">✓</span> Working now</h3>
+        <ul>
+          <li>Full 26.2 network protocol, including compression and encryption</li>
+          <li>Microsoft account sign-in, with several accounts per machine</li>
+          <li>Connecting to real servers and staying connected</li>
+          <li>Decoding the world as the server streams it</li>
+          <li>Block and registry data generated from the real game</li>
+        </ul>
+      </div>
+      <div class="panel next">
+        <h3><span class="todo">◇</span> Being built</h3>
+        <ul>
+          <li>The renderer, and the first frame on screen</li>
+          <li>Baking block models and textures ahead of time</li>
+          <li>Shader pack support</li>
+          <li>Player movement, physics and input</li>
+          <li>Interface, settings and profiles</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="download">
+  <div class="wrap">
+    <div class="dl">
+      <div class="kicker">Download</div>
+      <h2>Not ready yet.</h2>
+      <p class="sub" style="max-width:560px;margin:0 auto">
+        There are no public builds, because there is nothing worth downloading until
+        you can see the world. When there is, it will be here for all three platforms.
+      </p>
+      <div class="platforms">
+        <div class="plat"><b>Windows</b><span>x64 · soon</span></div>
+        <div class="plat"><b>macOS</b><span>Apple silicon · soon</span></div>
+        <div class="plat"><b>Linux</b><span>x64 · soon</span></div>
+      </div>
+      <div class="notice">
+        <span style="font-size:17px;line-height:1.2">⚠</span>
+        <div>
+          <b>Sign-in is awaiting approval</b>
+          Third-party Minecraft clients need their application reviewed by Mojang before
+          players can sign in. That review is pending. Everything else runs; this is the
+          last gate before builds can be useful to anyone.
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="privacy">
+  <div class="wrap">
+    <div class="section-head">
+      <div class="kicker">Your account</div>
+      <h2>What neuton does with your sign-in.</h2>
+      <p class="sub">
+        Short version: it signs you in with Microsoft, keeps the result on your own
+        computer, and sends it nowhere else.
+      </p>
+    </div>
+    <dl class="plist">
+      <div class="prow">
+        <dt>How you sign in</dt>
+        <dd>Microsoft's official device code flow. neuton shows a code, you enter it on Microsoft's own website, and approve there.</dd>
+      </div>
+      <div class="prow">
+        <dt>Your password</dt>
+        <dd>Never seen, never typed into neuton, never stored. You only ever enter it on Microsoft's site.</dd>
+      </div>
+      <div class="prow">
+        <dt>What is stored</dt>
+        <dd>One file on your machine holding your sign-in, readable only by your user account. Nothing is uploaded, because there is nowhere to upload it to.</dd>
+      </div>
+      <div class="prow">
+        <dt>Who it talks to</dt>
+        <dd>Microsoft, Xbox Live and Mojang to sign in, and whichever game server you choose to join. Nothing else, ever.</dd>
+      </div>
+      <div class="prow">
+        <dt>Telemetry</dt>
+        <dd>None. No analytics, no crash reporting, no usage data, no accounts on our side. There is no "our side".</dd>
+      </div>
+      <div class="prow">
+        <dt>Signing out</dt>
+        <dd>Deletes the file. You can also revoke neuton's access from your Microsoft account at <code>account.live.com/consent/Manage</code>.</dd>
+      </div>
+    </dl>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-top">
+      <div>
+        <a class="brand" href="#top" style="margin-bottom:10px"><span class="dot"></span>neuton</a>
+        <p style="color:var(--dim);font-size:13.5px;max-width:300px">
+          A from-scratch Minecraft client for Java Edition 26.2.
+        </p>
+      </div>
+      <div class="foot-links">
+        <a href="#how">How it works</a>
+        <a href="#status">Status</a>
+        <a href="#download">Download</a>
+        <a href="#privacy">Your account</a>
+      </div>
+    </div>
+    <div class="disclaimer">
+      <strong>NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.</strong><br>
+      neuton is an independent third-party client. Minecraft is a trademark of Mojang Synergies AB.
+      You need your own legitimate copy of Minecraft: Java Edition to use it; neuton does not provide,
+      circumvent or replace the game licence, and it will not sign in an account that does not own the game.
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
