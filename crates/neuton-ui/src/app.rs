@@ -2,12 +2,12 @@
 
 use crate::auth_task::{SignIn, SignInTask};
 use crate::icons::IconCache;
-use crate::ping_task::{Ping, Pinger};
+use crate::ping_task::{Ping, Pinger, Probe};
 use crate::servers::{Server, ServerList};
 use crate::theme::{self, ACCENT, CARD, DANGER, DIM, FG, LINE, LINE2, MID, WARN};
 use egui::{Align, Color32, Frame, Layout, RichText, Stroke};
 use neuton_auth::Accounts;
-use neuton_net::ServerStatus;
+use neuton_net::{Resolution, ServerStatus};
 use std::path::PathBuf;
 
 /// Versions this build can play. One for now; the picker exists so adding a
@@ -83,6 +83,7 @@ impl Launcher {
                 self.top_bar(ui);
                 Frame::new().inner_margin(egui::Margin::symmetric(20, 16)).show(ui, |ui| {
                     self.server_section(ui);
+                    self.network_panel(ui);
                 });
                 self.bottom_bar(ui);
             });
@@ -214,6 +215,7 @@ impl Launcher {
         let mut up: Option<u64> = None;
         let mut down: Option<u64> = None;
         let mut reping: Option<u64> = None;
+        let mut join: Option<u64> = None;
 
         let entries: Vec<Server> = self.servers.entries().to_vec();
         let last = entries.len().saturating_sub(1);
@@ -228,6 +230,7 @@ impl Launcher {
                         RowAction::Up => up = Some(server.id),
                         RowAction::Down => down = Some(server.id),
                         RowAction::Reping => reping = Some(server.id),
+                        RowAction::Join => join = Some(server.id),
                     }
                 });
                 if response {
@@ -261,12 +264,17 @@ impl Launcher {
             self.servers.move_down(id);
             let _ = self.servers.save();
         }
+        if let Some(id) = join {
+            self.selected = Some(id);
+            self.join_selected();
+        }
         if let Some(id) = reping
             && let Some(s) = self.servers.get(id)
         {
             let (host, port) = s.host_port();
+            let explicit = s.has_explicit_port();
             self.icons.invalidate(id);
-            self.pinger.refresh_one(id, host, port);
+            self.pinger.refresh_one(id, host, port, explicit);
         }
     }
 
@@ -279,77 +287,115 @@ impl Launcher {
         last: usize,
         act: &mut dyn FnMut(RowAction),
     ) -> bool {
-        let stroke = if selected { Stroke::new(1.0, ACCENT) } else { Stroke::new(1.0, LINE) };
         let state = self.pinger.state(server.id).clone();
+        let reachable = matches!(state, Ping::Ok(_));
 
-        let inner = Frame::new()
-            .fill(CARD)
-            .stroke(stroke)
-            .corner_radius(10)
-            .inner_margin(egui::Margin::same(12))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    self.icon(ui, server.id, &state);
-                    ui.add_space(10.0);
-
-                    ui.vertical(|ui| {
-                        ui.set_min_width(260.0);
+        // The background senses clicks through UiBuilder rather than by calling
+        // interact() on the finished frame. Interacting afterwards registers the
+        // row on top of its own children, which silently swallows every button
+        // and menu inside it.
+        let scope = ui.scope_builder(
+            egui::UiBuilder::new().sense(egui::Sense::click()),
+            |ui| {
+                let hovered = ui.response().hovered();
+                let stroke = if selected {
+                    Stroke::new(1.0, ACCENT)
+                } else if hovered {
+                    Stroke::new(1.0, LINE2)
+                } else {
+                    Stroke::new(1.0, LINE)
+                };
+                Frame::new()
+                    .fill(if selected { theme::RAISE } else { CARD })
+                    .stroke(stroke)
+                    .corner_radius(10)
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(server.display_name()).size(14.5).strong().color(FG),
-                            );
-                            ui.label(theme::mono(&server.address, DIM).size(11.0));
-                        });
-                        ui.add_space(2.0);
-                        self.motd(ui, &state);
-                    });
+                            self.icon(ui, server.id, &state);
+                            ui.add_space(10.0);
 
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        // Controls first: right-to-left lays out in reverse.
-                        ui.menu_button(RichText::new("...").size(13.0), |ui| {
-                            if ui.button("Edit").clicked() {
-                                act(RowAction::Edit);
-                                ui.close();
-                            }
-                            if ui.button("Refresh").clicked() {
-                                act(RowAction::Reping);
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.add_enabled(index > 0, egui::Button::new("Move up")).clicked() {
-                                act(RowAction::Up);
-                                ui.close();
-                            }
-                            if ui
-                                .add_enabled(index < last, egui::Button::new("Move down"))
-                                .clicked()
-                            {
-                                act(RowAction::Down);
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui
-                                .button(RichText::new("Remove").color(DANGER))
-                                .clicked()
-                            {
-                                act(RowAction::Remove);
-                                ui.close();
-                            }
-                        });
-                        ui.add_space(6.0);
-                        self.status_column(ui, &state);
-                    });
-                });
-            });
+                            ui.vertical(|ui| {
+                                ui.set_min_width(240.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(server.display_name())
+                                            .size(14.5)
+                                            .strong()
+                                            .color(FG),
+                                    );
+                                    ui.label(theme::mono(&server.address, DIM).size(11.0));
+                                });
+                                ui.add_space(2.0);
+                                self.motd(ui, &state);
+                            });
 
-        let response = inner.response.interact(egui::Sense::click());
-        response.clicked()
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                // Right-to-left lays out in reverse, so the
+                                // rightmost control is written first.
+                                ui.menu_button(RichText::new("\u{22ee}").size(15.0), |ui| {
+                                    if ui.button("Edit").clicked() {
+                                        act(RowAction::Edit);
+                                        ui.close();
+                                    }
+                                    if ui.button("Refresh").clicked() {
+                                        act(RowAction::Reping);
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui
+                                        .add_enabled(index > 0, egui::Button::new("Move up"))
+                                        .clicked()
+                                    {
+                                        act(RowAction::Up);
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .add_enabled(index < last, egui::Button::new("Move down"))
+                                        .clicked()
+                                    {
+                                        act(RowAction::Down);
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button(RichText::new("Remove").color(DANGER)).clicked() {
+                                        act(RowAction::Remove);
+                                        ui.close();
+                                    }
+                                });
+                                ui.add_space(4.0);
+
+                                let can_join = reachable && self.accounts.active().is_some();
+                                let join = ui.add_enabled(
+                                    can_join,
+                                    egui::Button::new(RichText::new("Join").size(13.0).strong()),
+                                );
+                                if join.clicked() {
+                                    act(RowAction::Join);
+                                }
+                                if !can_join {
+                                    join.on_disabled_hover_text(if !reachable {
+                                        "server did not answer"
+                                    } else {
+                                        "sign in first"
+                                    });
+                                }
+
+                                ui.add_space(6.0);
+                                self.status_column(ui, &state);
+                            });
+                        });
+                    });
+            },
+        );
+
+        scope.response.clicked()
     }
 
     fn icon(&mut self, ui: &mut egui::Ui, id: u64, state: &Ping) {
         let size = egui::vec2(40.0, 40.0);
         let png = match state {
-            Ping::Ok(status) => status.favicon_png.as_deref(),
+            Ping::Ok(probe) => probe.status.favicon_png.as_deref(),
             _ => None,
         };
         match self.icons.get(ui.ctx(), id, png) {
@@ -371,7 +417,7 @@ impl Launcher {
 
     fn motd(&self, ui: &mut egui::Ui, state: &Ping) {
         match state {
-            Ping::Ok(status) => Self::motd_spans(ui, status),
+            Ping::Ok(probe) => Self::motd_spans(ui, &probe.status),
             Ping::Pending => {
                 ui.label(RichText::new("pinging...").color(DIM).size(12.5).italics());
             }
@@ -426,7 +472,8 @@ impl Launcher {
 
     fn status_column(&self, ui: &mut egui::Ui, state: &Ping) {
         match state {
-            Ping::Ok(status) => {
+            Ping::Ok(probe) => {
+                let status = &probe.status;
                 ui.vertical(|ui| {
                     ui.with_layout(Layout::top_down(Align::Max), |ui| {
                         let bad = !status.compatible();
@@ -467,6 +514,217 @@ impl Launcher {
         }
     }
 
+    /// What pressing Join or Play does. Nothing yet, honestly.
+    fn join_selected(&mut self) {
+        self.notice = Some((
+            "Not yet: the renderer is still being built.".to_string(),
+            WARN,
+        ));
+    }
+
+    // -------------------------------------------------------- network detail
+
+    /// Everything the launcher learned about reaching the selected server.
+    ///
+    /// Consolidated here rather than sprinkled through the row, because the row
+    /// has to stay scannable and this is the panel you open when a server is
+    /// behaving oddly.
+    fn network_panel(&self, ui: &mut egui::Ui) {
+        let Some(id) = self.selected else { return };
+        let Some(server) = self.servers.get(id) else { return };
+        let Ping::Ok(probe) = self.pinger.state(id) else { return };
+        let Probe { status, resolution } = probe.as_ref();
+
+        ui.add_space(14.0);
+        ui.label(theme::mono("NETWORK", DIM).size(11.5));
+        ui.add_space(8.0);
+
+        Frame::new()
+            .fill(CARD)
+            .stroke(Stroke::new(1.0, LINE))
+            .corner_radius(10)
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                egui::Grid::new("net-detail")
+                    .num_columns(2)
+                    .spacing([18.0, 6.0])
+                    .min_col_width(120.0)
+                    .show(ui, |ui| {
+                        Self::field(ui, "typed", &server.address);
+
+                        if let Some(srv) = &resolution.srv {
+                            Self::field(
+                                ui,
+                                "srv record",
+                                &format!(
+                                    "{}:{}  priority {} weight {}",
+                                    srv.target.trim_end_matches('.'),
+                                    srv.port,
+                                    srv.priority,
+                                    srv.weight
+                                ),
+                            );
+                        }
+                        Self::field(
+                            ui,
+                            "connects to",
+                            &format!("{}:{}", resolution.effective_host, resolution.effective_port),
+                        );
+
+                        let addrs = if resolution.addresses.is_empty() {
+                            "none".to_string()
+                        } else {
+                            resolution
+                                .addresses
+                                .iter()
+                                .map(|a| a.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        Self::field(ui, "addresses", &addrs);
+
+                        if let Some(rev) = &resolution.reverse {
+                            Self::field(ui, "reverse dns", rev);
+                        }
+
+                        Self::field(
+                            ui,
+                            "timings",
+                            &format!(
+                                "dns {:.0} ms · tcp {:.0} ms · status {:.0} ms · rtt {:.0} ms",
+                                resolution.lookup_ms.unwrap_or(0.0),
+                                status.connect_ms,
+                                status.status_ms,
+                                status.latency_ms
+                            ),
+                        );
+                        Self::field(
+                            ui,
+                            "server",
+                            &format!("{} · protocol {}", status.version_name, status.protocol),
+                        );
+                    });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(theme::mono("what that tells you", DIM).size(10.5));
+                ui.add_space(6.0);
+                for fact in Self::facts(status, resolution) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(theme::mono("·", ACCENT).size(12.0));
+                        ui.label(RichText::new(fact).color(MID).size(12.5));
+                    });
+                }
+            });
+    }
+
+    fn field(ui: &mut egui::Ui, label: &str, value: &str) {
+        ui.label(theme::mono(label, DIM).size(12.0));
+        ui.label(theme::mono(value, FG).size(12.0));
+        ui.end_row();
+    }
+
+    /// Observations drawn from the numbers above.
+    ///
+    /// These are inferences, not measurements, and are worded that way.
+    fn facts(status: &ServerStatus, resolution: &Resolution) -> Vec<String> {
+        let mut out = Vec::new();
+
+        // Light in fibre travels at roughly two thirds of c, so half the round
+        // trip puts a hard ceiling on how far away the machine can be. Anything
+        // under that is impossible; well over it means queueing or routing.
+        if status.latency_ms > 0.0 {
+            let km = (status.latency_ms / 2.0) * 200.0;
+            out.push(format!(
+                "at {:.0} ms round trip the server is at most ~{:.0} km away through fibre, and probably much closer",
+                status.latency_ms, km
+            ));
+        }
+
+        // The application ping and the TCP handshake cross the same path once
+        // each. A large gap is the server thread, not the network.
+        let gap = status.latency_ms - status.connect_ms;
+        if status.connect_ms > 0.0 && gap.abs() > 15.0 {
+            if gap > 0.0 {
+                out.push(format!(
+                    "the ping takes {:.0} ms longer than the TCP handshake over the same path, so that time is the server thinking rather than the network",
+                    gap
+                ));
+            } else {
+                out.push(format!(
+                    "the handshake took {:.0} ms longer than the ping, which usually means the first connection paid for a route or TLS setup the second reused",
+                    -gap
+                ));
+            }
+        }
+
+        if resolution.redirected() {
+            out.push(
+                "an SRV record points this domain somewhere else, which is how a server runs on a non-default port without anyone typing one".to_string(),
+            );
+        }
+
+        if resolution.addresses.len() > 1 {
+            out.push(format!(
+                "{} addresses answer for this name, so something is load balancing or it sits behind a proxy network",
+                resolution.addresses.len()
+            ));
+        }
+
+        if let Some(rev) = &resolution.reverse {
+            let lower = rev.to_ascii_lowercase();
+            for (needle, who) in [
+                ("cloudflare", "Cloudflare"),
+                ("tcpshield", "TCPShield"),
+                ("ovh", "OVH"),
+                ("hetzner", "Hetzner"),
+                ("amazonaws", "AWS"),
+                ("googleusercontent", "Google Cloud"),
+                ("azure", "Azure"),
+                ("digitalocean", "DigitalOcean"),
+            ] {
+                if lower.contains(needle) {
+                    out.push(format!(
+                        "reverse DNS points at {who}, so you are talking to their edge rather than the machine running the game"
+                    ));
+                    break;
+                }
+            }
+        } else if !resolution.addresses.is_empty() {
+            out.push(
+                "the address has no reverse DNS, which is normal for consumer connections and for hosts behind a proxy".to_string(),
+            );
+        }
+
+        if resolution.addresses.iter().any(|a| a.is_ipv6()) {
+            out.push("the server also answers on IPv6".to_string());
+        }
+
+        if status.payload_bytes > 0 {
+            out.push(format!(
+                "the status reply was {} bytes, {}",
+                status.payload_bytes,
+                if status.favicon_png.is_some() {
+                    "most of it the server icon"
+                } else {
+                    "with no server icon in it"
+                }
+            ));
+        }
+
+        if !status.compatible() {
+            out.push(format!(
+                "this build speaks protocol {} and the server speaks {}, so joining would be refused at the handshake",
+                neuton_protocol::PROTOCOL_VERSION,
+                status.protocol
+            ));
+        }
+
+        out
+    }
+
     // ------------------------------------------------------------ bottom bar
 
     fn bottom_bar(&mut self, ui: &mut egui::Ui) {
@@ -477,7 +735,11 @@ impl Launcher {
                 .inner_margin(egui::Margin::symmetric(20, 12))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        let chosen = self.selected.and_then(|id| self.servers.get(id));
+                        // Copied out so the Play handler can take &mut self.
+                        let chosen: Option<String> = self
+                            .selected
+                            .and_then(|id| self.servers.get(id))
+                            .map(|s| s.display_name().to_string());
                         let ready = chosen.is_some() && self.accounts.active().is_some();
 
                         if ui
@@ -487,15 +749,12 @@ impl Launcher {
                             )
                             .clicked()
                         {
-                            self.notice = Some((
-                                "Not yet: the renderer is still being built.".to_string(),
-                                WARN,
-                            ));
+                            self.join_selected();
                         }
 
-                        match chosen {
-                            Some(s) => {
-                                ui.label(RichText::new(s.display_name()).color(MID).size(13.0))
+                        match &chosen {
+                            Some(name) => {
+                                ui.label(RichText::new(name).color(MID).size(13.0))
                             }
                             None => ui.label(
                                 RichText::new("select a server").color(DIM).size(13.0),
@@ -594,14 +853,18 @@ impl Launcher {
                     Some(id) => {
                         self.servers.edit(id, name.trim(), address.trim());
                         self.icons.invalidate(id);
-                        let (h, p) = self.servers.get(id).map(|s| s.host_port()).unwrap_or_default();
-                        self.pinger.refresh_one(id, h, p);
+                        let (h, p, explicit) = self
+                            .servers
+                            .get(id)
+                            .map(|s| (s.host_port().0, s.host_port().1, s.has_explicit_port()))
+                            .unwrap_or_default();
+                        self.pinger.refresh_one(id, h, p, explicit);
                     }
                     None => {
                         let new_id = self.servers.add(name.trim(), address.trim());
                         if let Some(s) = self.servers.get(new_id) {
                             let (h, p) = s.host_port();
-                            self.pinger.refresh_one(new_id, h, p);
+                            self.pinger.refresh_one(new_id, h, p, s.has_explicit_port());
                         }
                         self.selected = Some(new_id);
                     }
@@ -830,6 +1093,7 @@ enum RowAction {
     Up,
     Down,
     Reping,
+    Join,
 }
 
 /// Green through amber to red, on the same thresholds the vanilla list uses.

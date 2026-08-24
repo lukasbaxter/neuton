@@ -57,6 +57,22 @@ impl Server {
         }
     }
 
+    /// Whether the user typed a port.
+    ///
+    /// Vanilla only consults SRV when they did not, so this decides whether the
+    /// launcher looks one up.
+    pub fn has_explicit_port(&self) -> bool {
+        let addr = self.address.trim();
+        if let Some(rest) = addr.strip_prefix('[') {
+            return rest.split_once(']').is_some_and(|(_, tail)| tail.starts_with(':'));
+        }
+        if addr.matches(':').count() > 1 {
+            return false;
+        }
+        addr.rsplit_once(':')
+            .is_some_and(|(h, p)| !h.is_empty() && !p.is_empty() && p.parse::<u16>().is_ok())
+    }
+
     /// What to show when the entry has no name yet.
     pub fn display_name(&self) -> &str {
         if self.name.trim().is_empty() { self.address.trim() } else { self.name.trim() }
@@ -212,6 +228,17 @@ mod tests {
         // The bracketed form does carry a port.
         assert_eq!(entry("[fe80::1]:25571").host_port(), ("fe80::1".into(), 25571));
         assert_eq!(entry("[::1]").host_port(), ("::1".into(), 25565));
+    }
+
+    #[test]
+    fn explicit_ports_are_detected_so_srv_can_be_skipped() {
+        assert!(!entry("play.example.com").has_explicit_port());
+        assert!(entry("play.example.com:25571").has_explicit_port());
+        assert!(!entry("fe80::1").has_explicit_port());
+        assert!(entry("[fe80::1]:25571").has_explicit_port());
+        assert!(!entry("[fe80::1]").has_explicit_port());
+        // A typo is not a port, so SRV should still be tried.
+        assert!(!entry("play.example.com:abc").has_explicit_port());
     }
 
     #[test]

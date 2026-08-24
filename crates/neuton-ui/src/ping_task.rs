@@ -5,9 +5,17 @@
 //! blank for half a minute, so they all go at once and rows fill in as replies
 //! land.
 
-use neuton_net::ServerStatus;
+use neuton_net::{Resolution, ServerStatus};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+
+/// Everything one probe learned about a server.
+#[derive(Debug, Clone)]
+pub struct Probe {
+    pub status: ServerStatus,
+    /// How the address was resolved, including any SRV redirect.
+    pub resolution: Resolution,
+}
 
 /// What is known about one row right now.
 #[derive(Debug, Clone, Default)]
@@ -15,7 +23,7 @@ pub enum Ping {
     #[default]
     Unknown,
     Pending,
-    Ok(Box<ServerStatus>),
+    Ok(Box<Probe>),
     Failed(String),
 }
 
@@ -47,18 +55,26 @@ impl Pinger {
         self.results.values().any(Ping::is_pending)
     }
 
-    /// Pings one server. Ignored if that row is already in flight.
-    pub fn refresh_one(&mut self, id: u64, host: String, port: u16) {
+    /// Resolves and pings one server. Ignored if that row is already in flight.
+    ///
+    /// `port_was_explicit` decides whether SRV is consulted, matching vanilla:
+    /// typing `host:port` means that exact endpoint and nothing else.
+    pub fn refresh_one(&mut self, id: u64, host: String, port: u16, port_was_explicit: bool) {
         if self.state(id).is_pending() {
             return;
         }
         self.results.insert(id, Ping::Pending);
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result = match neuton_net::ping(&host, port) {
-                Ok(status) => Ping::Ok(Box::new(status)),
-                Err(e) => Ping::Failed(short_reason(&e)),
-            };
+            // Resolve first: an SRV record can send the ping somewhere else
+            // entirely, and pinging the typed name would then measure the wrong
+            // machine.
+            let resolution = neuton_net::dns::resolve(&host, port, port_was_explicit);
+            let result =
+                match neuton_net::ping(&resolution.effective_host, resolution.effective_port) {
+                    Ok(status) => Ping::Ok(Box::new(Probe { status, resolution })),
+                    Err(e) => Ping::Failed(short_reason(&e)),
+                };
             // The receiver is gone if the window closed mid-ping, which is fine.
             let _ = tx.send((id, result));
         });
@@ -68,7 +84,7 @@ impl Pinger {
         for s in servers {
             let (host, port) = s.host_port();
             if !host.is_empty() {
-                self.refresh_one(s.id, host, port);
+                self.refresh_one(s.id, host, port, s.has_explicit_port());
             }
         }
     }
@@ -128,7 +144,7 @@ mod tests {
         let mut p = Pinger::default();
         // Port 1 on loopback refuses immediately, so this does not wait on a
         // timeout.
-        p.refresh_one(1, "127.0.0.1".into(), 1);
+        p.refresh_one(1, "127.0.0.1".into(), 1, true);
         assert!(p.state(1).is_pending());
 
         for _ in 0..100 {
