@@ -1,0 +1,13 @@
+[package]
+name = "neuton-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "neuton"
+path = "src/main.rs"
+
+[dependencies]
+neuton-protocol = { workspace = true }
+neuton-blocks = { workspace = true }
