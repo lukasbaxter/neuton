@@ -478,10 +478,10 @@ fn start_world(
             pending.host,
             pending.port,
             pending.session,
-            atlas,
+            atlas.clone(),
             tints.clone().unwrap_or_default(),
         );
-        let mut view = WorldView::new(session);
+        let mut view = WorldView::new(session, atlas.clone());
         set_capture(&state.gpu.window, &mut view, true);
         *world = Some(view);
         state.gpu.window.request_redraw();

@@ -2,14 +2,14 @@
 
 use crate::chat::Chat;
 use crate::session::{Outgoing, WorldEvent, WorldSession};
+use neuton_world::{Body, Chunk, Input as MoveInput, physics};
+use std::collections::HashMap;
+use std::sync::Arc;
 use neuton_render::{Camera, WorldRenderer};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use winit::keyboard::KeyCode;
 
-/// Blocks per second at a walk, and the multiplier while sprinting.
-const SPEED: f32 = 14.0;
-const SPRINT: f32 = 5.0;
 /// Degrees of turn per pixel of mouse movement.
 const SENSITIVITY: f32 = 0.12;
 
@@ -30,6 +30,17 @@ pub struct WorldView {
     /// flickering through every stutter.
     frame_ms_avg: f32,
     pub chat: Chat,
+    /// Block data for collision, keyed by chunk.
+    blocks: HashMap<(i32, i32), Arc<Chunk>>,
+    /// Physical state. Separate from the camera, which follows it.
+    pub body: Body,
+    /// Shapes to walk into, shared with the meshing thread.
+    shapes: Arc<neuton_render::BlockTextures>,
+    /// Time since the last physics tick, so physics runs at a fixed rate
+    /// regardless of frame rate.
+    accumulator: f64,
+    /// Set on the frame the jump key is pressed, for the double-tap to fly.
+    last_jump: Option<Instant>,
     /// When the last movement update went out, and what it said.
     last_move_sent: Option<Instant>,
     last_position: Option<[f64; 3]>,
@@ -41,7 +52,7 @@ pub struct WorldView {
 }
 
 impl WorldView {
-    pub fn new(session: WorldSession) -> Self {
+    pub fn new(session: WorldSession, shapes: Arc<neuton_render::BlockTextures>) -> Self {
         Self {
             session,
             camera: Camera::default(),
@@ -53,6 +64,11 @@ impl WorldView {
             show_debug: true,
             frame_ms_avg: 0.0,
             chat: Chat::default(),
+            blocks: HashMap::new(),
+            body: Body::default(),
+            shapes,
+            accumulator: 0.0,
+            last_jump: None,
             last_move_sent: None,
             last_position: None,
             last_rotation: None,
@@ -95,6 +111,16 @@ impl WorldView {
                     self.chat.open("/");
                     self.held.clear();
                     return true;
+                }
+                // Double-tap jump to fly, as in creative mode.
+                KeyCode::Space => {
+                    let now = Instant::now();
+                    if self.last_jump.is_some_and(|t| now.duration_since(t).as_millis() < 300) {
+                        self.toggle_fly();
+                        self.last_jump = None;
+                    } else {
+                        self.last_jump = Some(now);
+                    }
                 }
                 _ => {}
             }
@@ -153,20 +179,9 @@ impl WorldView {
         }
     }
 
-    /// Applies held keys for a frame of `dt` seconds.
+    /// Advances the player and the world for a frame of `dt` seconds.
     pub fn update(&mut self, dt: f32, renderer: &mut WorldRenderer, device: &wgpu::Device) {
-        let mut speed = SPEED * dt;
-        if self.held.contains(&KeyCode::ShiftLeft) {
-            speed *= SPRINT;
-        }
-        let axis = |pos: KeyCode, neg: KeyCode| {
-            (self.held.contains(&pos) as i32 - self.held.contains(&neg) as i32) as f32
-        };
-        self.camera.fly(
-            axis(KeyCode::KeyW, KeyCode::KeyS) * speed,
-            axis(KeyCode::KeyD, KeyCode::KeyA) * speed,
-            axis(KeyCode::Space, KeyCode::ControlLeft) * speed,
-        );
+        self.tick_physics(dt);
 
         // The server is told where we are about twenty times a second, which is
         // the rate the game itself uses. Less often and chunk loading lags
@@ -175,9 +190,7 @@ impl WorldView {
         if self.placed && self.last_move_sent.is_none_or(|t| t.elapsed() >= MOVE_INTERVAL) {
             self.last_move_sent = Some(Instant::now());
 
-            let [x, y, z] = self.camera.position;
-            // The camera sits at eye height; the server wants the feet.
-            let position = [x as f64, (y - 1.62) as f64, z as f64];
+            let position = self.body.position;
             let rotation = (self.camera.yaw, self.camera.pitch);
 
             // Only report what changed. Claiming to have turned every tick when
@@ -220,15 +233,24 @@ impl WorldView {
                 WorldEvent::Joined { .. } => {
                     self.session.status = "in world".to_string();
                 }
-                WorldEvent::Chunk { x, z, mesh } => {
+                WorldEvent::Chunk { x, z, mesh, blocks } => {
                     renderer.upload(device, x, z, &mesh);
+                    self.blocks.insert((x, z), blocks);
                 }
-                WorldEvent::Forget { x, z } => renderer.forget(x, z),
+                WorldEvent::Forget { x, z } => {
+                    renderer.forget(x, z);
+                    self.blocks.remove(&(x, z));
+                }
                 WorldEvent::Moved { x, y, z, yaw, pitch } => {
                     if !self.placed {
                         self.placed = true;
-                        // Eye height, so the view sits where a player's would.
-                        self.camera.position = [x as f32, y as f32 + 1.62, z as f32];
+                        // The server sends the feet; the camera sits at the eyes.
+                        self.body.position = [x, y, z];
+                        self.body.velocity = [0.0; 3];
+                        // Walking, not flying: the whole point.
+                        self.body.flying = false;
+                        self.camera.position =
+                            [x as f32, (y + neuton_world::physics::EYE_HEIGHT) as f32, z as f32];
                         self.camera.yaw = yaw;
                         self.camera.pitch = pitch;
                         if !self.reported_loaded {
@@ -243,6 +265,63 @@ impl WorldView {
                 }
             }
         }
+    }
+
+    /// Runs physics at a fixed rate, whatever the frame rate.
+    ///
+    /// A variable step changes how far a jump goes and how reliably a collision
+    /// is caught, so the simulation runs in fixed slices and the frame just
+    /// decides how many of them happen.
+    fn tick_physics(&mut self, dt: f32) {
+        const TICK: f64 = 1.0 / 60.0;
+        let axis = |held: &HashSet<KeyCode>, pos: KeyCode, neg: KeyCode| {
+            (held.contains(&pos) as i32 - held.contains(&neg) as i32) as f32
+        };
+        let input = MoveInput {
+            forward: axis(&self.held, KeyCode::KeyW, KeyCode::KeyS),
+            strafe: axis(&self.held, KeyCode::KeyD, KeyCode::KeyA),
+            jump: self.held.contains(&KeyCode::Space),
+            sneak: self.held.contains(&KeyCode::ShiftLeft),
+            sprint: self.held.contains(&KeyCode::ControlLeft),
+            yaw: self.camera.yaw,
+        };
+
+        // Nothing to stand on until the ground has arrived. Chunks stream in
+        // over about a second, and a player who starts falling before then is
+        // inside the terrain by the time it lands.
+        let here = (
+            (self.body.position[0].floor() as i32).div_euclid(16),
+            (self.body.position[2].floor() as i32).div_euclid(16),
+        );
+        if !self.blocks.contains_key(&here) {
+            self.accumulator = 0.0;
+            return;
+        }
+
+        self.accumulator += dt as f64;
+        // Bounded, so a long stall does not make the player teleport when it
+        // ends.
+        self.accumulator = self.accumulator.min(0.25);
+        let world = ChunkWorld { chunks: &self.blocks };
+        while self.accumulator >= TICK {
+            self.accumulator -= TICK;
+            physics::step(&mut self.body, input, &world, self.shapes.as_ref(), TICK);
+        }
+
+        // The camera sits at the eyes.
+        self.camera.position = [
+            self.body.position[0] as f32,
+            (self.body.position[1] + neuton_world::physics::EYE_HEIGHT) as f32,
+            self.body.position[2] as f32,
+        ];
+    }
+
+    /// Switches between walking and flying, as double-tapping jump does in the
+    /// game.
+    fn toggle_fly(&mut self) {
+        self.body.flying = !self.body.flying;
+        self.body.velocity = [0.0; 3];
+        self.chat.note(if self.body.flying { "Flying" } else { "Walking" });
     }
 
     /// Folds this frame's time into the smoothed average.
@@ -290,5 +369,26 @@ impl WorldView {
             y if y < 225.0 => "north (-Z)",
             _ => "east (+X)",
         }
+    }
+}
+
+
+/// Looks blocks up across the loaded chunks.
+struct ChunkWorld<'a> {
+    chunks: &'a HashMap<(i32, i32), Arc<Chunk>>,
+}
+
+impl neuton_world::BlockView for ChunkWorld<'_> {
+    fn state_at(&self, x: i32, y: i32, z: i32) -> neuton_blocks::StateId {
+        let key = (x.div_euclid(16), z.div_euclid(16));
+        // An unloaded chunk reads as air. Treating it as solid would trap the
+        // player at the edge of the world; falling through is recoverable and
+        // the chunk usually arrives first anyway.
+        let Some(chunk) = self.chunks.get(&key) else {
+            return neuton_blocks::StateId(0);
+        };
+        chunk
+            .state_at(x.rem_euclid(16) as usize, y, z.rem_euclid(16) as usize)
+            .unwrap_or(neuton_blocks::StateId(0))
     }
 }
