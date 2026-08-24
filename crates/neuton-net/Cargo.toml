@@ -1,16 +1,12 @@
 [package]
-name = "neuton-cli"
+name = "neuton-net"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "neuton"
-path = "src/main.rs"
-
 [dependencies]
 neuton-protocol = { workspace = true }
 neuton-blocks = { workspace = true }
-neuton-auth = { path = "../neuton-auth" }
-neuton-net = { path = "../neuton-net" }
 neuton-world = { path = "../neuton-world" }
+neuton-nbt = { path = "../neuton-nbt" }
+neuton-auth = { path = "../neuton-auth" }

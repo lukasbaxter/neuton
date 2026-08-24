@@ -49,31 +49,49 @@ Generated files are committed, so a normal build never needs Java.
 ```
 crates/
   neuton-datagen    build tool: vanilla jar -> generated Rust tables
-  neuton-protocol   wire types, framing, compression, packet IDs
+  neuton-protocol   wire types, framing, compression, encryption, packet IDs
+  neuton-nbt        NBT, with an allocation-free skipper for the chunk path
   neuton-blocks     block + block state tables
-  neuton-cli        `neuton ping`, `neuton info`
+  neuton-auth       Microsoft / Xbox / Minecraft session auth
+  neuton-world      chunk and paletted-container decoding
+  neuton-net        login -> configuration -> play state machine
+  neuton-cli        ping, login, join
 ```
 
 ## Status
 
-Working:
+Working, with 57 tests:
 
-- VarInt/VarLong and the full wire type set, zero-copy reads
-- Packet framing with zlib compression thresholds
-- Generated packet ID and block state tables, with invariants under test
-- Live server-list ping at protocol 776
+- **Wire layer** — VarInt/VarLong and the full type set with zero-copy reads,
+  frame compression, AES-128-CFB8 encryption verified against the NIST SP 800-38A
+  vector, and a server hash verified against Mojang's published examples
+- **Auth** — Microsoft device-code flow through Xbox Live and XSTS to a Minecraft
+  session, cached so warm launches touch the network zero times
+- **NBT** — network framing, modified UTF-8, and a skipper that steps over tags
+  without allocating
+- **Chunks** — paletted containers in all three forms, decoded against the
+  dimension shape read from registry data
+- **Join** — full login, configuration and play sequence, covered end to end by an
+  integration test that scripts the server side
 
 ```
 $ neuton ping play.notmiji.com
-play.notmiji.com:25565
   connect     21.6 ms
   status      29.3 ms
   ping        10.7 ms
   protocol 776
+
+$ neuton join play.notmiji.com
+auth     cached as <name> (0 ms)
+join     encrypted=true compression=256
+world    entity 419, 24 sections from y=-64
+chunk    #1 at (12, -30)  8214 non-air, 9 sections used
 ```
 
-Next: encryption + Microsoft auth, the configuration/play state machine, chunk
-palette decoding, then the renderer.
+Signing in needs an Azure application ID; see [docs/AUTH.md](docs/AUTH.md).
+
+Next: the renderer. Block model baking and atlas stitching move to build time,
+then chunk meshing and the first frame.
 
 ## Requirements
 

@@ -1,0 +1,10 @@
+[package]
+name = "neuton-world"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neuton-protocol = { workspace = true }
+neuton-blocks = { workspace = true }
+neuton-nbt = { path = "../neuton-nbt" }

@@ -6,3 +6,12 @@ license.workspace = true
 
 [dependencies]
 flate2 = "1"
+neuton-nbt = { path = "../neuton-nbt" }
+
+# Crypto. Pinned as a matching set: `rsa` 0.9 builds on the digest 0.10 /
+# cipher 0.4 generation, so `sha1` and `aes` are held there too rather than
+# pulling two copies of the same traits into the tree.
+rsa = "0.9"
+sha1 = "0.10"
+aes = "0.8"
+rand = "0.8"

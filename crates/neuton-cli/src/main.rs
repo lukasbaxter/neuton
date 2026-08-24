@@ -4,6 +4,8 @@
 //! and reports the round trip. It exists to keep the wire layer honest against
 //! live servers, including ones behind proxies like TCPShield.
 
+use neuton_auth::{CachePath, Origin};
+use neuton_net::{Connection, Event};
 use neuton_protocol::{Framed, PROTOCOL_VERSION, Reader, Writer, ids};
 use std::time::{Duration, Instant};
 
@@ -14,12 +16,23 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("ping") if args.len() >= 2 => ping(&args[1]),
+        Some("join") if args.len() >= 2 => join(&args[1], offline_name(&args)),
+        Some("login") => login(),
+        Some("logout") => logout(),
+        Some("whoami") => whoami(),
         Some("info") => {
             info();
             Ok(())
         }
         _ => {
-            eprintln!("usage: neuton ping <host[:port]>\n       neuton info");
+            eprintln!(
+                "usage: neuton ping <host[:port]>   server list ping\n\
+                 \x20      neuton join <host[:port]>   connect and stream the world\n\
+                 \x20      neuton login               sign in with a Microsoft account\n\
+                 \x20      neuton logout              forget the saved session\n\
+                 \x20      neuton whoami              show the cached session\n\
+                 \x20      neuton info                build and registry summary"
+            );
             return std::process::ExitCode::from(2);
         }
     };
@@ -100,6 +113,13 @@ fn ping(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `--offline <name>` runs the join without Microsoft auth, for testing
+/// against a development server.
+fn offline_name(args: &[String]) -> Option<&str> {
+    let i = args.iter().position(|a| a == "--offline")?;
+    args.get(i + 1).map(String::as_str)
+}
+
 fn split_host_port(target: &str) -> (&str, u16) {
     match target.rsplit_once(':') {
         Some((h, p)) => (h, p.parse().unwrap_or(DEFAULT_PORT)),
@@ -129,4 +149,159 @@ fn scrape(json: &str, key: &str) -> Option<String> {
     let rest = &json[start..];
     let end = rest.find(['"', ',', '}']).unwrap_or(rest.len());
     Some(rest[..end.max(1)].to_string())
+}
+
+
+fn login() -> Result<(), Box<dyn std::error::Error>> {
+    let cache = CachePath::default_path()?;
+    let t = Instant::now();
+    let (session, origin) = neuton_auth::authenticate(&cache, true, |dc| {
+        println!("\n  open {}", dc.verification_uri);
+        println!("  enter code  {}\n", dc.user_code);
+        println!("  waiting for approval...");
+    })?;
+    let how = match origin {
+        Origin::Cache => "from cache",
+        Origin::Refreshed => "refreshed",
+        Origin::Interactive => "signed in",
+    };
+    println!(
+        "{} as {} ({}) in {:.0} ms",
+        how,
+        session.profile.name,
+        session.profile.uuid_hyphenated(),
+        t.elapsed().as_secs_f64() * 1000.0
+    );
+    println!("  session valid for {} h", session.expires_in() / 3600);
+    Ok(())
+}
+
+fn logout() -> Result<(), Box<dyn std::error::Error>> {
+    let cache = CachePath::default_path()?;
+    cache.clear()?;
+    println!("cleared {}", cache.path().display());
+    Ok(())
+}
+
+fn whoami() -> Result<(), Box<dyn std::error::Error>> {
+    let cache = CachePath::default_path()?;
+    match cache.load() {
+        Some(s) => {
+            println!("{} ({})", s.profile.name, s.profile.uuid_hyphenated());
+            println!(
+                "  session   {}",
+                if s.is_valid() {
+                    format!("valid for {} h", s.expires_in() / 3600)
+                } else {
+                    "expired, will refresh on next use".to_string()
+                }
+            );
+            println!("  cache     {}", cache.path().display());
+        }
+        None => println!("not signed in; run `neuton login`"),
+    }
+    Ok(())
+}
+
+/// Joins a server and streams the world until interrupted.
+///
+/// This is the end-to-end check on the whole stack: auth, encryption,
+/// compression, the configuration exchange and chunk decoding all have to be
+/// right for a single chunk to arrive.
+fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let (host, port) = split_host_port(target);
+
+    let session = match offline {
+        // Offline mode exists for development against a local server. The
+        // server derives the UUID from the name itself and never sends an
+        // encryption request, so the token here is never used.
+        Some(name) => {
+            println!("auth     offline as {name}");
+            neuton_auth::Session {
+                profile: neuton_auth::Profile { uuid: 0, name: name.to_string() },
+                access_token: String::new(),
+                refresh_token: String::new(),
+                expires_at: u64::MAX,
+            }
+        }
+        None => {
+            let cache = CachePath::default_path()?;
+            let t_auth = Instant::now();
+            let (session, origin) = neuton_auth::authenticate(&cache, true, |dc| {
+                println!("  open {} and enter {}", dc.verification_uri, dc.user_code);
+            })?;
+            println!(
+                "auth     {} as {} ({:.0} ms)",
+                match origin {
+                    Origin::Cache => "cached",
+                    Origin::Refreshed => "refreshed",
+                    Origin::Interactive => "interactive",
+                },
+                session.profile.name,
+                t_auth.elapsed().as_secs_f64() * 1000.0
+            );
+            session
+        }
+    };
+
+    let mut conn = Connection::join(host, port, &session)?;
+    println!(
+        "join     {host}:{port}  encrypted={}  compression={}",
+        conn.is_encrypted(),
+        conn.compression().map(|t| t.to_string()).unwrap_or_else(|| "off".into())
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut ignored: std::collections::BTreeMap<&'static str, u32> = Default::default();
+
+    while Instant::now() < deadline {
+        match conn.poll()? {
+            Event::Joined { entity_id, dimension } => {
+                println!(
+                    "world    entity {entity_id}, {} sections from y={} ({:.0} ms to join)",
+                    dimension.section_count(),
+                    dimension.min_y,
+                    conn.stats.join_ms
+                );
+            }
+            Event::Chunk(c) => {
+                if conn.stats.chunks <= 3 || conn.stats.chunks % 100 == 0 {
+                    println!(
+                        "chunk    #{} at ({}, {})  {} non-air, {} sections used",
+                        conn.stats.chunks,
+                        c.x,
+                        c.z,
+                        c.block_count(),
+                        c.non_empty_sections().count()
+                    );
+                }
+            }
+            Event::Teleported { x, y, z, .. } => {
+                println!("teleport {x:.1} {y:.1} {z:.1}");
+            }
+            Event::Disconnect(why) => {
+                println!("kicked   {why}");
+                break;
+            }
+            Event::Ignored { name, .. } => {
+                *ignored.entry(name).or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let s = &conn.stats;
+    println!("\nsummary");
+    println!("  packets  {}", s.packets);
+    println!("  bytes    {:.1} KiB", s.bytes as f64 / 1024.0);
+    println!("  chunks   {}", s.chunks);
+    println!("  blocks   {}", s.blocks);
+    if !ignored.is_empty() {
+        let mut top: Vec<_> = ignored.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1));
+        let list: Vec<String> =
+            top.iter().take(8).map(|(n, c)| format!("{n} x{c}")).collect();
+        println!("  unhandled {}", list.join(", "));
+    }
+    Ok(())
 }
