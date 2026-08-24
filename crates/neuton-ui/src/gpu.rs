@@ -82,4 +82,12 @@ impl Gpu {
     pub fn format(&self) -> wgpu::TextureFormat {
         self.config.format
     }
+
+    /// Switches presentation between waiting for the display and not.
+    pub fn set_present_mode(&mut self, mode: wgpu::PresentMode) {
+        if self.config.present_mode != mode {
+            self.config.present_mode = mode;
+            self.surface.configure(&self.device, &self.config);
+        }
+    }
 }

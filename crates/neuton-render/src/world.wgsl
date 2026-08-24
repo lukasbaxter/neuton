@@ -4,7 +4,8 @@
 struct Globals {
     view_projection: mat4x4<f32>,
     fog_color: vec4<f32>,
-    // x: fog start, y: fog end, z and w unused.
+    // x: fog start, y: fog end, z: lowest light any surface is drawn at,
+    // w unused.
     fog: vec4<f32>,
 };
 
@@ -67,7 +68,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         discard;
     }
 
-    let lit = texel.rgb * in.tint.rgb * in.light;
+    // Fullbright raises the floor rather than discarding the lighting, so
+    // shape and the directional shade still read.
+    let lit = texel.rgb * in.tint.rgb * max(in.light, globals.fog.z);
     return vec4<f32>(apply_fog(lit, in.view_distance), 1.0);
 }
 
@@ -76,6 +79,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_translucent(in: VertexOut) -> @location(0) vec4<f32> {
     let texel = textureSample(atlas, atlas_sampler, in.uv);
-    let lit = texel.rgb * in.tint.rgb * in.light;
+    let lit = texel.rgb * in.tint.rgb * max(in.light, globals.fog.z);
     return vec4<f32>(apply_fog(lit, in.view_distance), texel.a * in.tint.a);
 }
