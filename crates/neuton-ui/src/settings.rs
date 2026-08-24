@@ -19,12 +19,13 @@ pub enum Action {
     Sprint,
     Chat,
     Command,
+    Inventory,
     Debug,
 }
 
 impl Action {
     /// Every action, in the order the settings screen lists them.
-    pub const ALL: [Action; 10] = [
+    pub const ALL: [Action; 11] = [
         Action::Forward,
         Action::Back,
         Action::Left,
@@ -34,6 +35,7 @@ impl Action {
         Action::Sprint,
         Action::Chat,
         Action::Command,
+        Action::Inventory,
         Action::Debug,
     ];
 
@@ -48,6 +50,7 @@ impl Action {
             Action::Sprint => "Sprint",
             Action::Chat => "Open chat",
             Action::Command => "Open command",
+            Action::Inventory => "Open inventory",
             Action::Debug => "Debug overlay",
         }
     }
@@ -63,6 +66,7 @@ impl Action {
             Action::Sprint => KeyCode::ControlLeft,
             Action::Chat => KeyCode::KeyT,
             Action::Command => KeyCode::Slash,
+            Action::Inventory => KeyCode::KeyE,
             Action::Debug => KeyCode::F3,
         }
     }

@@ -238,14 +238,15 @@ impl Atlas {
 }
 
 /// A decoded texture, possibly an animation strip.
-struct Image {
-    rgba: Vec<u8>,
-    width: u32,
-    height: u32,
+pub(crate) struct Image {
+    pub(crate) rgba: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 impl Image {
     /// Edge length of one frame.
+    #[allow(dead_code)]
     ///
     /// An animated texture is a vertical strip of square frames, so the frame is
     /// as tall as the image is wide. Treating the whole strip as one tile would
@@ -259,7 +260,7 @@ impl Image {
     }
 }
 
-fn decode(bytes: &[u8]) -> Option<Image> {
+pub(crate) fn decode(bytes: &[u8]) -> Option<Image> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().ok()?;

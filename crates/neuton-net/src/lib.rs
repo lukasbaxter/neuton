@@ -9,6 +9,7 @@
 pub mod component;
 pub mod connection;
 pub mod dns;
+pub mod items;
 pub mod registries;
 pub mod status;
 

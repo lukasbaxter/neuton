@@ -41,6 +41,10 @@ pub struct WorldView {
     /// Where the body was at the previous tick, for interpolating the camera
     /// between them.
     previous: [f64; 3],
+    /// What the player is carrying, and which slot is in hand.
+    pub inventory: crate::inventory::Inventory,
+    /// Item pictures and interface sprites, rendered as they are first needed.
+    pub art: crate::inventory::ItemArt,
     /// Chunk meshes waiting to go to the GPU, oldest first.
     pending: std::collections::VecDeque<(i32, i32, Box<neuton_render::Mesh>)>,
     /// Set on the frame the jump key is pressed, for the double-tap to fly.
@@ -64,9 +68,13 @@ pub struct WorldView {
     pub rebinding: Option<Action>,
     /// What the last movement update said, so only changes are reported.
     last_position: Option<[f64; 3]>,
+    /// Ticks since a position last went out. The game restates its position
+    /// every twentieth tick however still the player is standing.
+    position_reminder: u32,
+    /// Whether the last update said we were standing on something.
+    last_on_ground: Option<bool>,
     last_rotation: Option<(f32, f32)>,
-    /// Ticks since anything about the player changed.
-    idle_ticks: u32,
+
     /// Whether the server has been told the world finished loading.
     reported_loaded: bool,
 }
@@ -89,6 +97,8 @@ impl WorldView {
             shapes,
             accumulator: 0.0,
             previous: [0.0; 3],
+            inventory: crate::inventory::Inventory::default(),
+            art: crate::inventory::ItemArt::new(),
             pending: std::collections::VecDeque::new(),
             last_jump: None,
             abilities: Abilities::default(),
@@ -102,8 +112,9 @@ impl WorldView {
             settings_open: false,
             rebinding: None,
             last_position: None,
+            position_reminder: 0,
+            last_on_ground: None,
             last_rotation: None,
-            idle_ticks: 0,
             reported_loaded: false,
         }
     }
@@ -144,6 +155,18 @@ impl WorldView {
                 }
                 Some(Action::Command) => {
                     self.chat.open("/");
+                    self.held.clear();
+                    return true;
+                }
+                // The number row picks a hotbar slot, as it always has.
+                None if !repeat && hotbar_digit(code).is_some() => {
+                    if let Some(slot) = hotbar_digit(code) {
+                        self.select_slot(slot);
+                    }
+                    return false;
+                }
+                Some(Action::Inventory) if !repeat => {
+                    self.inventory.open = !self.inventory.open;
                     self.held.clear();
                     return true;
                 }
@@ -289,6 +312,10 @@ impl WorldView {
 
                     self.body.position = position;
                     self.body.velocity = [0.0; 3];
+                    // The camera interpolates between the last two ticks, so
+                    // without this it spends a tick travelling from wherever
+                    // the player used to be to wherever they now are.
+                    self.previous = position;
 
                     // A teleport is only accepted once the client reports
                     // standing exactly where it was put. Anti-cheats compare
@@ -337,6 +364,26 @@ impl WorldView {
                 }
                 WorldEvent::Timing(t) => self.timing = t,
                 WorldEvent::Chat(spans) => self.chat.push(spans),
+                WorldEvent::Container { window, slots, .. } => {
+                    // Window zero is the player's own inventory, the one behind
+                    // every other screen. Anything else is a chest or a
+                    // workbench, which this client does not open yet.
+                    if window == 0 {
+                        self.inventory.replace(slots);
+                    }
+                }
+                WorldEvent::Slot { window, slot, stack } => {
+                    if window == 0 {
+                        self.inventory.set(slot, stack);
+                    }
+                }
+                WorldEvent::HeldSlot(slot) => {
+                    if let Ok(slot) = usize::try_from(slot)
+                        && slot < crate::inventory::HOTBAR.len()
+                    {
+                        self.inventory.selected = slot;
+                    }
+                }
                 WorldEvent::Disconnected(why) => {
                     self.chat.note(format!("Disconnected: {why}"));
                 }
@@ -427,40 +474,70 @@ impl WorldView {
         }
         let position = self.body.position;
         let rotation = (self.camera.yaw, self.camera.pitch);
+        let on_ground = self.body.on_ground;
 
-        // Only report what changed. Claiming to have turned every tick when the
-        // view has not moved is what anti-cheat flags as a duplicate look, and
-        // it is a fair thing to flag.
+        // The game's own rule, and worth following exactly. A position goes out
+        // when it has changed, and every twentieth tick regardless -- a client
+        // that stands still and never restates where it is looks, to a server,
+        // like a client whose position packets have stopped meaning anything.
+        // Anti-cheat calls that "movement packets without updating position"
+        // and stops trusting anything the client says, including its answer to
+        // a teleport, which is how standing still ends up freezing a player in
+        // place and swallowing every later teleport.
+        self.position_reminder += 1;
         let moved = self.last_position.is_none_or(|last| {
             let d = [position[0] - last[0], position[1] - last[1], position[2] - last[2]];
             d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 4.0e-8
         });
-        let turned = self
+        let send_position = moved || self.position_reminder >= 20;
+        // Claiming to have turned every tick when the view has not moved is
+        // what anti-cheat flags as a duplicate look, and it is fair to flag.
+        let send_rotation = self
             .last_rotation
             .is_none_or(|(yaw, pitch)| yaw != rotation.0 || pitch != rotation.1);
 
-        if moved {
-            self.last_position = Some(position);
+        if send_position || send_rotation {
+            self.session.send(Outgoing::Move {
+                position: send_position.then_some(position),
+                rotation: send_rotation.then_some(rotation),
+                on_ground,
+            });
+        } else if self.last_on_ground != Some(on_ground) {
+            // Landing and taking off are worth a packet on their own, and
+            // nothing else is.
+            self.session.send(Outgoing::Move { position: None, rotation: None, on_ground });
         }
-        if turned {
+
+        if send_position {
+            self.last_position = Some(position);
+            self.position_reminder = 0;
+        }
+        if send_rotation {
             self.last_rotation = Some(rotation);
         }
-        // Standing still and looking the same way needs no packet most ticks.
-        // The game sends a bare status update about once a second to show it is
-        // still there; sending one every tick is noise that anti-cheat reads as
-        // a client not running a real game loop.
-        self.idle_ticks = if moved || turned { 0 } else { self.idle_ticks + 1 };
-        if moved || turned || self.idle_ticks >= 20 {
-            if self.idle_ticks >= 20 {
-                self.idle_ticks = 0;
-            }
-            self.session.send(Outgoing::Move {
-                position: moved.then_some(position),
-                rotation: turned.then_some(rotation),
-            });
-        }
+        self.last_on_ground = Some(on_ground);
+
         // Every tick ends, whatever happened in it.
         self.session.send(Outgoing::TickEnd);
+    }
+
+    /// Picks a hotbar slot and tells the server, which otherwise keeps handing
+    /// out whatever was selected before.
+    pub fn select_slot(&mut self, slot: usize) {
+        if slot >= crate::inventory::HOTBAR.len() || slot == self.inventory.selected {
+            return;
+        }
+        self.inventory.selected = slot;
+        self.session.send(Outgoing::HeldSlot(slot as i32));
+    }
+
+    /// The scroll wheel walks along the hotbar, wrapping at both ends.
+    pub fn scroll(&mut self, delta: f32) {
+        if delta == 0.0 {
+            return;
+        }
+        let slot = self.inventory.scroll(delta.signum() as i32);
+        self.session.send(Outgoing::HeldSlot(slot as i32));
     }
 
     /// Switches between walking and flying, where the server allows it.
@@ -547,4 +624,20 @@ impl neuton_world::BlockView for ChunkWorld<'_> {
             .state_at(x.rem_euclid(16) as usize, y, z.rem_euclid(16) as usize)
             .unwrap_or(neuton_blocks::StateId(0))
     }
+}
+
+/// The hotbar slot a number key picks, if it is one.
+fn hotbar_digit(code: KeyCode) -> Option<usize> {
+    Some(match code {
+        KeyCode::Digit1 | KeyCode::Numpad1 => 0,
+        KeyCode::Digit2 | KeyCode::Numpad2 => 1,
+        KeyCode::Digit3 | KeyCode::Numpad3 => 2,
+        KeyCode::Digit4 | KeyCode::Numpad4 => 3,
+        KeyCode::Digit5 | KeyCode::Numpad5 => 4,
+        KeyCode::Digit6 | KeyCode::Numpad6 => 5,
+        KeyCode::Digit7 | KeyCode::Numpad7 => 6,
+        KeyCode::Digit8 | KeyCode::Numpad8 => 7,
+        KeyCode::Digit9 | KeyCode::Numpad9 => 8,
+        _ => return None,
+    })
 }

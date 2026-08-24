@@ -14,6 +14,7 @@ pub mod ping_task;
 pub mod servers;
 pub mod settings;
 pub mod session;
+pub mod inventory;
 pub mod world_view;
 pub mod theme;
 
@@ -667,7 +668,7 @@ fn draw_into(
     let mut pause_action = PauseAction::None;
     let mut output = state.egui_ctx.run_ui(raw_input, |ui| match &hud {
         // In a world, egui draws only the overlay.
-        Some(hud) => pause_action = overlay(ui, hud),
+        Some(hud) => pause_action = overlay(ui, hud, world.as_deref_mut()),
         None => launcher.update(ui),
     });
     if let Some(w) = world.as_mut() {
@@ -856,13 +857,20 @@ enum PauseAction {
 }
 
 /// The in-world overlay: a crosshair, and the debug panel when it is up.
-fn overlay(ui: &mut egui::Ui, hud: &Hud) -> PauseAction {
+fn overlay(ui: &mut egui::Ui, hud: &Hud, world: Option<&mut WorldView>) -> PauseAction {
     let mut action = PauseAction::None;
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show(ui, |ui| {
             if !hud.paused {
                 crosshair(ui);
+            }
+            if let Some(world) = world {
+                // The hotbar stays up while paused, as it does in the game: the
+                // pause menu sits over the world, it does not replace it.
+                let scale = crate::inventory::interface_scale(ui.clip_rect().size());
+                let WorldView { inventory, art, .. } = world;
+                crate::inventory::hotbar(ui, inventory, art, scale);
             }
 
             let Some(lines) = &hud.debug else { return };
@@ -890,15 +898,8 @@ fn overlay(ui: &mut egui::Ui, hud: &Hud) -> PauseAction {
             });
 
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "WASD move  ·  space/ctrl height  ·  shift sprint  ·  T chat  ·  / command  ·  F3 debug  ·  esc release",
-                    )
-                    .monospace()
-                    .size(11.0)
-                    .color(egui::Color32::from_white_alpha(120)),
-                );
-                ui.add_space(4.0);
+                // Chat sits above the hotbar rather than behind it.
+                ui.add_space(24.0 * crate::inventory::interface_scale(ui.clip_rect().size()));
                 chat_panel(ui, hud);
             });
 

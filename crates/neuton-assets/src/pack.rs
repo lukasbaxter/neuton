@@ -27,6 +27,19 @@ pub struct PackStack {
 }
 
 impl PackStack {
+    /// Opens the vanilla jar and every resource pack the player has installed,
+    /// lowest priority first. `None` if there is no vanilla install to read.
+    pub fn discover(version: &str) -> Option<Self> {
+        let mut packs = Self::new();
+        packs.push(vanilla_jar(version)?).ok()?;
+        if let Some(dir) = resource_pack_dir() {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let _ = packs.push(entry.path());
+            }
+        }
+        Some(packs)
+    }
+
     pub fn new() -> Self {
         Self { sources: Vec::new() }
     }

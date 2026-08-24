@@ -5,6 +5,7 @@
 //! render thread would drop frames for a second solid every time the server
 //! sends a batch. What reaches the main thread is geometry ready to upload.
 
+use neuton_net::items::Stack;
 use neuton_net::{Connection, Event};
 use neuton_render::{Appearance, BiomeTints, BlockTextures, Mesh, Neighbours};
 use neuton_world::Chunk;
@@ -32,6 +33,12 @@ pub enum WorldEvent {
     },
     Chat(Vec<neuton_net::Span>),
     Abilities(neuton_world::physics::Abilities),
+    /// A whole container's contents, the player's own inventory included.
+    Container { window: i32, slots: Vec<Option<Stack>>, carried: Option<Stack> },
+    /// One slot of one container.
+    Slot { window: i32, slot: i32, stack: Option<Stack> },
+    /// The server picked a hotbar slot for us.
+    HeldSlot(i32),
     /// Where the time went while the world arrived.
     Timing(Timing),
     Disconnected(String),
@@ -41,13 +48,16 @@ pub enum WorldEvent {
 pub enum Outgoing {
     Chat(String),
     Command(String),
-    /// What changed since the last update. Both `None` is a movement
-    /// keep-alive.
-    Move { position: Option<[f64; 3]>, rotation: Option<(f32, f32)> },
+    /// What changed since the last update. Both `None` reports only whether
+    /// the player is standing on something, which is a change worth sending on
+    /// its own.
+    Move { position: Option<[f64; 3]>, rotation: Option<(f32, f32)>, on_ground: bool },
     /// Sent once the world has streamed in.
     Loaded,
     /// End of a client tick.
     TickEnd,
+    /// The hotbar slot the player selected.
+    HeldSlot(i32),
 }
 
 /// How the world's arrival was spent, for telling network from client.
@@ -123,11 +133,12 @@ impl WorldSession {
                     let result = match &out {
                         Outgoing::Chat(text) => conn.send_chat(text),
                         Outgoing::Command(text) => conn.send_command(text),
-                        Outgoing::Move { position, rotation } => {
-                            conn.send_movement(*position, *rotation, false)
+                        Outgoing::Move { position, rotation, on_ground } => {
+                            conn.send_movement(*position, *rotation, *on_ground)
                         }
                         Outgoing::Loaded => conn.send_loaded(),
                         Outgoing::TickEnd => conn.send_tick_end(),
+                        Outgoing::HeldSlot(slot) => conn.send_held_slot(*slot),
                     };
                     if let Err(e) = result {
                         let _ = tx.send(WorldEvent::Disconnected(e.to_string()));
@@ -211,6 +222,20 @@ impl WorldSession {
                     }
                     Ok(Event::Teleported { x, y, z, yaw, pitch, relative }) => {
                         let _ = tx.send(WorldEvent::Moved { x, y, z, yaw, pitch, relative });
+                    }
+                    Ok(Event::Container { window, slots, carried, unread }) => {
+                        if let Some(why) = unread {
+                            // Worth saying out loud: it means a slot is missing
+                            // from the screen, and it names what to add.
+                            eprintln!("inventory: stopped reading slots, {why}");
+                        }
+                        let _ = tx.send(WorldEvent::Container { window, slots, carried });
+                    }
+                    Ok(Event::Slot { window, slot, stack }) => {
+                        let _ = tx.send(WorldEvent::Slot { window, slot, stack });
+                    }
+                    Ok(Event::HeldSlot(slot)) => {
+                        let _ = tx.send(WorldEvent::HeldSlot(slot));
                     }
                     Ok(Event::Abilities(abilities)) => {
                         if tx.send(WorldEvent::Abilities(abilities)).is_err() {
