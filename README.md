@@ -49,6 +49,8 @@ Generated files are committed, so a normal build never needs Java.
 ```
 crates/
   neuton-datagen    build tool: vanilla jar -> generated Rust tables
+  neuton-assets     layered resource packs, blockstate and model resolution
+  neuton-render     chunk meshing
   neuton-protocol   wire types, framing, compression, encryption, packet IDs
   neuton-nbt        NBT, with an allocation-free skipper for the chunk path
   neuton-blocks     block + block state tables
@@ -72,8 +74,14 @@ Working, with 57 tests:
   without allocating
 - **Chunks** — paletted containers in all three forms, decoded against the
   dimension shape read from registry data
-- **Join** — full login, configuration and play sequence, covered end to end by an
-  integration test that scripts the server side
+- **Join** — full login, configuration and play sequence, verified against a live
+  server: 401 chunks and 7.3 million blocks decoded, with the column under the
+  player reading back correctly
+- **Meshing** — naive per-face with same-block culling, 92% of faces discarded on
+  real terrain, 0.68 ms per chunk
+- **Resource packs** — layered exactly as Minecraft layers them, with the vanilla
+  jar as the base and every added pack overriding it. Blockstates and model
+  parent chains resolve to per-face textures for all 1,196 blocks
 
 ```
 $ neuton ping play.notmiji.com
@@ -102,6 +110,12 @@ no secret, so nobody but the publisher touches Azure. See
 
 Next: the renderer. Block model baking and atlas stitching move to build time,
 then chunk meshing and the first frame.
+
+## Minecraft assets
+
+neuton ships no Minecraft content. Block data and textures are read at build and
+run time from a copy of the game you already own, which is also what makes
+resource packs work: the vanilla jar is simply the bottom of the pack stack.
 
 ## Requirements
 
