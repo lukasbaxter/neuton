@@ -4,7 +4,7 @@
 //! and reports the round trip. It exists to keep the wire layer honest against
 //! live servers, including ones behind proxies like TCPShield.
 
-use neuton_auth::{CachePath, Origin};
+use neuton_auth::{Accounts, Origin};
 use neuton_net::{Connection, Event};
 use neuton_protocol::{Framed, PROTOCOL_VERSION, Reader, Writer, ids};
 use std::time::{Duration, Instant};
@@ -18,7 +18,9 @@ fn main() -> std::process::ExitCode {
         Some("ping") if args.len() >= 2 => ping(&args[1]),
         Some("join") if args.len() >= 2 => join(&args[1], offline_name(&args)),
         Some("login") => login(),
-        Some("logout") => logout(),
+        Some("logout") => logout(args.get(1).map(String::as_str)),
+        Some("accounts") => accounts(),
+        Some("switch") if args.len() >= 2 => switch(&args[1]),
         Some("whoami") => whoami(),
         Some("info") => {
             info();
@@ -29,8 +31,10 @@ fn main() -> std::process::ExitCode {
                 "usage: neuton ping <host[:port]>   server list ping\n\
                  \x20      neuton join <host[:port]>   connect and stream the world\n\
                  \x20      neuton login               sign in with a Microsoft account\n\
-                 \x20      neuton logout              forget the saved session\n\
-                 \x20      neuton whoami              show the cached session\n\
+                 \x20      neuton accounts            list signed-in accounts\n\
+                 \x20      neuton switch <name>       choose the active account\n\
+                 \x20      neuton logout [name]       sign one account out, or all\n\
+                 \x20      neuton whoami              show the active account\n\
                  \x20      neuton info                build and registry summary"
             );
             return std::process::ExitCode::from(2);
@@ -152,40 +156,96 @@ fn scrape(json: &str, key: &str) -> Option<String> {
 }
 
 
+/// Shows the device code and waits. Deliberately loud: this is the one moment
+/// the client asks something of the user, and a code they miss is a sign-in
+/// that silently times out.
+fn prompt(dc: &neuton_auth::DeviceCode) {
+    println!();
+    println!("  sign in at   {}", dc.verification_uri);
+    println!("  enter code   {}", dc.user_code);
+    println!();
+    if neuton_auth::open_browser(&dc.verification_uri) {
+        println!("  (opened in your browser)");
+    }
+    println!("  use the Microsoft account that owns Minecraft.");
+    println!("  waiting...");
+}
+
 fn login() -> Result<(), Box<dyn std::error::Error>> {
-    let cache = CachePath::default_path()?;
+    let mut store = Accounts::load_default()?;
     let t = Instant::now();
-    let (session, origin) = neuton_auth::authenticate(&cache, true, |dc| {
-        println!("\n  open {}", dc.verification_uri);
-        println!("  enter code  {}\n", dc.user_code);
-        println!("  waiting for approval...");
-    })?;
-    let how = match origin {
-        Origin::Cache => "from cache",
-        Origin::Refreshed => "refreshed",
-        Origin::Interactive => "signed in",
-    };
+    // Always a fresh sign-in: `login` on a machine that already has an account
+    // means "add another", not "reuse the one I have".
+    let session = neuton_auth::sign_in(&mut store, prompt)?;
     println!(
-        "{} as {} ({}) in {:.0} ms",
-        how,
+        "\nsigned in as {} ({:.0} ms)",
         session.profile.name,
-        session.profile.uuid_hyphenated(),
         t.elapsed().as_secs_f64() * 1000.0
     );
-    println!("  session valid for {} h", session.expires_in() / 3600);
+    println!("  uuid      {}", session.profile.uuid_hyphenated());
+    println!("  session   valid for {} h", session.expires_in() / 3600);
+    if store.list().len() > 1 {
+        println!("  accounts  {} signed in, this one is now active", store.list().len());
+    }
     Ok(())
 }
 
-fn logout() -> Result<(), Box<dyn std::error::Error>> {
-    let cache = CachePath::default_path()?;
-    cache.clear()?;
-    println!("cleared {}", cache.path().display());
+fn accounts() -> Result<(), Box<dyn std::error::Error>> {
+    let store = Accounts::load_default()?;
+    if store.is_empty() {
+        println!("no accounts signed in; run `neuton login`");
+        return Ok(());
+    }
+    for a in store.list() {
+        println!(
+            "{} {:<17} {}  {}",
+            if store.is_active(a) { "*" } else { " " },
+            a.profile.name,
+            a.profile.uuid_hyphenated(),
+            if a.is_valid() { "valid".to_string() } else { "needs refresh".to_string() }
+        );
+    }
+    println!("\n{}", store.path().display());
+    Ok(())
+}
+
+fn switch(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut store = Accounts::load_default()?;
+    if !store.set_active(name) {
+        return Err(format!("no account named {name:?}; run `neuton accounts`").into());
+    }
+    store.save()?;
+    println!("active account is now {}", store.active().unwrap().profile.name);
+    Ok(())
+}
+
+fn logout(name: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut store = Accounts::load_default()?;
+    match name {
+        Some(name) => {
+            if !store.remove(name) {
+                return Err(format!("no account named {name:?}").into());
+            }
+            store.save()?;
+            println!("signed {name} out");
+            match store.active() {
+                Some(a) => println!("active account is now {}", a.profile.name),
+                None => println!("no accounts left"),
+            }
+        }
+        None => {
+            let n = store.list().len();
+            store.clear();
+            store.delete_file()?;
+            println!("signed out {n} account{}", if n == 1 { "" } else { "s" });
+        }
+    }
     Ok(())
 }
 
 fn whoami() -> Result<(), Box<dyn std::error::Error>> {
-    let cache = CachePath::default_path()?;
-    match cache.load() {
+    let store = Accounts::load_default()?;
+    match store.active() {
         Some(s) => {
             println!("{} ({})", s.profile.name, s.profile.uuid_hyphenated());
             println!(
@@ -196,7 +256,9 @@ fn whoami() -> Result<(), Box<dyn std::error::Error>> {
                     "expired, will refresh on next use".to_string()
                 }
             );
-            println!("  cache     {}", cache.path().display());
+            if store.list().len() > 1 {
+                println!("  accounts  {} signed in", store.list().len());
+            }
         }
         None => println!("not signed in; run `neuton login`"),
     }
@@ -225,11 +287,9 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
             }
         }
         None => {
-            let cache = CachePath::default_path()?;
+            let mut store = Accounts::load_default()?;
             let t_auth = Instant::now();
-            let (session, origin) = neuton_auth::authenticate(&cache, true, |dc| {
-                println!("  open {} and enter {}", dc.verification_uri, dc.user_code);
-            })?;
+            let (session, origin) = neuton_auth::authenticate(&mut store, true, prompt)?;
             println!(
                 "auth     {} as {} ({:.0} ms)",
                 match origin {
