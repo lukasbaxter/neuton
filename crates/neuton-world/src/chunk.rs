@@ -64,6 +64,47 @@ pub struct BlockEntity {
     pub kind: i32,
 }
 
+/// Sky and block light for a column.
+///
+/// One nibble per block, so a section is 2048 bytes. Sections the server calls
+/// empty carry no array at all, which is most of them: an underground column is
+/// almost entirely dark and an open one is almost entirely full daylight.
+#[derive(Debug, Clone, Default)]
+pub struct Lighting {
+    /// Indexed by section index + 1, because the server sends light for one
+    /// section below the world and one above it.
+    pub sky: Vec<Option<Vec<u8>>>,
+    pub block: Vec<Option<Vec<u8>>>,
+    /// Lowest section the arrays cover, in world section coordinates.
+    pub min_section: i32,
+}
+
+impl Lighting {
+    /// Sky light at a position, 0 to 15.
+    ///
+    /// Defaults to full daylight where the server sent nothing, which is what
+    /// vanilla assumes for a section above the terrain.
+    #[inline]
+    pub fn sky_at(&self, x: usize, y: i32, z: usize) -> u8 {
+        self.sample(&self.sky, x, y, z).unwrap_or(15)
+    }
+
+    /// Block light at a position, 0 to 15. Absent means unlit.
+    #[inline]
+    pub fn block_at(&self, x: usize, y: i32, z: usize) -> u8 {
+        self.sample(&self.block, x, y, z).unwrap_or(0)
+    }
+
+    fn sample(&self, arrays: &[Option<Vec<u8>>], x: usize, y: i32, z: usize) -> Option<u8> {
+        let section = y.div_euclid(16) - self.min_section;
+        let array = arrays.get(usize::try_from(section).ok()?)?.as_ref()?;
+        let index = block_index(x & 15, y.rem_euclid(16) as usize, z & 15);
+        // Two blocks per byte: low nibble first.
+        let byte = *array.get(index / 2)?;
+        Some(if index % 2 == 0 { byte & 0x0F } else { byte >> 4 })
+    }
+}
+
 /// A decoded chunk column.
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -75,6 +116,7 @@ pub struct Chunk {
     pub sections: Vec<Section>,
     pub heightmaps: Vec<Heightmap>,
     pub block_entities: Vec<BlockEntity>,
+    pub lighting: Lighting,
 }
 
 impl Chunk {
@@ -132,7 +174,12 @@ impl Chunk {
             block_entities.push(BlockEntity { x: packed >> 4, z: packed & 0x0F, y, kind });
         }
 
-        Ok(Self { x, z, min_y, sections, heightmaps, block_entities })
+        // Light follows the chunk in the same packet. Skipping it is what makes
+        // a world look uniformly lit at noon with no way to tell inside from
+        // outside.
+        let lighting = read_lighting(r, min_y).unwrap_or_default();
+
+        Ok(Self { x, z, min_y, sections, heightmaps, block_entities, lighting })
     }
 
     /// Block state at a position relative to this column, `y` in world
@@ -155,6 +202,58 @@ impl Chunk {
     pub fn block_count(&self) -> u32 {
         self.sections.iter().map(|s| s.block_count as u32).sum()
     }
+}
+
+/// Reads the light section of a chunk packet.
+///
+/// Four bit sets say which sections carry light and which are known empty, then
+/// the arrays themselves, sky first. A missing array is not an error: it means
+/// the section is uniformly lit or uniformly dark.
+fn read_lighting(r: &mut Reader<'_>, min_y: i32) -> Result<Lighting> {
+    let sky_mask = read_bitset(r)?;
+    let block_mask = read_bitset(r)?;
+    let _empty_sky = read_bitset(r)?;
+    let _empty_block = read_bitset(r)?;
+
+    let sky = read_light_arrays(r, &sky_mask)?;
+    let block = read_light_arrays(r, &block_mask)?;
+
+    Ok(Lighting {
+        sky,
+        block,
+        // The first entry covers the section below the bottom of the world.
+        min_section: min_y.div_euclid(16) - 1,
+    })
+}
+
+fn read_bitset(r: &mut Reader<'_>) -> Result<Vec<u64>> {
+    let words = r.read_varint_len(1024)?;
+    let mut out = Vec::with_capacity(words.min(64));
+    for _ in 0..words {
+        out.push(r.read_u64()?);
+    }
+    Ok(out)
+}
+
+/// Reads one array per set bit, in bit order, into a slot-indexed list.
+fn read_light_arrays(r: &mut Reader<'_>, mask: &[u64]) -> Result<Vec<Option<Vec<u8>>>> {
+    let count = r.read_varint_len(1024)?;
+    let mut arrays = Vec::with_capacity(count);
+    for _ in 0..count {
+        arrays.push(r.read_byte_array()?.to_vec());
+    }
+
+    let slots = mask.len() * 64;
+    let mut out = vec![None; slots];
+    let mut next = arrays.into_iter();
+    for slot in 0..slots {
+        if mask[slot / 64] >> (slot % 64) & 1 == 1
+            && let Some(array) = next.next()
+        {
+            out[slot] = Some(array);
+        }
+    }
+    Ok(out)
 }
 
 /// Scratch space for unpacking a section during meshing.
@@ -200,7 +299,17 @@ mod tests {
         w.write_u64(0);
         w.write_byte_array(sections.as_slice());
         w.write_varint(0); // no block entities
+        write_empty_lighting(&mut w);
         w.into_vec()
+    }
+
+    /// Four empty bit sets and two empty array lists.
+    fn write_empty_lighting(w: &mut Writer) {
+        for _ in 0..4 {
+            w.write_varint(0);
+        }
+        w.write_varint(0);
+        w.write_varint(0);
     }
 
     #[test]
@@ -267,7 +376,8 @@ mod tests {
         // An empty NBT compound: type byte then TAG_End.
         w.write_u8(10);
         w.write_u8(0);
-        // Trailing marker proves the skip consumed exactly the NBT.
+        write_empty_lighting(&mut w);
+        // Trailing marker proves the skip consumed exactly the NBT and light.
         w.write_i32(0x4321);
         let bytes = w.into_vec();
 

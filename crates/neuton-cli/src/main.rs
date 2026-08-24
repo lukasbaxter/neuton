@@ -389,6 +389,7 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
     let mut triangles: u64 = 0;
     let mut vertices: u64 = 0;
     let mut histogram: std::collections::HashMap<&'static str, u64> = Default::default();
+    let mut lit_samples: Vec<String> = Vec::new();
 
     while Instant::now() < deadline {
         match conn.poll()? {
@@ -434,6 +435,20 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
                     }
                 }
 
+                // Light arrives with the chunk; check it decoded to something
+                // that varies rather than a constant.
+                if lit_samples.len() < 6 && c.block_count() > 0 {
+                    let sky = c.lighting.sky_at(8, 70, 8);
+                    let block = c.lighting.block_at(8, 70, 8);
+                    let sections_with_sky = c.lighting.sky.iter().filter(|a| a.is_some()).count();
+                    let sections_with_block =
+                        c.lighting.block.iter().filter(|a| a.is_some()).count();
+                    lit_samples.push(format!(
+                        "    ({:>4},{:>4})  sky={sky:<2} block={block:<2}  arrays: {sections_with_sky} sky, {sections_with_block} block",
+                        c.x, c.z
+                    ));
+                }
+
                 let t = Instant::now();
                 let mesh = neuton_render::build(&c, &appearance, &textures);
                 mesh_time += t.elapsed();
@@ -471,6 +486,13 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
     if !column.is_empty() {
         println!("\nblocks under the player");
         for line in &column {
+            println!("{line}");
+        }
+    }
+
+    if !lit_samples.is_empty() {
+        println!("\nlighting");
+        for line in &lit_samples {
             println!("{line}");
         }
     }
