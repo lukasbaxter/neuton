@@ -11,7 +11,7 @@ use neuton_world::Chunk;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
 /// What the world view needs to know about.
 pub enum WorldEvent {
@@ -20,11 +20,26 @@ pub enum WorldEvent {
     Chunk { x: i32, z: i32, mesh: Box<Mesh> },
     Forget { x: i32, z: i32 },
     Moved { x: f64, y: f64, z: f64, yaw: f32, pitch: f32 },
+    Chat(Vec<neuton_net::Span>),
     Disconnected(String),
+}
+
+/// Something the player asked the connection to send.
+pub enum Outgoing {
+    Chat(String),
+    Command(String),
+    /// What changed since the last update. Both `None` is a movement
+    /// keep-alive.
+    Move { position: Option<[f64; 3]>, rotation: Option<(f32, f32)> },
+    /// Sent once the world has streamed in.
+    Loaded,
+    /// End of a client tick.
+    TickEnd,
 }
 
 pub struct WorldSession {
     rx: Receiver<WorldEvent>,
+    tx_out: Sender<Outgoing>,
     stop: Arc<AtomicBool>,
     pub server: String,
     /// Chunk meshes produced, including re-meshes when a neighbour arrives.
@@ -42,6 +57,7 @@ impl WorldSession {
         tints: Arc<neuton_assets::Tints>,
     ) -> Self {
         let (tx, rx) = channel();
+        let (tx_out, rx_out) = channel::<Outgoing>();
         let stop = Arc::new(AtomicBool::new(false));
         let server = format!("{host}:{port}");
 
@@ -68,6 +84,24 @@ impl WorldSession {
                 if thread_stop.load(Ordering::Relaxed) {
                     return;
                 }
+                // Anything the player typed. Sent before polling, since poll
+                // blocks until the server says something.
+                while let Ok(out) = rx_out.try_recv() {
+                    let result = match &out {
+                        Outgoing::Chat(text) => conn.send_chat(text),
+                        Outgoing::Command(text) => conn.send_command(text),
+                        Outgoing::Move { position, rotation } => {
+                            conn.send_movement(*position, *rotation, false)
+                        }
+                        Outgoing::Loaded => conn.send_loaded(),
+                        Outgoing::TickEnd => conn.send_tick_end(),
+                    };
+                    if let Err(e) = result {
+                        let _ = tx.send(WorldEvent::Disconnected(e.to_string()));
+                        return;
+                    }
+                }
+
                 // Re-mesh anything a new neighbour invalidated, but only once
                 // the incoming burst has been drained: chunks arrive hundreds at
                 // a time, and re-meshing on every single one would do the same
@@ -119,6 +153,11 @@ impl WorldSession {
                     Ok(Event::Teleported { x, y, z, yaw, pitch }) => {
                         let _ = tx.send(WorldEvent::Moved { x, y, z, yaw, pitch });
                     }
+                    Ok(Event::Chat(spans)) => {
+                        if tx.send(WorldEvent::Chat(spans)).is_err() {
+                            return;
+                        }
+                    }
                     Ok(Event::Disconnect(why)) => {
                         let _ = tx.send(WorldEvent::Disconnected(why));
                         return;
@@ -134,11 +173,18 @@ impl WorldSession {
 
         Self {
             rx,
+            tx_out,
             stop,
             server,
             chunks: 0,
             status: "connecting...".to_string(),
         }
+    }
+
+    /// Queues something to send. Dropped silently if the connection is gone,
+    /// which the UI already learns about through a disconnect event.
+    pub fn send(&self, out: Outgoing) {
+        let _ = self.tx_out.send(out);
     }
 
     /// Takes whatever has arrived. Never blocks.

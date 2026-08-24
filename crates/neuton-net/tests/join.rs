@@ -229,3 +229,14 @@ fn a_login_disconnect_is_reported_with_its_reason() {
     };
     assert!(err.to_string().contains("server full"), "got: {err}");
 }
+
+#[test]
+fn a_long_message_is_cut_at_a_character_boundary() {
+    // Not a network test: slicing by bytes would panic mid-character, and a
+    // server rejects an over-long message anyway.
+    let long = "é".repeat(200); // 400 bytes
+    let cut = neuton_net::connection::truncate_for_test(&long, 256);
+    assert!(cut.len() <= 256);
+    assert!(cut.chars().all(|c| c == 'é'));
+    assert_eq!(neuton_net::connection::truncate_for_test("short", 256), "short");
+}
