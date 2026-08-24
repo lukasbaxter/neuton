@@ -22,7 +22,14 @@ pub enum WorldEvent {
     /// already holds them for re-meshing, so sharing costs a pointer.
     Chunk { x: i32, z: i32, mesh: Box<Mesh>, blocks: Arc<Chunk> },
     Forget { x: i32, z: i32 },
-    Moved { x: f64, y: f64, z: f64, yaw: f32, pitch: f32 },
+    Moved {
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+        relative: neuton_net::Relatives,
+    },
     Chat(Vec<neuton_net::Span>),
     Abilities(neuton_world::physics::Abilities),
     /// Where the time went while the world arrived.
@@ -202,8 +209,8 @@ impl WorldSession {
                         meshed_with.remove(&(x, z));
                         let _ = tx.send(WorldEvent::Forget { x, z });
                     }
-                    Ok(Event::Teleported { x, y, z, yaw, pitch }) => {
-                        let _ = tx.send(WorldEvent::Moved { x, y, z, yaw, pitch });
+                    Ok(Event::Teleported { x, y, z, yaw, pitch, relative }) => {
+                        let _ = tx.send(WorldEvent::Moved { x, y, z, yaw, pitch, relative });
                     }
                     Ok(Event::Abilities(abilities)) => {
                         if tx.send(WorldEvent::Abilities(abilities)).is_err() {
