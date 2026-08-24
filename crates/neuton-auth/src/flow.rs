@@ -160,7 +160,20 @@ impl DeviceCodeFlow {
         // The two stages return the same user hash; prefer XSTS's.
         let hash = if xsts_hash.is_empty() { user_hash } else { xsts_hash };
 
-        let (access_token, expires_at) = self.minecraft_token(&hash, &xsts_token)?;
+        let (access_token, expires_at) = match self.minecraft_token(&hash, &xsts_token) {
+            Ok(pair) => pair,
+            Err(e) => {
+                // The Microsoft half of the sign-in succeeded and cost the user
+                // a trip to a browser. If only Mojang refused -- which is a
+                // gate on the application, not on this person, and can be
+                // lifted later -- keep the refresh token so the next attempt
+                // costs nothing.
+                if matches!(e, Error::AppNotApproved) {
+                    crate::pending::save(&refresh_token);
+                }
+                return Err(e);
+            }
+        };
         let profile = self.profile(&access_token)?;
 
         Ok(Session { profile, access_token, expires_at, refresh_token })
@@ -236,6 +249,12 @@ impl DeviceCodeFlow {
         let body: Value = res.body_mut().read_json()?;
         if status >= 400 {
             let message = describe(&body);
+            // Worth having verbatim when an approval is expected but refused:
+            // the difference between "not reviewed" and "reviewed, wrong id" is
+            // only visible in what Mojang actually said.
+            if std::env::var_os("NEUTON_TRACE").is_some() {
+                eprintln!("auth: minecraft services {status}: {body}");
+            }
             // Mojang gates the Minecraft API on a one-time review of the Azure
             // application. The raw message is four words and a link, which
             // reads like a misconfiguration rather than a policy gate.
