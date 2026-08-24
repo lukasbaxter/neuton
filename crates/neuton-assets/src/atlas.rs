@@ -36,9 +36,69 @@ pub struct Atlas {
     pub size: u32,
     /// Edge length of one tile in pixels.
     pub tile: u32,
+    /// Texels of replicated border around each tile.
+    ///
+    /// Without it, mip filtering samples across tile edges and every block in
+    /// the world gets a seam of its neighbour in the atlas along its border.
+    pub gutter: u32,
     uvs: BTreeMap<String, Uv>,
     /// Where an unresolved texture points. Magenta, so a mistake is obvious.
     missing: Uv,
+}
+
+/// Builds the mip chain for an atlas.
+///
+/// Distant blocks alias badly without one: a 16-pixel texture covering two
+/// screen pixels turns into a shimmering moire that crawls as the camera moves.
+///
+/// Downsampling the atlas as a whole is safe here only because tiles are
+/// power-of-two and grid-aligned, so a 2x2 box filter never straddles two
+/// tiles. The chain therefore stops before a tile would shrink below one texel,
+/// which is also the point at which neighbouring textures would start bleeding
+/// into each other.
+pub fn mip_chain(pixels: &[u8], size: u32, gutter: u32) -> Vec<Vec<u8>> {
+    // One level per halving the gutter can absorb. Filtering at level L reaches
+    // 2^L base texels sideways, so a wider gutter buys another level and no
+    // more.
+    let levels = gutter.trailing_zeros() + 1;
+    let mut out = Vec::with_capacity(levels as usize);
+    let mut current = pixels.to_vec();
+    let mut width = size;
+
+    for _ in 1..levels {
+        let half = width / 2;
+        if half == 0 {
+            break;
+        }
+        let mut next = vec![0u8; (half * half * 4) as usize];
+        for y in 0..half {
+            for x in 0..half {
+                // Averaged in premultiplied alpha, so a transparent texel does
+                // not drag its colour into the average and fringe the edges of
+                // cutout textures like leaves.
+                let mut acc = [0.0f32; 4];
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let i = (((y * 2 + dy) * width + x * 2 + dx) * 4) as usize;
+                    let a = current[i + 3] as f32 / 255.0;
+                    acc[0] += current[i] as f32 * a;
+                    acc[1] += current[i + 1] as f32 * a;
+                    acc[2] += current[i + 2] as f32 * a;
+                    acc[3] += a;
+                }
+                let o = ((y * half + x) * 4) as usize;
+                if acc[3] > 0.0 {
+                    next[o] = (acc[0] / acc[3]).round().clamp(0.0, 255.0) as u8;
+                    next[o + 1] = (acc[1] / acc[3]).round().clamp(0.0, 255.0) as u8;
+                    next[o + 2] = (acc[2] / acc[3]).round().clamp(0.0, 255.0) as u8;
+                }
+                next[o + 3] = (acc[3] / 4.0 * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        out.push(next.clone());
+        current = next;
+        width = half;
+    }
+    out
 }
 
 impl Atlas {
@@ -57,6 +117,11 @@ impl Atlas {
 
     pub fn is_empty(&self) -> bool {
         self.uvs.is_empty()
+    }
+
+    /// The mip chain, level 1 downwards. Level 0 is [`Atlas::pixels`].
+    pub fn mips(&self) -> Vec<Vec<u8>> {
+        mip_chain(&self.pixels, self.size, self.gutter)
     }
 
     /// Stitches the given textures, reading each through the pack stack.
@@ -84,32 +149,44 @@ impl Atlas {
             .unwrap_or(16)
             .clamp(16, 256);
 
+        // Each tile sits in a cell with a replicated border, so filtering near
+        // an edge samples more of the same texture rather than the next one
+        // along. The gutter is what makes mipmapping an atlas viable at all.
+        let gutter = (tile / 8).max(1).next_power_of_two();
+        let cell = tile + gutter * 2;
+
         // One extra slot for the missing-texture tile.
         let count = images.len() + 1;
         let per_row = (count as f64).sqrt().ceil() as u32;
-        let size = (per_row * tile).next_power_of_two();
-        let per_row = size / tile;
+        let size = (per_row * cell).next_power_of_two();
+        let per_row = (size / cell).max(1);
 
         let mut pixels = vec![0u8; (size * size * 4) as usize];
         let mut uvs = BTreeMap::new();
 
         let blit = |slot: u32, src: &Image, pixels: &mut Vec<u8>| -> Uv {
-            let (tx, ty) = (slot % per_row, slot / per_row);
-            let (ox, oy) = (tx * tile, ty * tile);
-            for y in 0..tile {
-                for x in 0..tile {
+            let (sx_tile, sy_tile) = (slot % per_row, slot / per_row);
+            let (cx, cy) = (sx_tile * cell, sy_tile * cell);
+            let (ox, oy) = (cx + gutter, cy + gutter);
+
+            for y in 0..cell {
+                for x in 0..cell {
+                    // Clamped to the tile, which writes the texture and fills
+                    // the border with its own edge texels in one pass.
+                    let tx = (x as i32 - gutter as i32).clamp(0, tile as i32 - 1) as u32;
+                    let ty = (y as i32 - gutter as i32).clamp(0, tile as i32 - 1) as u32;
                     // Nearest-neighbour: sharp edges matter more than smooth
                     // ones on 16-pixel textures.
-                    let sx = x * src.frame_size() / tile;
-                    let sy = y * src.frame_size() / tile;
+                    let sx = tx * src.frame_size() / tile;
+                    let sy = ty * src.frame_size() / tile;
                     let s = ((sy * src.width + sx) * 4) as usize;
-                    let d = (((oy + y) * size + ox + x) * 4) as usize;
+                    let d = (((cy + y) * size + cx + x) * 4) as usize;
                     pixels[d..d + 4].copy_from_slice(&src.rgba[s..s + 4]);
                 }
             }
-            // Half a texel in from each edge. Sampling exactly on the boundary
-            // bleeds the neighbouring tile in at distance, which shows up as a
-            // bright seam along every block edge.
+
+            // Half a texel in, so bilinear at level 0 stays inside the tile.
+            // The gutter covers the coarser levels.
             let inset = 0.5 / size as f32;
             Uv {
                 min: [ox as f32 / size as f32 + inset, oy as f32 / size as f32 + inset],
@@ -130,7 +207,7 @@ impl Atlas {
         let missing_image = missing_tile(tile);
         let missing = blit(images.len() as u32, &missing_image, &mut pixels);
 
-        Atlas { pixels, size, tile, uvs, missing }
+        Atlas { pixels, size, tile, gutter, uvs, missing }
     }
 }
 
@@ -371,6 +448,75 @@ mod tests {
         let atlas = Atlas::stitch(&mut packs, &paths);
         assert!(atlas.contains("good.png"));
         assert!(!atlas.contains("bad.png"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mip_chain_is_bounded_by_the_gutter() {
+        // A bilinear tap at level L reaches 2^L base texels sideways, so a
+        // gutter of 4 supports levels 1 and 2 and no more.
+        let pixels = vec![128u8; 64 * 64 * 4];
+        let mips = mip_chain(&pixels, 64, 4);
+        assert_eq!(mips.len(), 2);
+        assert_eq!(mips[0].len(), 32 * 32 * 4);
+        assert_eq!(mips[1].len(), 16 * 16 * 4);
+
+        // A narrower gutter buys fewer levels, and none at all is honest about
+        // it rather than bleeding.
+        assert_eq!(mip_chain(&pixels, 64, 2).len(), 1);
+        assert!(mip_chain(&pixels, 64, 1).is_empty());
+    }
+
+    #[test]
+    fn a_flat_colour_survives_downsampling() {
+        let mut pixels = Vec::new();
+        for _ in 0..(32 * 32) {
+            pixels.extend_from_slice(&[10, 200, 30, 255]);
+        }
+        let mips = mip_chain(&pixels, 32, 4);
+        for level in &mips {
+            for px in level.chunks_exact(4) {
+                assert_eq!(px, [10, 200, 30, 255], "flat colour drifted");
+            }
+        }
+    }
+
+    #[test]
+    fn transparent_texels_do_not_bleed_their_colour() {
+        // A 4x4 whose top-left 2x2 quad holds one opaque green texel and three
+        // fully transparent black ones. Averaging without premultiplying would
+        // give a quarter-strength green, which is the fringe that shows up
+        // around leaves and glass at distance.
+        let mut pixels = vec![0u8; 4 * 4 * 4];
+        pixels[0..4].copy_from_slice(&[0, 255, 0, 255]);
+        let mips = mip_chain(&pixels, 4, 2);
+        assert_eq!(mips.len(), 1, "a two-texel gutter allows one level");
+
+        assert_eq!(&mips[0][0..3], &[0, 255, 0], "colour was dragged towards black");
+        // Alpha still averages: the texel ends up a quarter covered.
+        assert_eq!(mips[0][3], 64);
+    }
+
+    #[test]
+    fn tiles_are_surrounded_by_their_own_edge_texels() {
+        // The gutter must repeat the tile, not show whatever is next door.
+        let (dir, mut packs) = pack("gutter", &[
+            ("a.png", png(16, 16, [255, 0, 0])),
+            ("b.png", png(16, 16, [0, 0, 255])),
+        ]);
+        let paths = vec!["a.png".to_string(), "b.png".to_string()];
+        let atlas = Atlas::stitch(&mut packs, &paths);
+        assert!(atlas.gutter >= 1);
+
+        // Walk a row through the first tile and its border; every texel should
+        // be that tile's colour, never the other one's.
+        let uv = atlas.uv("a.png");
+        let y = ((uv.min[1] + uv.max[1]) / 2.0 * atlas.size as f32) as u32;
+        let x0 = (uv.min[0] * atlas.size as f32) as u32 - atlas.gutter;
+        for x in x0..x0 + atlas.tile + atlas.gutter {
+            let i = ((y * atlas.size + x) * 4) as usize;
+            assert_eq!(&atlas.pixels[i..i + 3], &[255, 0, 0], "bled at x={x}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
