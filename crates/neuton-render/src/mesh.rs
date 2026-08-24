@@ -149,6 +149,25 @@ impl Mesh {
 /// makes a Minecraft world read as solid rather than as flat coloured planes.
 const AO_LEVELS: [f32; 4] = [0.46, 0.66, 0.84, 1.0];
 
+/// Brightness of a light level, on vanilla's curve.
+///
+/// Deliberately not linear: level 7 is about a fifth as bright as level 15, not
+/// half, which is why a torch lights a small bright pool rather than a large
+/// dim one.
+#[inline]
+fn light_brightness(level: f32) -> f32 {
+    let f = (level / 15.0).clamp(0.0, 1.0);
+    // A floor, so an unlit cave is very dark but not featureless black.
+    (f / (4.0 - 3.0 * f)).max(0.05)
+}
+
+/// Combines sky and block light the way the game does: whichever is brighter
+/// wins, rather than the two adding up.
+#[inline]
+fn combine_light(sky: f32, block: f32, daylight: f32) -> f32 {
+    (sky * daylight).max(block)
+}
+
 /// Occlusion for one corner, from the three blocks around it.
 ///
 /// Two sides touching means the corner is fully enclosed however the diagonal
@@ -183,6 +202,16 @@ pub trait BlockAppearance {
 
 /// Builds the mesh for one chunk column.
 pub fn build(chunk: &Chunk, look: &dyn BlockAppearance, textures: &BlockTextures) -> Mesh {
+    build_at(chunk, look, textures, 1.0)
+}
+
+/// Builds a chunk's mesh at a given daylight level, 0 for night and 1 for noon.
+pub fn build_at(
+    chunk: &Chunk,
+    look: &dyn BlockAppearance,
+    textures: &BlockTextures,
+    daylight: f32,
+) -> Mesh {
     let mut mesh = Mesh::default();
     let sections = chunk.sections.len();
 
@@ -229,7 +258,9 @@ pub fn build(chunk: &Chunk, look: &dyn BlockAppearance, textures: &BlockTextures
                 }
                 let base = [x as f32, (y + chunk.min_y) as f32, z as f32];
                 for element in &model.elements {
-                    push_element(&mut mesh, base, element, state, look, &at, x, y, z);
+                    push_element(
+                        &mut mesh, base, element, state, look, &at, x, y, z, chunk, daylight,
+                    );
                 }
             }
         }
@@ -248,7 +279,12 @@ fn push_element(
     x: i32,
     y: i32,
     z: i32,
+    chunk: &Chunk,
+    daylight: f32,
 ) {
+    // World Y, since light is indexed in world coordinates while the block loop
+    // counts from the bottom of the column.
+    let world_y = y + chunk.min_y;
     for index in 0..6u8 {
         let Some(face) = element.faces[index as usize] else { continue };
 
@@ -276,29 +312,69 @@ fn push_element(
 
         let shade = dir.shade();
 
-        // Ambient occlusion, on full cubes only. A partial box sits inside its
-        // cell, so the neighbours a corner would sample are not the ones
-        // actually touching it, and the result reads as dirt rather than depth.
-        let ao = if element.full_cube {
-            let (normal, u_axis, v_axis, signs) = dir.ao_basis();
-            let solid = |offset: [i32; 3]| {
-                look.is_opaque(StateId(at(x + offset[0], y + offset[1], z + offset[2])))
-            };
-            let mut out = [3usize; 4];
-            for (i, (su, sv)) in signs.iter().enumerate() {
-                let mut side1 = normal;
-                side1[u_axis] += su;
-                let mut side2 = normal;
-                side2[v_axis] += sv;
-                let mut diagonal = normal;
-                diagonal[u_axis] += su;
-                diagonal[v_axis] += sv;
-                out[i] = corner_ao(solid(side1), solid(side2), solid(diagonal));
-            }
-            out
-        } else {
-            [3; 4]
+        let (normal, u_axis, v_axis, signs) = dir.ao_basis();
+        let solid = |offset: [i32; 3]| {
+            look.is_opaque(StateId(at(x + offset[0], y + offset[1], z + offset[2])))
         };
+        // Light of the cell a face looks into, not of the block itself: a lit
+        // surface is lit by what is in front of it.
+        let light_of = |offset: [i32; 3]| {
+            let (px, py, pz) = (x + offset[0], world_y + offset[1], z + offset[2]);
+            if !(0..16).contains(&px) || !(0..16).contains(&pz) {
+                // Outside the column, so the neighbour's light is unknown.
+                // Daylight is the better guess than darkness, which would draw
+                // a black seam down every chunk border.
+                return (15.0, 0.0);
+            }
+            (
+                chunk.lighting.sky_at(px as usize, py, pz as usize) as f32,
+                chunk.lighting.block_at(px as usize, py, pz as usize) as f32,
+            )
+        };
+
+        // Ambient occlusion and smooth lighting share the same four cells
+        // around each corner: how many are solid decides the occlusion, and
+        // their average light decides the brightness. Vanilla does both from
+        // the same neighbourhood, which is why they agree at every seam.
+        let mut ao = [3usize; 4];
+        let mut lit = [1.0f32; 4];
+        for (i, (su, sv)) in signs.iter().enumerate() {
+            let mut side1 = normal;
+            side1[u_axis] += su;
+            let mut side2 = normal;
+            side2[v_axis] += sv;
+            let mut diagonal = normal;
+            diagonal[u_axis] += su;
+            diagonal[v_axis] += sv;
+
+            if element.full_cube {
+                // A partial box sits inside its cell, so the neighbours a
+                // corner would sample are not the ones touching it, and the
+                // occlusion reads as dirt rather than depth.
+                ao[i] = corner_ao(solid(side1), solid(side2), solid(diagonal));
+            }
+
+            // Averaged over the cells that are not solid; a solid one has no
+            // light of its own to contribute and would drag the corner dark.
+            let mut sky_sum = 0.0;
+            let mut block_sum = 0.0;
+            let mut count = 0.0;
+            for offset in [normal, side1, side2, diagonal] {
+                if solid(offset) {
+                    continue;
+                }
+                let (sky, block) = light_of(offset);
+                sky_sum += sky;
+                block_sum += block;
+                count += 1.0;
+            }
+            lit[i] = if count > 0.0 {
+                light_brightness(combine_light(sky_sum / count, block_sum / count, daylight))
+            } else {
+                let (sky, block) = light_of(normal);
+                light_brightness(combine_light(sky, block, daylight))
+            };
+        }
 
         let start = mesh.vertices.len() as u32;
         for (i, (corner, uv)) in dir.corners(from, to).iter().zip(face.uv.corners()).enumerate() {
@@ -306,7 +382,7 @@ fn push_element(
                 position: *corner,
                 uv,
                 tint: face.tint,
-                light: shade * AO_LEVELS[ao[i]],
+                light: shade * AO_LEVELS[ao[i]] * lit[i],
             });
         }
 
@@ -382,6 +458,7 @@ mod tests {
                 .collect(),
             heightmaps: Vec::new(),
             block_entities: Vec::new(),
+            lighting: Default::default(),
         }
     }
 
@@ -436,7 +513,15 @@ mod tests {
                 },
             });
         }
-        Chunk { x: 0, z: 0, min_y: 0, sections: out, heightmaps: Vec::new(), block_entities: Vec::new() }
+        Chunk {
+            x: 0,
+            z: 0,
+            min_y: 0,
+            sections: out,
+            heightmaps: Vec::new(),
+            block_entities: Vec::new(),
+            lighting: Default::default(),
+        }
     }
 
     fn stone() -> u32 {
@@ -474,7 +559,30 @@ mod tests {
         let mut lights: Vec<f32> = mesh.vertices.iter().map(|v| v.light).collect();
         lights.sort_by(|a, b| a.partial_cmp(b).unwrap());
         lights.dedup();
+        // No light arrays means full daylight, so brightness is 1 and only the
+        // face direction varies.
         assert_eq!(lights, vec![0.5, 0.6, 0.8, 1.0]);
+    }
+
+    #[test]
+    fn light_levels_follow_a_curve_rather_than_a_line() {
+        assert!((light_brightness(15.0) - 1.0).abs() < 1e-6);
+        // Half-way is much less than half as bright.
+        assert!(light_brightness(7.5) < 0.35, "{}", light_brightness(7.5));
+        // Never fully black, so an unlit cave still has shape.
+        assert!(light_brightness(0.0) > 0.0);
+        assert!(light_brightness(-5.0) > 0.0, "clamps below zero");
+        assert!(light_brightness(99.0) <= 1.0, "clamps above fifteen");
+    }
+
+    #[test]
+    fn sky_and_block_light_do_not_add_up() {
+        // Two dim sources stay dim; the brighter one wins.
+        assert_eq!(combine_light(7.0, 7.0, 1.0), 7.0);
+        assert_eq!(combine_light(4.0, 12.0, 1.0), 12.0);
+        // At night the sky contributes nothing and torches carry the world.
+        assert_eq!(combine_light(15.0, 6.0, 0.0), 6.0);
+        assert_eq!(combine_light(15.0, 0.0, 1.0), 15.0);
     }
 
     #[test]
