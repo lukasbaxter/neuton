@@ -7,4 +7,4 @@ pub mod chunk;
 pub mod palette;
 
 pub use chunk::{BlockEntity, Chunk, Heightmap, Section, SectionScratch};
-pub use palette::{BIOME_VOLUME, PalettedContainer, Palette, SECTION_VOLUME, block_index};
+pub use palette::{BIOME_VOLUME, Palette, PalettedContainer, SECTION_VOLUME, block_index, words_for};

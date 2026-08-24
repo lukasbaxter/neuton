@@ -12,6 +12,9 @@ pub struct Section {
     /// Zero means the section is empty and meshing can skip it outright,
     /// without unpacking anything.
     pub block_count: u16,
+    /// Blocks holding fluid. Sent since 26.x, and needed by the mesher to know
+    /// whether a section has any water surface to build.
+    pub fluid_count: u16,
     pub blocks: PalettedContainer,
     pub biomes: PalettedContainer,
 }
@@ -19,9 +22,14 @@ pub struct Section {
 impl Section {
     pub fn read(r: &mut Reader<'_>) -> Result<Self> {
         let block_count = r.read_i16()? as u16;
+        // Two shorts, not one: LevelChunkSection writes nonEmptyBlockCount and
+        // then fluidCount. Missing the second shifts everything after it by two
+        // bytes, which shows up several sections later as an impossible
+        // bits-per-entry rather than as a clean error here.
+        let fluid_count = r.read_i16()? as u16;
         let blocks = PalettedContainer::read_blocks(r)?;
         let biomes = PalettedContainer::read_biomes(r)?;
-        Ok(Self { block_count, blocks, biomes })
+        Ok(Self { block_count, fluid_count, blocks, biomes })
     }
 
     /// True if nothing in this section can produce geometry.
@@ -173,14 +181,13 @@ mod tests {
         for i in 0..n {
             let state = states[i % states.len()];
             sections.write_i16(if state == 0 { 0 } else { 4096 });
+            sections.write_i16(0); // fluid count
             // Blocks: single-valued palette.
             sections.write_u8(0);
             sections.write_varint(state as i32);
-            sections.write_varint(0);
             // Biomes: single-valued palette.
             sections.write_u8(0);
             sections.write_varint(1);
-            sections.write_varint(0);
         }
 
         let mut w = Writer::new();
@@ -242,12 +249,11 @@ mod tests {
     fn block_entity_nbt_is_stepped_over_correctly() {
         let mut sections = Writer::new();
         sections.write_i16(0);
+        sections.write_i16(0); // fluid count
         sections.write_u8(0);
-        sections.write_varint(0);
         sections.write_varint(0);
         sections.write_u8(0);
         sections.write_varint(1);
-        sections.write_varint(0);
 
         let mut w = Writer::new();
         w.write_i32(0);

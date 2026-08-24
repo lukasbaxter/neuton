@@ -70,9 +70,10 @@ impl PalettedContainer {
             Palette::Direct
         };
 
-        // The data array is always length-prefixed, including the zero-length
-        // array that follows a single-valued palette.
-        let words = r.read_varint_len(1 << 20)?;
+        // Vanilla writes this with writeFixedSizeLongArray: no length prefix.
+        // The word count is implied by the bits-per-entry and the cell count,
+        // and a single-valued container carries no words at all.
+        let words = words_for(bits, len);
         let mut data = Vec::with_capacity(words.min(4096));
         for _ in 0..words {
             data.push(r.read_u64()?);
@@ -176,6 +177,22 @@ impl PalettedContainer {
     }
 }
 
+/// Number of `u64` words a container occupies.
+///
+/// Entries never straddle a word, so each word holds `64 / bits` of them and
+/// the remainder is padding.
+#[inline]
+pub const fn words_for(bits: u8, len: usize) -> usize {
+    // A desynchronised stream shows up here as a nonsense bits value, and
+    // 64 / bits would then be zero. Report nothing rather than dividing by it;
+    // the caller fails on the short read instead of panicking mid-frame.
+    if bits == 0 || bits > 64 {
+        return 0;
+    }
+    let per_word = 64 / bits as usize;
+    len.div_ceil(per_word)
+}
+
 /// Index of a block within a section, in the order the wire packs them.
 ///
 /// The ordering is y, then z, then x, so x is contiguous. Meshing loops should
@@ -215,7 +232,7 @@ mod tests {
             }
             None => {}
         }
-        w.write_varint(data.len() as i32);
+        // No length prefix: the reader derives the word count.
         for &d in data {
             w.write_u64(d);
         }
@@ -305,11 +322,25 @@ mod tests {
     #[test]
     fn a_truncated_data_array_is_reported_not_panicked() {
         let palette = [0u32, 1];
-        // Claims 4 bits per entry but supplies a single word.
+        // Claims 4 bits per entry but supplies a single word, so the read
+        // itself runs out before the container is complete.
         let bytes = encode(4, Some(&palette), &[0u64]);
-        let c = PalettedContainer::read_blocks(&mut Reader::new(&bytes)).unwrap();
-        let mut out = vec![0u32; SECTION_VOLUME];
-        assert!(!c.unpack_into(&mut out), "short data must fail rather than read past the end");
+        assert!(PalettedContainer::read_blocks(&mut Reader::new(&bytes)).is_err());
+    }
+
+    #[test]
+    fn word_counts_match_the_wire_format() {
+        // 4 bits: 16 per word, 4096 cells -> 256 words.
+        assert_eq!(words_for(4, SECTION_VOLUME), 256);
+        // 5 bits: 12 per word with 4 bits padding -> 342 words.
+        assert_eq!(words_for(5, SECTION_VOLUME), 342);
+        // 15 bits: 4 per word -> 1024 words.
+        assert_eq!(words_for(15, SECTION_VOLUME), 1024);
+        // Single-valued containers carry no data at all.
+        assert_eq!(words_for(0, SECTION_VOLUME), 0);
+        assert_eq!(words_for(3, BIOME_VOLUME), 4);
+        // An impossible width must not divide by zero.
+        assert_eq!(words_for(200, SECTION_VOLUME), 0);
     }
 
     #[test]

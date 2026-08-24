@@ -23,6 +23,11 @@ pub enum Error {
     Disconnected(String),
     /// The server did something the state machine does not allow here.
     Unexpected { state: &'static str, packet: String },
+    /// A packet we recognise but could not decode.
+    ///
+    /// Names the packet, because "unexpected end of buffer" on its own gives no
+    /// clue which of a hundred and forty decoders is wrong.
+    Decode { packet: &'static str, id: i32, len: usize, source: neuton_protocol::Error },
 }
 
 impl std::fmt::Display for Error {
@@ -34,6 +39,9 @@ impl std::fmt::Display for Error {
             Error::Disconnected(why) => write!(f, "disconnected: {why}"),
             Error::Unexpected { state, packet } => {
                 write!(f, "unexpected {packet} during {state}")
+            }
+            Error::Decode { packet, id, len, source } => {
+                write!(f, "could not decode {packet} (id {id}, {len} bytes): {source}")
             }
         }
     }
@@ -328,10 +336,19 @@ impl Connection {
             let (id, body) = self.read()?;
             let mut r = Reader::new(&body);
             let len = body.len();
+            let named = |source| Error::Decode {
+                packet: ids::play::clientbound::name(id).unwrap_or("unknown"),
+                id,
+                len,
+                source,
+            };
 
             match id {
                 ids::play::clientbound::LOGIN => {
-                    let entity_id = self.read_join(&mut r)?;
+                    let entity_id = self.read_join(&mut r).map_err(|e| match e {
+                        Error::Protocol(p) => named(p),
+                        other => other,
+                    })?;
                     self.stats.join_ms = self.started.elapsed().as_secs_f64() * 1000.0;
                     return Ok(Event::Joined {
                         entity_id,
@@ -339,33 +356,31 @@ impl Connection {
                     });
                 }
                 ids::play::clientbound::LEVEL_CHUNK_WITH_LIGHT => {
-                    let chunk = Chunk::read(
-                        &mut r,
-                        self.dimension.section_count(),
-                        self.dimension.min_y,
-                    )?;
+                    let chunk =
+                        Chunk::read(&mut r, self.dimension.section_count(), self.dimension.min_y)
+                            .map_err(named)?;
                     self.stats.chunks += 1;
                     self.stats.blocks += chunk.block_count() as u64;
                     return Ok(Event::Chunk(Box::new(chunk)));
                 }
                 ids::play::clientbound::FORGET_LEVEL_CHUNK => {
                     // Packed as z in the high half, x in the low half.
-                    let packed = r.read_i64()?;
+                    let packed = r.read_i64().map_err(named)?;
                     return Ok(Event::ChunkForgotten {
                         x: packed as i32,
                         z: (packed >> 32) as i32,
                     });
                 }
                 ids::play::clientbound::PLAYER_POSITION => {
-                    let teleport_id = r.read_varint()?;
-                    let x = r.read_f64()?;
-                    let y = r.read_f64()?;
-                    let z = r.read_f64()?;
-                    let _dx = r.read_f64()?;
-                    let _dy = r.read_f64()?;
-                    let _dz = r.read_f64()?;
-                    let yaw = r.read_f32()?;
-                    let pitch = r.read_f32()?;
+                    let teleport_id = r.read_varint().map_err(named)?;
+                    let x = r.read_f64().map_err(named)?;
+                    let y = r.read_f64().map_err(named)?;
+                    let z = r.read_f64().map_err(named)?;
+                    let _dx = r.read_f64().map_err(named)?;
+                    let _dy = r.read_f64().map_err(named)?;
+                    let _dz = r.read_f64().map_err(named)?;
+                    let yaw = r.read_f32().map_err(named)?;
+                    let pitch = r.read_f32().map_err(named)?;
 
                     // Not acknowledging a teleport gets the connection dropped,
                     // so this is answered here rather than left to the caller.
@@ -375,14 +390,14 @@ impl Connection {
                     return Ok(Event::Teleported { x, y, z, yaw, pitch });
                 }
                 ids::play::clientbound::KEEP_ALIVE => {
-                    let token = r.read_i64()?;
+                    let token = r.read_i64().map_err(named)?;
                     let mut w = Writer::new();
                     w.write_i64(token);
                     self.framed.write_packet(ids::play::serverbound::KEEP_ALIVE, &w)?;
                     return Ok(Event::KeepAlive);
                 }
                 ids::play::clientbound::PING => {
-                    let token = r.read_i32()?;
+                    let token = r.read_i32().map_err(named)?;
                     let mut w = Writer::new();
                     w.write_i32(token);
                     self.framed.write_packet(ids::play::serverbound::PONG, &w)?;

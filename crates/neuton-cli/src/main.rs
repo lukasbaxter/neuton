@@ -316,6 +316,11 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut ignored: std::collections::BTreeMap<&'static str, u32> = Default::default();
+    // Where the server put us, and the column of blocks there once its chunk
+    // arrives. Reading real terrain back as block names is the only end-to-end
+    // check that palettes, state IDs and the generated tables all agree.
+    let mut spawn: Option<(f64, f64, f64)> = None;
+    let mut column: Vec<String> = Vec::new();
 
     while Instant::now() < deadline {
         match conn.poll()? {
@@ -328,6 +333,24 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
                 );
             }
             Event::Chunk(c) => {
+                // Is this the column the player is standing in?
+                if let Some((px, py, pz)) = spawn
+                    && column.is_empty()
+                    && c.x == (px.floor() as i32).div_euclid(16)
+                    && c.z == (pz.floor() as i32).div_euclid(16)
+                {
+                    let (lx, lz) =
+                        ((px.floor() as i32).rem_euclid(16) as usize, (pz.floor() as i32).rem_euclid(16) as usize);
+                    let feet = py.floor() as i32;
+                    for y in (feet - 4..=feet + 2).rev() {
+                        let name = c
+                            .state_at(lx, y, lz)
+                            .and_then(|s| s.block())
+                            .map(|b| b.name().trim_start_matches("minecraft:").to_string())
+                            .unwrap_or_else(|| "?".into());
+                        column.push(format!("    y={y:<4} {name}"));
+                    }
+                }
                 if conn.stats.chunks <= 3 || conn.stats.chunks % 100 == 0 {
                     println!(
                         "chunk    #{} at ({}, {})  {} non-air, {} sections used",
@@ -340,7 +363,10 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
                 }
             }
             Event::Teleported { x, y, z, .. } => {
-                println!("teleport {x:.1} {y:.1} {z:.1}");
+                if spawn.is_none() {
+                    println!("teleport {x:.1} {y:.1} {z:.1}");
+                }
+                spawn = Some((x, y, z));
             }
             Event::Disconnect(why) => {
                 println!("kicked   {why}");
@@ -350,6 +376,13 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
                 *ignored.entry(name).or_default() += 1;
             }
             _ => {}
+        }
+    }
+
+    if !column.is_empty() {
+        println!("\nblocks under the player");
+        for line in &column {
+            println!("{line}");
         }
     }
 
