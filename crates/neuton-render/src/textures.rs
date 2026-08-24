@@ -33,12 +33,28 @@ pub struct BakedElement {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BakedModel {
     pub elements: Vec<BakedElement>,
+    /// True for water and lava.
+    ///
+    /// Fluids have no model in the game files at all: `block/water.json`
+    /// declares a particle texture and nothing else, because vanilla draws them
+    /// with a dedicated renderer that varies their height. Without a special
+    /// case an ocean simply does not exist.
+    pub fluid: bool,
 }
 
 impl BakedModel {
     pub fn is_empty(&self) -> bool {
         self.elements.is_empty()
     }
+}
+
+/// What one state resolved to before the atlas existed.
+#[derive(Clone)]
+struct Pending {
+    model: Option<BlockModel>,
+    tint: TintSource,
+    /// The still texture, for water and lava.
+    fluid: Option<String>,
 }
 
 /// Baked models for every block state.
@@ -59,19 +75,29 @@ impl BlockTextures {
         // Two passes: the atlas cannot be stitched before the textures it needs
         // are known, and faces cannot be baked before the atlas exists.
         let mut wanted = std::collections::BTreeSet::new();
-        let mut raw: Vec<Option<(BlockModel, TintSource)>> = vec![None; STATE_COUNT];
+        let mut raw: Vec<Option<Pending>> = vec![None; STATE_COUNT];
 
         for i in 0..BLOCK_COUNT {
             let block = neuton_blocks::BlockId(i);
             let tint = neuton_assets::tint::source_for(block.name());
+            // Checked per block rather than per state: a fluid has no model to
+            // resolve, so it would otherwise be dropped before it is ever baked.
+            let fluid = fluid_texture(block.name());
+            if let Some(texture) = &fluid {
+                wanted.insert(texture.clone());
+            }
+
             let b = block.get();
             for id in b.first_state.0..b.first_state.0 + b.state_count {
                 let state = StateId(id);
-                if let Some(model) = resolver.model(packs, block.name(), state.variant_key()) {
+                let model = resolver.model(packs, block.name(), state.variant_key());
+                if let Some(model) = &model {
                     for path in model.textures() {
                         wanted.insert(path.to_string());
                     }
-                    raw[id as usize] = Some((model, tint));
+                }
+                if model.is_some() || fluid.is_some() {
+                    raw[id as usize] = Some(Pending { model, tint, fluid: fluid.clone() });
                 }
             }
         }
@@ -84,8 +110,13 @@ impl BlockTextures {
         let mut index = vec![0u16; STATE_COUNT];
 
         for (id, entry) in raw.iter().enumerate() {
-            let Some((model, tint_source)) = entry else { continue };
-            let baked = bake(model, &atlas, tints.get(*tint_source));
+            let Some(pending) = entry else { continue };
+            let tint = tints.get(pending.tint);
+            let baked = match (&pending.fluid, &pending.model) {
+                (Some(texture), _) => bake_fluid(texture, &atlas, tint),
+                (None, Some(model)) => bake(model, &atlas, tint),
+                (None, None) => continue,
+            };
             // Keyed on a cheap textual form: the values are copies of the same
             // few shapes, and f32 is not hashable.
             let key = fingerprint(&baked);
@@ -147,7 +178,50 @@ fn bake(model: &BlockModel, atlas: &Atlas, tint: [f32; 3]) -> BakedModel {
             }
         })
         .collect();
-    BakedModel { elements }
+    BakedModel { elements, fluid: false }
+}
+
+/// The still texture a fluid draws with, or `None` for anything else.
+fn fluid_texture(block: &str) -> Option<String> {
+    let name = block.trim_start_matches("minecraft:");
+    let still = match name {
+        "water" | "bubble_column" => "water_still",
+        "lava" => "lava_still",
+        _ => return None,
+    };
+    Some(format!("assets/minecraft/textures/block/{still}.png"))
+}
+
+/// Builds the cube a fluid draws as.
+///
+/// A full cube here; the mesher lowers the top face when there is air above,
+/// which is the only place the neighbour needed to decide that is available.
+fn bake_fluid(texture: &str, atlas: &Atlas, tint: [f32; 3]) -> BakedModel {
+    let face = Some(BakedFace {
+        uv: atlas.uv(texture),
+        tint,
+        // Every face can be hidden, including by another fluid block: an ocean
+        // is a surface, not a volume.
+        cullface: None,
+    });
+    let mut faces: [Option<BakedFace>; 6] = Default::default();
+    for (i, slot) in faces.iter_mut().enumerate() {
+        *slot = face;
+        // Only the sides and bottom cull against a neighbour; the top is
+        // handled by the mesher, which knows whether this block is submerged.
+        if let Some(f) = slot.as_mut() {
+            f.cullface = Some(i as u8);
+        }
+    }
+    BakedModel {
+        elements: vec![BakedElement {
+            from: [0.0, 0.0, 0.0],
+            to: [1.0, 1.0, 1.0],
+            faces,
+            full_cube: true,
+        }],
+        fluid: true,
+    }
 }
 
 /// Rotates a box and its faces 90 degrees about the X axis.
@@ -293,6 +367,27 @@ mod tests {
         // Lying along X: the ends move to west and east.
         assert_eq!(face_texture("axis=x", 4), face_texture("axis=x", 5));
         assert_eq!(face_texture("axis=x", 4), face_texture("axis=y", 1));
+    }
+
+    #[test]
+    fn fluids_get_geometry_despite_having_no_model() {
+        let Some(mut packs) = packs() else { return };
+        let t = BlockTextures::build(&mut packs);
+
+        let water = neuton_blocks::by_name("minecraft:water").unwrap().get().default_state;
+        let m = t.model(water);
+        assert!(m.fluid, "water must be recognised as a fluid");
+        assert_eq!(m.elements.len(), 1, "water has no model, so one is synthesised");
+        // Tinted blue, or an ocean comes out grey.
+        let face = m.elements[0].faces[1].expect("water has a top face");
+        assert!(face.tint[2] > face.tint[0], "water not blue: {:?}", face.tint);
+
+        let lava = neuton_blocks::by_name("minecraft:lava").unwrap().get().default_state;
+        assert!(t.model(lava).fluid);
+
+        // And nothing else is claimed as a fluid.
+        let stone = neuton_blocks::by_name("minecraft:stone").unwrap().get().default_state;
+        assert!(!t.model(stone).fluid);
     }
 
     #[test]

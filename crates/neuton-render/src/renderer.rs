@@ -20,6 +20,9 @@ struct ChunkBuffers {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
+    /// Water and glass, drawn in a second pass.
+    translucent: Option<wgpu::Buffer>,
+    translucent_count: u32,
     /// World-space bounds, for frustum culling. Taken from the geometry rather
     /// than assumed, so a column holding one layer of bedrock does not claim to
     /// be 384 blocks tall.
@@ -30,6 +33,7 @@ struct ChunkBuffers {
 /// Draws the world.
 pub struct WorldRenderer {
     pipeline: wgpu::RenderPipeline,
+    translucent_pipeline: wgpu::RenderPipeline,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     atlas_bind_group: wgpu::BindGroup,
@@ -161,7 +165,7 @@ impl WorldRenderer {
                     attributes: &wgpu::vertex_attr_array![
                         0 => Float32x3, // position
                         1 => Float32x2, // uv
-                        2 => Float32x3, // biome tint
+                        2 => Float32x4, // biome tint, with opacity in alpha
                         3 => Float32,   // directional shade
                     ],
                 })],
@@ -199,8 +203,61 @@ impl WorldRenderer {
             cache: None,
         });
 
+        // Same geometry and same shader, but blended and without depth writes,
+        // so two translucent surfaces do not hide each other depending on which
+        // chunk happened to be drawn first.
+        let translucent_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("world translucent"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Vertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![
+                            0 => Float32x3,
+                            1 => Float32x2,
+                            2 => Float32x4,
+                            3 => Float32,
+                        ],
+                    })],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    // Both sides: from under the surface of an ocean you are
+                    // looking at the back of every water face.
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_translucent"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+
         Self {
             pipeline,
+            translucent_pipeline,
             globals_buffer,
             globals_bind_group,
             atlas_bind_group,
@@ -224,6 +281,8 @@ impl WorldRenderer {
             self.chunks.remove(&(x, z));
             return;
         }
+        // An index buffer must not be empty, so a chunk that is entirely water
+        // still needs a valid opaque buffer even though it draws nothing.
         // Positions are chunk-relative from the mesher, so shift them into the
         // world here rather than paying for a per-chunk uniform and a bind
         // group change on every draw.
@@ -247,8 +306,19 @@ impl WorldRenderer {
         });
         let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("chunk indices"),
-            contents: bytemuck::cast_slice(&mesh.indices),
+            contents: bytemuck::cast_slice(if mesh.indices.is_empty() {
+                &[0u32, 0, 0][..]
+            } else {
+                &mesh.indices
+            }),
             usage: wgpu::BufferUsages::INDEX,
+        });
+        let translucent = (!mesh.translucent.is_empty()).then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("chunk translucent indices"),
+                contents: bytemuck::cast_slice(&mesh.translucent),
+                usage: wgpu::BufferUsages::INDEX,
+            })
         });
         self.chunks.insert(
             (x, z),
@@ -256,6 +326,8 @@ impl WorldRenderer {
                 vertices,
                 indices,
                 index_count: mesh.indices.len() as u32,
+                translucent,
+                translucent_count: mesh.translucent.len() as u32,
                 min,
                 max,
             },
@@ -334,17 +406,31 @@ impl WorldRenderer {
         // that fails this test costs a plane comparison instead of a draw call
         // and a few thousand triangles.
         let frustum = Frustum::from_matrix(camera.view_projection());
-        let mut drawn = 0;
-        for chunk in self.chunks.values() {
-            if !frustum.intersects(chunk.min, chunk.max) {
+        let visible: Vec<&ChunkBuffers> = self
+            .chunks
+            .values()
+            .filter(|c| frustum.intersects(c.min, c.max))
+            .collect();
+        self.drawn.set(visible.len());
+
+        for chunk in &visible {
+            if chunk.index_count == 0 {
                 continue;
             }
-            drawn += 1;
             pass.set_vertex_buffer(0, chunk.vertices.slice(..));
             pass.set_index_buffer(chunk.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..chunk.index_count, 0, 0..1);
         }
-        self.drawn.set(drawn);
+
+        // Second: water and glass, over everything solid, so what is behind
+        // them has already been drawn and can show through.
+        pass.set_pipeline(&self.translucent_pipeline);
+        for chunk in &visible {
+            let Some(buffer) = &chunk.translucent else { continue };
+            pass.set_vertex_buffer(0, chunk.vertices.slice(..));
+            pass.set_index_buffer(buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..chunk.translucent_count, 0, 0..1);
+        }
     }
 }
 

@@ -18,7 +18,8 @@ pub struct Vertex {
     /// Atlas coordinates.
     pub uv: [f32; 2],
     /// Biome tint, multiplied into the texture. White for untinted faces.
-    pub tint: [f32; 3],
+    /// The fourth channel carries how opaque the block is.
+    pub tint: [f32; 4],
     /// Directional shade, applied per face.
     pub light: f32,
 }
@@ -129,16 +130,20 @@ impl Face {
 #[derive(Debug, Default)]
 pub struct Mesh {
     pub vertices: Vec<Vertex>,
+    /// Cutout geometry, drawn first with depth writes on.
     pub indices: Vec<u32>,
+    /// Water, ice and stained glass, drawn afterwards with blending on and
+    /// depth writes off so they do not hide each other.
+    pub translucent: Vec<u32>,
 }
 
 impl Mesh {
     pub fn is_empty(&self) -> bool {
-        self.indices.is_empty()
+        self.indices.is_empty() && self.translucent.is_empty()
     }
 
     pub fn triangles(&self) -> usize {
-        self.indices.len() / 3
+        (self.indices.len() + self.translucent.len()) / 3
     }
 }
 
@@ -183,6 +188,12 @@ fn corner_ao(side1: bool, side2: bool, corner: bool) -> usize {
 /// Whether a block fills its cell and whether it hides its own internal faces.
 pub trait BlockAppearance {
     fn is_opaque(&self, state: StateId) -> bool;
+
+    /// How opaque a block draws, 1 for everything that is not water, ice or
+    /// stained glass.
+    fn alpha(&self, _state: StateId) -> f32 {
+        1.0
+    }
 
     /// True if this block hides the faces between two of itself, as fluids and
     /// glass do. An ocean is millions of blocks; without this it is drawn as a
@@ -234,15 +245,39 @@ pub fn build_at(
     }
 
     let height = (sections * 16) as i32;
+    let inside = |x: i32, y: i32, z: i32| {
+        (0..16).contains(&x) && (0..16).contains(&z) && (0..height).contains(&y)
+    };
     let at = |x: i32, y: i32, z: i32| -> u32 {
-        if !(0..16).contains(&x) || !(0..16).contains(&z) || !(0..height).contains(&y) {
-            // Outside the column. Treated as empty, which draws faces at the
-            // chunk border a neighbour may cover; harmless, and fixed once
-            // neighbours are meshed together.
+        if !inside(x, y, z) {
             return 0;
         }
         column[(y as usize / 16) * SECTION_VOLUME
             + block_index(x as usize, y as usize % 16, z as usize)]
+    };
+
+    /// What sits across a face when it is not in this column.
+    ///
+    /// Sideways, the neighbouring chunk does, and its own mesh will draw
+    /// whatever belongs there. Assuming air instead makes every column draw its
+    /// full depth at all four chunk borders, which for an ocean is most of the
+    /// geometry in the world and looks like a grid of walls under the surface.
+    ///
+    /// Below the world is solid bedrock for these purposes. Above it is sky, so
+    /// the top of the tallest block still gets a face.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Outside {
+        Hidden,
+        Sky,
+    }
+
+    let outside = |y: i32| if y >= height { Outside::Sky } else { Outside::Hidden };
+
+    let hides = |x: i32, y: i32, z: i32, own: StateId| -> bool {
+        if inside(x, y, z) {
+            return look.hides_face(own, StateId(at(x, y, z)));
+        }
+        outside(y) == Outside::Hidden
     };
 
     for y in 0..height {
@@ -257,9 +292,20 @@ pub fn build_at(
                     continue;
                 }
                 let base = [x as f32, (y + chunk.min_y) as f32, z as f32];
+                // A fluid's surface sits just below the top of its block unless
+                // there is more of the same fluid above it, which is what gives
+                // an ocean a surface you can see the edge of rather than a flat
+                // lid at block height.
+                let surface = if model.fluid {
+                    let above = StateId(at(x, y + 1, z));
+                    if above.block() == state.block() { 1.0 } else { 14.0 / 16.0 }
+                } else {
+                    1.0
+                };
                 for element in &model.elements {
                     push_element(
-                        &mut mesh, base, element, state, look, &at, x, y, z, chunk, daylight,
+                        &mut mesh, base, element, state, look, &at, &hides, x, y, z, chunk,
+                        daylight, surface,
                     );
                 }
             }
@@ -276,11 +322,13 @@ fn push_element(
     state: StateId,
     look: &dyn BlockAppearance,
     at: &dyn Fn(i32, i32, i32) -> u32,
+    hides: &dyn Fn(i32, i32, i32, StateId) -> bool,
     x: i32,
     y: i32,
     z: i32,
     chunk: &Chunk,
     daylight: f32,
+    surface: f32,
 ) {
     // World Y, since light is indexed in world coordinates while the block loop
     // counts from the bottom of the column.
@@ -292,8 +340,7 @@ fn push_element(
         // else is interior geometry that stays visible whatever is next to it.
         if let Some(cull) = face.cullface {
             let [dx, dy, dz] = Face::from_index(cull).offset();
-            let neighbour = StateId(at(x + dx, y + dy, z + dz));
-            if look.hides_face(state, neighbour) {
+            if hides(x + dx, y + dy, z + dz, state) {
                 continue;
             }
         }
@@ -306,7 +353,7 @@ fn push_element(
         ];
         let to = [
             base[0] + element.to[0],
-            base[1] + element.to[1],
+            base[1] + element.to[1] * surface,
             base[2] + element.to[2],
         ];
 
@@ -376,37 +423,26 @@ fn push_element(
             };
         }
 
+        let alpha = look.alpha(state);
         let start = mesh.vertices.len() as u32;
         for (i, (corner, uv)) in dir.corners(from, to).iter().zip(face.uv.corners()).enumerate() {
             mesh.vertices.push(Vertex {
                 position: *corner,
                 uv,
-                tint: face.tint,
+                tint: [face.tint[0], face.tint[1], face.tint[2], alpha],
                 light: shade * AO_LEVELS[ao[i]] * lit[i],
             });
         }
+
+        let indices = if alpha < 1.0 { &mut mesh.translucent } else { &mut mesh.indices };
 
         // A quad is two triangles, and which diagonal they share is visible
         // when the corners are unevenly lit. Splitting along the darker
         // diagonal keeps the gradient symmetric instead of bending it.
         if ao[0] + ao[2] > ao[1] + ao[3] {
-            mesh.indices.extend_from_slice(&[
-                start + 1,
-                start + 2,
-                start + 3,
-                start + 1,
-                start + 3,
-                start,
-            ]);
+            indices.extend_from_slice(&[start + 1, start + 2, start + 3, start + 1, start + 3, start]);
         } else {
-            mesh.indices.extend_from_slice(&[
-                start,
-                start + 1,
-                start + 2,
-                start,
-                start + 2,
-                start + 3,
-            ]);
+            indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
         }
     }
 }
@@ -536,18 +572,21 @@ mod tests {
     }
 
     #[test]
-    fn a_single_solid_section_only_draws_its_shell() {
+    fn a_solid_column_draws_only_its_top() {
         let Some(t) = textures() else { return };
+        // The sides abut neighbouring chunks, which draw their own geometry,
+        // and the bottom is the floor of the world.
         let mesh = build(&chunk(1, stone(), |_| true), &Solid, &t);
-        assert_eq!(mesh.triangles(), 6 * 256 * 2);
+        assert_eq!(mesh.triangles(), 256 * 2);
     }
 
     #[test]
     fn stacked_sections_do_not_draw_the_seam_between_them() {
         let Some(t) = textures() else { return };
+        // Two sections rather than one, and still one surface: the boundary
+        // between them is interior, not a face.
         let mesh = build(&chunk(2, stone(), |_| true), &Solid, &t);
-        // Top and bottom stay 256 each; the four sides become 16x32.
-        assert_eq!(mesh.triangles(), (2 * 256 + 4 * 16 * 32) * 2);
+        assert_eq!(mesh.triangles(), 256 * 2);
     }
 
     #[test]
@@ -555,7 +594,13 @@ mod tests {
         let Some(t) = textures() else { return };
         // A single isolated section: its shell has nothing beside it, so every
         // corner is open and the only variation is the face direction.
-        let mesh = build(&chunk(1, stone(), |_| true), &Solid, &t);
+        // One block alone in the air, so all six faces are drawn and none are
+        // occluded.
+        let mesh = build(
+            &chunk_from(1, |x, y, z| if (x, y, z) == (8, 8, 8) { stone() } else { 0 }),
+            &Solid,
+            &t,
+        );
         let mut lights: Vec<f32> = mesh.vertices.iter().map(|v| v.light).collect();
         lights.sort_by(|a, b| a.partial_cmp(b).unwrap());
         lights.dedup();
@@ -662,13 +707,35 @@ mod tests {
         );
 
         let mesh = build(&chunk(1, stone(), |_| true), &Solid, &t);
-        assert!(mesh.vertices.iter().all(|v| v.tint == [1.0, 1.0, 1.0]));
+        assert!(mesh.vertices.iter().all(|v| v.tint[..3] == [1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn chunk_borders_do_not_grow_walls() {
+        let Some(t) = textures() else { return };
+        let s = stone();
+        // A solid column. Its sides touch neighbouring chunks, and assuming air
+        // there would draw all four of them: 4 x 16 x 16 faces on a single
+        // section, dwarfing the 256 that actually belong on top.
+        let mesh = build(&chunk(1, s, |_| true), &Solid, &t);
+        assert_eq!(mesh.triangles(), 256 * 2);
+    }
+
+    #[test]
+    fn the_top_of_the_world_still_gets_a_face() {
+        let Some(t) = textures() else { return };
+        let s = stone();
+        // The highest block has sky above it, which is not another chunk.
+        let mesh = build(&chunk_from(1, |_, y, _| if y == 15 { s } else { 0 }), &Solid, &t);
+        let highest = mesh.vertices.iter().fold(0.0f32, |m, v| m.max(v.position[1]));
+        assert!((highest - 16.0).abs() < 1e-3, "no top face at the world ceiling");
     }
 
     #[test]
     fn geometry_stays_inside_the_column() {
         let Some(t) = textures() else { return };
         let mesh = build(&chunk(2, stone(), |i| i == 1), &Solid, &t);
+        assert!(!mesh.is_empty());
         for v in &mesh.vertices {
             assert!((0.0..=16.0).contains(&v.position[0]), "{v:?}");
             assert!((16.0..=32.0).contains(&v.position[1]), "{v:?}");

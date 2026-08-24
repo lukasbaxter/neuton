@@ -18,6 +18,8 @@ pub struct Appearance {
     opaque: Vec<bool>,
     /// Blocks that hide the faces between two of themselves.
     self_culling: Vec<bool>,
+    /// How opaque each state draws. 1 for all but water, ice and stained glass.
+    translucent: Vec<f32>,
 }
 
 impl Default for Appearance {
@@ -30,19 +32,22 @@ impl Appearance {
     pub fn new() -> Self {
         let mut opaque = vec![true; STATE_COUNT];
         let mut self_culling = vec![false; STATE_COUNT];
+        let mut translucent = vec![1.0f32; STATE_COUNT];
 
         for i in 0..BLOCK_COUNT {
             let block = neuton_blocks::BlockId(i);
             let name = block.name().trim_start_matches("minecraft:");
             let solid = is_solid(name);
             let culls = hides_its_own_faces(name);
+            let alpha = opacity_of(name);
             let b = block.get();
             for s in b.first_state.0..b.first_state.0 + b.state_count {
                 opaque[s as usize] = solid;
                 self_culling[s as usize] = culls;
+                translucent[s as usize] = alpha;
             }
         }
-        Self { opaque, self_culling }
+        Self { opaque, self_culling, translucent }
     }
 }
 
@@ -50,6 +55,11 @@ impl BlockAppearance for Appearance {
     #[inline]
     fn is_opaque(&self, state: StateId) -> bool {
         self.opaque.get(state.0 as usize).copied().unwrap_or(false)
+    }
+
+    #[inline]
+    fn alpha(&self, state: StateId) -> f32 {
+        self.translucent.get(state.0 as usize).copied().unwrap_or(1.0)
     }
 
     #[inline]
@@ -86,6 +96,32 @@ fn is_solid(name: &str) -> bool {
         return true;
     }
     !SEE_THROUGH.iter().any(|s| name.contains(s))
+}
+
+/// How opaque a block is, for the blocks that are see-through without being
+/// cutout.
+///
+/// Leaves and grass are cutout: every texel is either drawn or discarded.
+/// Water and glass are not, and drawing them with a hard threshold makes an
+/// ocean look like a solid blue floor.
+fn opacity_of(name: &str) -> f32 {
+    let name = name.trim_start_matches("minecraft:");
+    if name == "water" || name == "bubble_column" {
+        return 0.72;
+    }
+    if name == "ice" || name == "frosted_ice" {
+        return 0.72;
+    }
+    if name == "tinted_glass" {
+        return 0.55;
+    }
+    if name.ends_with("stained_glass") || name.ends_with("stained_glass_pane") {
+        return 0.62;
+    }
+    if name == "slime_block" || name == "honey_block" {
+        return 0.7;
+    }
+    1.0
 }
 
 /// Blocks whose internal faces are never visible.
@@ -139,6 +175,19 @@ mod tests {
         assert!(!opaque("minecraft:oak_stairs"));
         assert!(!opaque("minecraft:water"));
         assert!(!opaque("minecraft:tall_grass"));
+    }
+
+    #[test]
+    fn water_and_glass_are_translucent_and_stone_is_not() {
+        let a = Appearance::new();
+        let alpha = |n: &str| a.alpha(neuton_blocks::by_name(n).unwrap().get().default_state);
+        assert!(alpha("minecraft:water") < 1.0);
+        assert!(alpha("minecraft:ice") < 1.0);
+        assert!(alpha("minecraft:blue_stained_glass") < 1.0);
+        assert_eq!(alpha("minecraft:stone"), 1.0);
+        // Plain glass is cutout, not translucent: it is either there or a hole.
+        assert_eq!(alpha("minecraft:glass"), 1.0);
+        assert_eq!(alpha("minecraft:oak_leaves"), 1.0);
     }
 
     #[test]
