@@ -1,0 +1,11 @@
+# The project's Azure application ID, compiled in by `option_env!`.
+#
+# This is a public OAuth client: the device code flow has no client secret and
+# cannot have one, so this is an identifier rather than a credential. It is safe
+# in a public repository. It grants nothing on its own and is not a licence
+# check; every user still signs in as themselves and must own the game.
+#
+# Override for a local build with the NEUTON_CLIENT_ID environment variable,
+# which takes precedence over this.
+[env]
+NEUTON_CLIENT_ID = "1b51d9e4-ae03-4f44-8287-b812541234c6"
