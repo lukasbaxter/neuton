@@ -24,6 +24,7 @@ pub enum WorldEvent {
     Forget { x: i32, z: i32 },
     Moved { x: f64, y: f64, z: f64, yaw: f32, pitch: f32 },
     Chat(Vec<neuton_net::Span>),
+    Abilities(neuton_world::physics::Abilities),
     Disconnected(String),
 }
 
@@ -162,6 +163,11 @@ impl WorldSession {
                     }
                     Ok(Event::Teleported { x, y, z, yaw, pitch }) => {
                         let _ = tx.send(WorldEvent::Moved { x, y, z, yaw, pitch });
+                    }
+                    Ok(Event::Abilities(abilities)) => {
+                        if tx.send(WorldEvent::Abilities(abilities)).is_err() {
+                            return;
+                        }
                     }
                     Ok(Event::Chat(spans)) => {
                         if tx.send(WorldEvent::Chat(spans)).is_err() {

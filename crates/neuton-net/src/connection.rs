@@ -78,6 +78,9 @@ pub enum Event {
     Teleported { x: f64, y: f64, z: f64, yaw: f32, pitch: f32 },
     /// A chat line, already flattened to styled runs.
     Chat(Vec<crate::Span>),
+    /// What the server says the player may do. Sent on join and whenever the
+    /// game mode changes.
+    Abilities(neuton_world::physics::Abilities),
     Disconnect(String),
     /// Answered automatically; surfaced so latency can be tracked.
     KeepAlive,
@@ -403,6 +406,19 @@ impl Connection {
                     let mut w = Writer::new();
                     w.write_i32(token);
                     self.framed.write_packet(ids::play::serverbound::PONG, &w)?;
+                }
+                ids::play::clientbound::PLAYER_ABILITIES => {
+                    let flags = r.read_u8().map_err(named)?;
+                    let fly_speed = r.read_f32().map_err(named)?;
+                    let walk_speed = r.read_f32().map_err(named)?;
+                    return Ok(Event::Abilities(neuton_world::physics::Abilities {
+                        invulnerable: flags & 0x01 != 0,
+                        flying: flags & 0x02 != 0,
+                        may_fly: flags & 0x04 != 0,
+                        instant_build: flags & 0x08 != 0,
+                        fly_speed,
+                        walk_speed,
+                    }));
                 }
                 ids::play::clientbound::SYSTEM_CHAT => {
                     // An NBT text component, then a flag for whether it belongs
