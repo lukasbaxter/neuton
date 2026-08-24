@@ -46,8 +46,10 @@ pub struct WorldRenderer {
     /// Chunks drawn on the last frame, against chunks held.
     pub drawn: std::cell::Cell<usize>,
     pub sky_color: [f32; 4],
-    pub fog_start: f32,
-    pub fog_end: f32,
+    /// Fog is derived from how much world is actually loaded rather than fixed.
+    /// Too near and the world is permanently hazy; too far and it ends at a
+    /// visible wall where the chunks run out.
+    pub fog_scale: f32,
 }
 
 impl WorldRenderer {
@@ -267,8 +269,7 @@ impl WorldRenderer {
             chunks: HashMap::new(),
             drawn: std::cell::Cell::new(0),
             sky_color: [0.62, 0.74, 0.94, 1.0],
-            fog_start: 120.0,
-            fog_end: 380.0,
+            fog_scale: 1.0,
         }
     }
 
@@ -346,6 +347,20 @@ impl WorldRenderer {
         self.chunks.len()
     }
 
+    /// How far the loaded world reaches, in blocks.
+    ///
+    /// Taken from the number of columns held rather than from the server's view
+    /// distance, because what matters is where the geometry actually stops.
+    pub fn view_distance(&self) -> f32 {
+        if self.chunks.is_empty() {
+            return 256.0;
+        }
+        // The loaded region is roughly a disc, so its radius follows from its
+        // area.
+        let radius = (self.chunks.len() as f32 / std::f32::consts::PI).sqrt();
+        radius * 16.0
+    }
+
     /// Triangles currently held, across every loaded chunk.
     ///
     /// Counted from the buffers rather than accumulated as chunks arrive: a
@@ -373,13 +388,21 @@ impl WorldRenderer {
         target: &wgpu::TextureView,
         camera: &Camera,
     ) {
+        let distance = self.view_distance();
         queue.write_buffer(
             &self.globals_buffer,
             0,
             bytemuck::bytes_of(&Globals {
                 view_projection: camera.view_projection(),
                 fog_color: self.sky_color,
-                fog: [self.fog_start, self.fog_end, 0.0, 0.0],
+                // Haze begins around half way out and is complete just short of
+                // the edge, so chunks fade rather than appear.
+                fog: [
+                    distance * 0.55 * self.fog_scale,
+                    distance * 0.95 * self.fog_scale,
+                    0.0,
+                    0.0,
+                ],
             }),
         );
 
