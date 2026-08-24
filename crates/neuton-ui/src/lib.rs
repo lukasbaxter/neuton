@@ -7,6 +7,9 @@
 pub mod app;
 pub mod auth_task;
 pub mod gpu;
+pub mod icons;
+pub mod ping_task;
+pub mod servers;
 pub mod theme;
 
 use app::Launcher;
@@ -141,7 +144,7 @@ fn draw(state: &mut State, launcher: &mut Launcher) {
     let to_free = std::mem::take(&mut output.textures_delta.free);
     output.textures_delta.clear();
 
-    let mut free_all = |renderer: &mut egui_wgpu::Renderer| {
+    let free_all = |renderer: &mut egui_wgpu::Renderer| {
         for id in &to_free {
             renderer.free_texture(id);
         }

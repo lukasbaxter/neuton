@@ -10,3 +10,4 @@ neuton-blocks = { workspace = true }
 neuton-world = { path = "../neuton-world" }
 neuton-nbt = { path = "../neuton-nbt" }
 neuton-auth = { path = "../neuton-auth" }
+serde_json = "1.0.151"

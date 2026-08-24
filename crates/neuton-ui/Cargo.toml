@@ -12,3 +12,8 @@ egui-winit = "0.36.1"
 pollster = "1.0.1"
 wgpu = "30.0.1"
 winit = "0.30.13"
+png = "0.18.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+neuton-net = { version = "0.1.0", path = "../neuton-net" }
+neuton-protocol = { version = "0.1.0", path = "../neuton-protocol" }
