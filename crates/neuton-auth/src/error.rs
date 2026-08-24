@@ -29,10 +29,13 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // Only reachable in a build that was compiled without one, so the
+            // audience here is whoever built it, not the player.
             Error::NoClientId => f.write_str(
-                "no Azure client ID configured\n\
-                 set NEUTON_CLIENT_ID, or write one to the client_id file in the config directory\n\
-                 see docs/AUTH.md",
+                "this build has no Microsoft application ID compiled in, so it cannot sign in\n\
+                 release builds set NEUTON_CLIENT_ID at build time\n\
+                 to use your own: export NEUTON_CLIENT_ID=<id>, or write it to the\n\
+                 client_id file in the config directory. see docs/AUTH.md",
             ),
             Error::Http(e) => write!(f, "http: {e}"),
             Error::Io(e) => write!(f, "io: {e}"),

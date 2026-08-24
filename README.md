@@ -66,7 +66,8 @@ Working, with 57 tests:
   frame compression, AES-128-CFB8 encryption verified against the NIST SP 800-38A
   vector, and a server hash verified against Mojang's published examples
 - **Auth** — Microsoft device-code flow through Xbox Live and XSTS to a Minecraft
-  session, cached so warm launches touch the network zero times
+  session, cached so warm launches touch the network zero times, with multiple
+  accounts per install
 - **NBT** — network framing, modified UTF-8, and a skipper that steps over tags
   without allocating
 - **Chunks** — paletted containers in all three forms, decoded against the
@@ -88,7 +89,11 @@ world    entity 419, 24 sections from y=-64
 chunk    #1 at (12, -30)  8214 non-air, 9 sections used
 ```
 
-Signing in needs an Azure application ID; see [docs/AUTH.md](docs/AUTH.md).
+Players just run `neuton login` and sign in with the Microsoft account that owns
+the game. Release builds bake in the project's Azure application ID
+(`NEUTON_CLIENT_ID=<id> cargo build --release`); it is a public OAuth client with
+no secret, so nobody but the publisher touches Azure. See
+[docs/AUTH.md](docs/AUTH.md).
 
 Next: the renderer. Block model baking and atlas stitching move to build time,
 then chunk meshing and the first frame.
