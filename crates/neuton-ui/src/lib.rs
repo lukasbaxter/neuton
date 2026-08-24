@@ -99,6 +99,8 @@ struct App {
     /// A camera to force, rather than following the player's spawn. For looking
     /// at a particular thing from a script.
     view: Option<([f32; 3], f32, f32)>,
+    /// Frames drawn after the screenshot deadline, before capturing.
+    warmup: u32,
     started: Option<Instant>,
 }
 
@@ -238,7 +240,27 @@ impl ApplicationHandler for App {
                             w.camera.yaw = yaw;
                             w.camera.pitch = pitch;
                         }
-
+                        // A few ordinary frames first. The panel reports the
+                        // previous frame's chunk count and frame time, and
+                        // capturing straight after placing the camera would put
+                        // "0 chunks" and a nonsense frame rate in the file.
+                        if self.warmup < 3 {
+                            self.warmup += 1;
+                            // Through the off-screen path, not the window. A
+                            // window that is behind another is reported as
+                            // occluded and its frame is skipped, which is right
+                            // for a game and useless for a warm-up.
+                            let _ = capture_frame(
+                                state,
+                                launcher,
+                                world.as_mut(),
+                                renderer.as_mut(),
+                                state.gpu.config.width,
+                                state.gpu.config.height,
+                            );
+                            state.gpu.window.request_redraw();
+                            return;
+                        }
                         // The window's own size, so the capture matches what
                         // is on screen rather than laying the interface out for
                         // one resolution and rendering it at another.
