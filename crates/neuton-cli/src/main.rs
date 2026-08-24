@@ -528,6 +528,35 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
         }
     }
 
+    let biomes = conn.registries().biomes.clone();
+    if !biomes.is_empty() {
+        println!("\nbiomes ({} in the registry)", biomes.len());
+        for b in biomes.iter().take(4) {
+            println!(
+                "    {:<34} temp={:.2} rain={:.2} grass={:?} water={:?} mod={:?}",
+                b.name.trim_start_matches("minecraft:"),
+                b.temperature,
+                b.downfall,
+                b.grass.map(|c| format!("#{c:06X}")),
+                b.water.map(|c| format!("#{c:06X}")),
+                b.grass_modifier
+            );
+        }
+        for want in ["minecraft:swamp", "minecraft:desert", "minecraft:badlands"] {
+            if let Some(b) = biomes.iter().find(|b| b.name == want) {
+                println!(
+                    "    {:<34} temp={:.2} rain={:.2} grass={:?} water={:?} mod={:?}",
+                    b.name.trim_start_matches("minecraft:"),
+                    b.temperature,
+                    b.downfall,
+                    b.grass.map(|c| format!("#{c:06X}")),
+                    b.water.map(|c| format!("#{c:06X}")),
+                    b.grass_modifier
+                );
+            }
+        }
+    }
+
     if !lit_samples.is_empty() {
         println!("\nlighting");
         for line in &lit_samples {

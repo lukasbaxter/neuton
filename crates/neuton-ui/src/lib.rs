@@ -93,6 +93,8 @@ struct App {
     renderer: Option<WorldRenderer>,
     /// Resolved once and shared with every connection thread.
     textures: Option<Arc<BlockTextures>>,
+    /// Colormaps, shared with connection threads so they can resolve biomes.
+    tints: Option<Arc<neuton_assets::Tints>>,
     last_frame: Option<Instant>,
     /// A join requested on the command line, applied once the window exists.
     direct: Option<app::PendingJoin>,
@@ -166,9 +168,9 @@ impl ApplicationHandler for App {
         self.state = Some(State { gpu, egui_ctx, egui_winit, egui_renderer });
 
         if let Some(pending) = self.direct.take() {
-            let Self { state, world, renderer, textures, .. } = self;
+            let Self { state, world, renderer, textures, tints, .. } = self;
             if let Some(state) = state {
-                start_world(pending, state, world, renderer, textures);
+                start_world(pending, state, world, renderer, textures, tints);
             }
         }
     }
@@ -193,7 +195,7 @@ impl ApplicationHandler for App {
         // borrowed at once; they are disjoint fields but the compiler cannot
         // see that through a method call on `self`.
         let Self {
-            state, launcher, world, renderer, textures, last_frame, started, ..
+            state, launcher, world, renderer, textures, tints, last_frame, started, ..
         } = self;
         let Some(state) = state else { return };
         let Some(launcher) = launcher else { return };
@@ -212,7 +214,7 @@ impl ApplicationHandler for App {
 
         // A join can only be started here, where the GPU lives.
         if let Some(pending) = launcher.pending_join.take() {
-            start_world(pending, state, world, renderer, textures);
+            start_world(pending, state, world, renderer, textures, tints);
         }
 
         match event {
@@ -372,6 +374,7 @@ fn start_world(
     world: &mut Option<WorldView>,
     renderer: &mut Option<WorldRenderer>,
     textures: &mut Option<Arc<BlockTextures>>,
+    tints: &mut Option<Arc<neuton_assets::Tints>>,
 ) {
     {
         // Resolving the atlas takes a few hundred milliseconds and only has to
@@ -393,6 +396,7 @@ fn start_world(
                     let _ = packs.push(entry.path());
                 }
             }
+            *tints = Some(Arc::new(neuton_assets::Tints::load(&mut packs)));
             *textures = Some(Arc::new(BlockTextures::build(&mut packs)));
         }
         let atlas = textures.clone().unwrap();
@@ -412,7 +416,13 @@ fn start_world(
             .gpu
             .window
             .set_title(&format!("neuton - {}:{}", pending.host, pending.port));
-        let session = WorldSession::connect(pending.host, pending.port, pending.session, atlas);
+        let session = WorldSession::connect(
+            pending.host,
+            pending.port,
+            pending.session,
+            atlas,
+            tints.clone().unwrap_or_default(),
+        );
         let mut view = WorldView::new(session);
         set_capture(&state.gpu.window, &mut view, true);
         *world = Some(view);

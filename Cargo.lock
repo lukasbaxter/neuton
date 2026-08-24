@@ -1599,6 +1599,7 @@ dependencies = [
  "bytemuck",
  "neuton-assets",
  "neuton-blocks",
+ "neuton-net",
  "neuton-world",
  "png",
  "wgpu",

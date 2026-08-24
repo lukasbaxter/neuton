@@ -6,7 +6,7 @@
 //! sends a batch. What reaches the main thread is geometry ready to upload.
 
 use neuton_net::{Connection, Event};
-use neuton_render::{Appearance, BlockTextures, Mesh, Neighbours};
+use neuton_render::{Appearance, BiomeTints, BlockTextures, Mesh, Neighbours};
 use neuton_world::Chunk;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -39,6 +39,7 @@ impl WorldSession {
         port: u16,
         session: neuton_auth::Session,
         textures: Arc<BlockTextures>,
+        tints: Arc<neuton_assets::Tints>,
     ) -> Self {
         let (tx, rx) = channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -54,6 +55,9 @@ impl WorldSession {
                 }
             };
             let appearance = Appearance::new();
+            // Biome colours are only known once the server has sent its
+            // registries, which it does before the first chunk.
+            let biome_tints = BiomeTints::build(&conn.registries().biomes, &tints);
             // Chunks are kept, not just meshed and dropped. A column's edge
             // faces depend on what is next to it, so a chunk has to be re-meshed
             // when a neighbour turns up, and that needs the block data back.
@@ -72,7 +76,8 @@ impl WorldSession {
                     let batch: Vec<(i32, i32)> = dirty.drain().collect();
                     for (x, z) in batch {
                         let Some(chunk) = world.get(&(x, z)) else { continue };
-                        let mesh = mesh_chunk(chunk, &world, &appearance, &textures);
+                        let mesh =
+                            mesh_chunk(chunk, &world, &appearance, &textures, &biome_tints);
                         if tx.send(WorldEvent::Chunk { x, z, mesh: Box::new(mesh) }).is_err() {
                             return;
                         }
@@ -91,7 +96,8 @@ impl WorldSession {
                         let (x, z) = (chunk.x, chunk.z);
                         world.insert((x, z), Arc::from(*chunk));
                         let chunk = world.get(&(x, z)).expect("just inserted");
-                        let mesh = mesh_chunk(chunk, &world, &appearance, &textures);
+                        let mesh =
+                            mesh_chunk(chunk, &world, &appearance, &textures, &biome_tints);
                         if tx
                             .send(WorldEvent::Chunk { x, z, mesh: Box::new(mesh) })
                             .is_err()
@@ -176,6 +182,7 @@ fn mesh_chunk(
     world: &HashMap<(i32, i32), Arc<Chunk>>,
     appearance: &Appearance,
     textures: &BlockTextures,
+    biomes: &BiomeTints,
 ) -> Mesh {
     let (x, z) = (chunk.x, chunk.z);
     let get = |dx: i32, dz: i32| world.get(&(x + dx, z + dz)).map(|c| c.as_ref());
@@ -185,5 +192,5 @@ fn mesh_chunk(
         north: get(0, -1),
         south: get(0, 1),
     };
-    neuton_render::build_at(chunk, neighbours, appearance, textures, 1.0)
+    neuton_render::build_full(chunk, neighbours, appearance, textures, biomes, 1.0)
 }
