@@ -148,7 +148,7 @@ play.notmiji.com:25565
     <div class="fact"><dt>tables are static</dt><dd><b>32,366</b> block states compile into <code>.rodata</code>. State ID to block is one bounds-checked index. No hashing, no parsing, no init.</dd></div>
     <div class="fact"><dt>sections stay packed</dt><dd>Palettes unpack lazily into a reused scratch buffer. At render distance 16 that is the difference between kilobytes and hundreds of megabytes resident.</dd></div>
     <div class="fact"><dt>blocking sockets</dt><dd>One connection does not need a runtime. A dedicated thread parked on <code>read</code> beats a scheduler wakeup, and tokio never enters the binary.</dd></div>
-    <div class="fact"><dt>eight dependencies</dt><dd><code>flate2 aes rsa sha1 rand serde serde_json ureq</code>. No protocol crate, no engine, no framework.</dd></div>
+    <div class="fact"><dt>eight dependencies</dt><dd>Client core: <code>flate2 aes rsa sha1 rand serde serde_json ureq</code>. No protocol crate, no engine, no framework. The renderer adds wgpu on top of that and nothing else.</dd></div>
     <div class="fact"><dt>1.8 MB</dt><dd>Release binary. Fat LTO, one codegen unit, <code>panic = "abort"</code>, symbols stripped.</dd></div>
   </dl>
 </div></section>
@@ -185,7 +185,6 @@ play.notmiji.com:25565
 
 <section id="status"><div class="w">
   <h2>Status</h2>
-  <p class="lede">No renderer yet. Nothing is on screen.</p>
   <div class="cols">
     <div>
       <h3>works</h3>
@@ -195,6 +194,7 @@ play.notmiji.com:25565
         <li>Joining real servers, staying joined</li>
         <li>Chunk and palette decoding</li>
         <li>Tables generated from the vanilla jar</li>
+        <li>Launcher window on wgpu, account management</li>
       </ul>
     </div>
     <div>
@@ -204,7 +204,6 @@ play.notmiji.com:25565
         <li>Model baking and atlas stitching</li>
         <li>Shader packs</li>
         <li>Movement and input</li>
-        <li>Interface and profiles</li>
       </ul>
     </div>
   </div>
