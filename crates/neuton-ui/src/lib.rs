@@ -12,6 +12,7 @@ pub mod gpu;
 pub mod icons;
 pub mod ping_task;
 pub mod servers;
+pub mod settings;
 pub mod session;
 pub mod world_view;
 pub mod theme;
@@ -265,6 +266,13 @@ impl ApplicationHandler for App {
                 if let (Some(w), Some(r)) = (world.as_mut(), renderer.as_mut()) {
                     w.update(dt, r, &state.gpu.device);
                     w.record_frame(dt);
+                    // Settings that live outside the world view.
+                    r.min_light = w.settings.min_light();
+                    state.gpu.set_present_mode(r.wants_present_mode(w.settings.vsync));
+                    let native = state.gpu.window.scale_factor() as f32;
+                    state
+                        .egui_ctx
+                        .set_pixels_per_point(w.settings.effective_gui_scale(native));
                 }
                 let animating = world.is_some();
 
@@ -285,6 +293,15 @@ impl ApplicationHandler for App {
                                     _ => w.session.send(session::Outgoing::Chat(line)),
                                 }
                             }
+                        }
+
+                        // Opens a menu for the screenshot, so the interface can
+                        // be looked at without a person pressing escape.
+                        if let Some(w) = world.as_mut()
+                            && let Ok(which) = std::env::var("NEUTON_SHOW_MENU")
+                        {
+                            w.paused = true;
+                            w.settings_open = which == "settings";
                         }
 
                         if let (Some(w), Some((pos, yaw, pitch))) = (world.as_mut(), self.view) {
@@ -397,11 +414,43 @@ impl ApplicationHandler for App {
                 // A world animates continuously; the launcher alone repaints
                 // only when something happens.
                 if animating || self.shot.is_some() {
+                    // A frame cap only means anything without vsync, which is
+                    // already pacing to the display.
+                    if let Some(w) = world.as_ref()
+                        && !w.settings.vsync
+                        && w.settings.max_fps > 0
+                    {
+                        let target = std::time::Duration::from_secs_f64(
+                            1.0 / w.settings.max_fps as f64,
+                        );
+                        let spent = last_frame.map(|t| t.elapsed()).unwrap_or_default();
+                        if let Some(remaining) = target.checked_sub(spent) {
+                            std::thread::sleep(remaining);
+                        }
+                    }
                     state.gpu.window.request_redraw();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
+
+                // Rebinding swallows the next key, so a menu shortcut is not
+                // triggered by the key being bound.
+                if pressed
+                    && let Some(w) = world.as_mut()
+                    && let Some(action) = w.rebinding
+                    && let PhysicalKey::Code(code) = event.physical_key
+                {
+                    w.rebinding = None;
+                    if code != KeyCode::Escape {
+                        w.settings.keys.set(action, code);
+                        if let Err(e) = w.settings.save() {
+                            eprintln!("neuton: could not save settings: {e}");
+                        }
+                    }
+                    state.gpu.window.request_redraw();
+                    return;
+                }
 
                 // Typed characters, before key codes: a text field wants what
                 // the layout produced, not which physical key was pressed.
@@ -426,6 +475,12 @@ impl ApplicationHandler for App {
                     if pressed && code == KeyCode::Escape && w.chat.is_open() {
                         w.key(code, pressed, event.repeat);
                         set_capture(&state.gpu.window, w, true);
+                        state.gpu.window.request_redraw();
+                        return;
+                    }
+                    // Escape backs out of settings before it closes the menu.
+                    if pressed && code == KeyCode::Escape && w.settings_open {
+                        w.settings_open = false;
                         state.gpu.window.request_redraw();
                         return;
                     }
@@ -606,6 +661,8 @@ fn draw_into(
         input: w.chat.input().map(str::to_string),
         paused: w.paused,
         server: w.session.server.clone(),
+        settings: w.settings_open.then(|| w.settings.clone()),
+        rebinding: w.rebinding,
     });
     let mut pause_action = PauseAction::None;
     let mut output = state.egui_ctx.run_ui(raw_input, |ui| match &hud {
@@ -615,8 +672,23 @@ fn draw_into(
     });
     if let Some(w) = world.as_mut() {
         match pause_action {
-            PauseAction::Resume => w.paused = false,
+            PauseAction::Resume => {
+                w.paused = false;
+                w.settings_open = false;
+            }
             PauseAction::Leave => w.leaving = true,
+            PauseAction::OpenSettings => w.settings_open = true,
+            PauseAction::CloseSettings => {
+                w.settings_open = false;
+                w.rebinding = None;
+            }
+            PauseAction::Apply(settings) => {
+                w.settings = *settings;
+                if let Err(e) = w.settings.save() {
+                    eprintln!("neuton: could not save settings: {e}");
+                }
+            }
+            PauseAction::Rebind(action) => w.rebinding = Some(action),
             PauseAction::None => {}
         }
     }
@@ -765,14 +837,22 @@ struct Hud {
     input: Option<String>,
     paused: bool,
     server: String,
+    /// Present while the settings screen is open, so it can be edited in place.
+    settings: Option<crate::settings::Settings>,
+    /// The action waiting for a key press, if the player is rebinding one.
+    rebinding: Option<crate::settings::Action>,
 }
 
 /// What the player picked on the pause menu.
-#[derive(Clone, Copy, PartialEq)]
 enum PauseAction {
     None,
     Resume,
     Leave,
+    OpenSettings,
+    CloseSettings,
+    /// Settings were changed and should be applied and saved.
+    Apply(Box<crate::settings::Settings>),
+    Rebind(crate::settings::Action),
 }
 
 /// The in-world overlay: a crosshair, and the debug panel when it is up.
@@ -823,7 +903,10 @@ fn overlay(ui: &mut egui::Ui, hud: &Hud) -> PauseAction {
             });
 
             if hud.paused {
-                action = pause_menu(ui, hud);
+                action = match &hud.settings {
+                    Some(settings) => settings_menu(ui, settings, hud.rebinding),
+                    None => pause_menu(ui, hud),
+                };
             }
         });
     action
@@ -865,6 +948,10 @@ fn pause_menu(ui: &mut egui::Ui, hud: &Hud) -> PauseAction {
                 let wide = egui::vec2(ui.available_width(), 32.0);
                 if ui.add_sized(wide, egui::Button::new("Back to game")).clicked() {
                     action = PauseAction::Resume;
+                }
+                ui.add_space(6.0);
+                if ui.add_sized(wide, egui::Button::new("Settings")).clicked() {
+                    action = PauseAction::OpenSettings;
                 }
                 ui.add_space(6.0);
                 if ui.add_sized(wide, egui::Button::new("Disconnect")).clicked() {
@@ -1109,4 +1196,188 @@ fn chat_panel(ui: &mut egui::Ui, hud: &Hud) {
                 });
             });
     }
+}
+
+/// The settings screen.
+///
+/// Changes apply as they are made rather than on a confirm button: a field that
+/// only takes effect later makes it impossible to tell whether it worked.
+fn settings_menu(
+    ui: &mut egui::Ui,
+    current: &crate::settings::Settings,
+    rebinding: Option<crate::settings::Action>,
+) -> PauseAction {
+    use crate::settings::Action;
+
+    let mut action = PauseAction::None;
+    let mut settings = current.clone();
+    let mut changed = false;
+
+    ui.painter().rect_filled(ui.clip_rect(), 0.0, egui::Color32::from_black_alpha(170));
+
+    egui::Window::new("Settings")
+        .title_bar(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .frame(
+            egui::Frame::new()
+                .fill(theme::RAISE)
+                .stroke(egui::Stroke::new(1.0, theme::LINE2))
+                .corner_radius(12)
+                .inner_margin(egui::Margin::same(20)),
+        )
+        .show(ui.ctx(), |ui| {
+            ui.set_width(430.0);
+            ui.label(egui::RichText::new("Settings").size(19.0).strong().color(theme::FG));
+            ui.add_space(12.0);
+
+            egui::ScrollArea::vertical().max_height(430.0).show(ui, |ui| {
+                section(ui, "VIDEO");
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut settings.fov, 30.0..=120.0)
+                            .text("Field of view")
+                            .suffix("\u{00b0}"),
+                    )
+                    .changed();
+                changed |= ui.checkbox(&mut settings.vsync, "Wait for the display (vsync)").changed();
+                if !settings.vsync {
+                    let mut cap = settings.max_fps as f32;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut cap, 0.0..=480.0)
+                                .text("Frame rate cap")
+                                .step_by(10.0),
+                        )
+                        .changed()
+                    {
+                        settings.max_fps = cap as u32;
+                        changed = true;
+                    }
+                    if settings.max_fps == 0 {
+                        ui.label(
+                            egui::RichText::new("uncapped")
+                                .monospace()
+                                .size(11.0)
+                                .color(theme::DIM),
+                        );
+                    }
+                }
+                let mut distance = settings.render_distance as f32;
+                if ui
+                    .add(egui::Slider::new(&mut distance, 2.0..=32.0).text("Render distance").step_by(1.0))
+                    .changed()
+                {
+                    settings.render_distance = distance as u32;
+                    changed = true;
+                }
+                ui.label(
+                    egui::RichText::new("the server decides how much of this it will honour")
+                        .size(11.0)
+                        .color(theme::DIM),
+                );
+
+                ui.add_space(12.0);
+                section(ui, "LIGHTING");
+                changed |= ui
+                    .checkbox(&mut settings.fullbright, "Full brightness")
+                    .on_hover_text("Ignores the world's light. Caves are as bright as noon.")
+                    .changed();
+
+                ui.add_space(12.0);
+                section(ui, "INTERFACE");
+                let mut scale = settings.gui_scale;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut scale, 0.0..=4.0)
+                            .text("Interface scale")
+                            .step_by(0.25),
+                    )
+                    .changed()
+                {
+                    settings.gui_scale = scale;
+                    changed = true;
+                }
+                if settings.gui_scale <= 0.0 {
+                    ui.label(
+                        egui::RichText::new("follows the display")
+                            .monospace()
+                            .size(11.0)
+                            .color(theme::DIM),
+                    );
+                }
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut settings.mouse_sensitivity, 0.02..=0.5)
+                            .text("Mouse sensitivity"),
+                    )
+                    .changed();
+
+                ui.add_space(12.0);
+                section(ui, "CONTROLS");
+                if rebinding.is_some() {
+                    ui.label(
+                        egui::RichText::new("press a key, or escape to cancel")
+                            .size(12.0)
+                            .color(theme::ACCENT),
+                    );
+                    ui.add_space(4.0);
+                }
+                egui::Grid::new("keybinds")
+                    .num_columns(2)
+                    .spacing([14.0, 5.0])
+                    .min_col_width(150.0)
+                    .show(ui, |ui| {
+                        for bind in Action::ALL {
+                            ui.label(
+                                egui::RichText::new(bind.label()).size(13.0).color(theme::MID),
+                            );
+                            let waiting = rebinding == Some(bind);
+                            let label = if waiting {
+                                "...".to_string()
+                            } else {
+                                settings.keys.label(bind)
+                            };
+                            let button = egui::Button::new(
+                                egui::RichText::new(label).monospace().size(12.5),
+                            );
+                            if ui
+                                .add_sized(egui::vec2(130.0, 24.0), button)
+                                .clicked()
+                            {
+                                action = PauseAction::Rebind(bind);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(6.0);
+                if ui.button("Reset controls to defaults").clicked() {
+                    settings.keys.reset();
+                    changed = true;
+                }
+            });
+
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if ui.button("Done").clicked() {
+                    action = PauseAction::CloseSettings;
+                }
+                ui.label(
+                    egui::RichText::new("changes apply as you make them")
+                        .size(11.0)
+                        .color(theme::DIM),
+                );
+            });
+        });
+
+    // A change beats a navigation action: the edit still has to be saved.
+    if changed {
+        return PauseAction::Apply(Box::new(settings));
+    }
+    action
+}
+
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.label(egui::RichText::new(title).monospace().size(11.0).color(theme::DIM));
+    ui.add_space(4.0);
 }

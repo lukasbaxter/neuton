@@ -9,10 +9,8 @@ use std::sync::Arc;
 use neuton_render::{Camera, WorldRenderer};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
+use crate::settings::{Action, Settings};
 use winit::keyboard::KeyCode;
-
-/// Degrees of turn per pixel of mouse movement.
-const SENSITIVITY: f32 = 0.12;
 
 pub struct WorldView {
     pub session: WorldSession,
@@ -53,6 +51,12 @@ pub struct WorldView {
     pub first_chunk: Option<Instant>,
     pub last_chunk: Option<Instant>,
     pub timing: crate::session::Timing,
+    /// The player's settings. Changes take effect the moment they are made.
+    pub settings: Settings,
+    /// Whether the settings screen is up, over the pause menu.
+    pub settings_open: bool,
+    /// The action waiting for a key, while rebinding one.
+    pub rebinding: Option<Action>,
     /// When the last movement update went out, and what it said.
     last_move_sent: Option<Instant>,
     last_position: Option<[f64; 3]>,
@@ -88,6 +92,9 @@ impl WorldView {
             first_chunk: None,
             last_chunk: None,
             timing: Default::default(),
+            settings: Settings::load(),
+            settings_open: false,
+            rebinding: None,
             last_move_sent: None,
             last_position: None,
             last_rotation: None,
@@ -118,25 +125,25 @@ impl WorldView {
             return false;
         }
 
+        let action = self.settings.keys.action_for(code);
         if pressed {
-            match code {
-                KeyCode::F3 => {
+            match action {
+                Some(Action::Debug) => {
                     self.show_debug = !self.show_debug;
                     return false;
                 }
-                // T for chat and slash for a command, as in the game.
-                KeyCode::KeyT => {
+                Some(Action::Chat) => {
                     self.chat.open("");
                     self.held.clear();
                     return true;
                 }
-                KeyCode::Slash => {
+                Some(Action::Command) => {
                     self.chat.open("/");
                     self.held.clear();
                     return true;
                 }
                 // Double-tap jump to fly, where the server allows it at all.
-                KeyCode::Space if self.abilities.may_fly && !repeat => {
+                Some(Action::Jump) if self.abilities.may_fly && !repeat => {
                     let now = Instant::now();
                     if self.last_jump.is_some_and(|t| now.duration_since(t).as_millis() < 300) {
                         self.toggle_fly();
@@ -152,6 +159,14 @@ impl WorldView {
             self.held.remove(&code);
         }
         false
+    }
+
+    /// True if the key bound to an action is currently down.
+    fn acting(&self, action: Action) -> bool {
+        self.settings
+            .keys
+            .key_for(action)
+            .is_some_and(|key| self.held.contains(&key))
     }
 
     /// Appends typed text to the input line.
@@ -198,10 +213,11 @@ impl WorldView {
 
     pub fn mouse_moved(&mut self, dx: f32, dy: f32) {
         if self.captured {
+            let sensitivity = self.settings.mouse_sensitivity;
             // Moving the mouse right turns the view right, and on these axes
             // turning right raises the yaw: facing south, your right is west,
             // which is a larger yaw than south.
-            self.camera.turn(dx * SENSITIVITY, dy * SENSITIVITY);
+            self.camera.turn(dx * sensitivity, dy * sensitivity);
         }
     }
 
@@ -277,22 +293,31 @@ impl WorldView {
                     self.blocks.remove(&(x, z));
                 }
                 WorldEvent::Moved { x, y, z, yaw, pitch } => {
-                    if !self.placed {
-                        self.placed = true;
-                        // The server sends the feet; the camera sits at the eyes.
-                        self.body.position = [x, y, z];
-                        self.body.velocity = [0.0; 3];
+                    // Every teleport, not just the first. The server moves a
+                    // player for all sorts of reasons, from a command to a
+                    // portal to being pushed, and ignoring those left the
+                    // client standing somewhere the server did not think it
+                    // was.
+                    let first = !self.placed;
+                    self.placed = true;
+                    self.body.position = [x, y, z];
+                    self.body.velocity = [0.0; 3];
+                    // Anything already sent about where we were is now wrong.
+                    self.last_position = None;
+
+                    if first {
                         // Walking, not flying: the whole point.
-                        self.body.flying = false;
-                        self.camera.position =
-                            [x as f32, (y + neuton_world::physics::EYE_HEIGHT) as f32, z as f32];
+                        self.body.flying = self.abilities.flying;
                         self.camera.yaw = yaw;
                         self.camera.pitch = pitch;
-                        if !self.reported_loaded {
-                            self.reported_loaded = true;
-                            self.session.send(Outgoing::Loaded);
-                        }
+                        self.session.send(Outgoing::Loaded);
+                        self.reported_loaded = true;
                     }
+                    self.camera.position = [
+                        x as f32,
+                        (y + neuton_world::physics::EYE_HEIGHT) as f32,
+                        z as f32,
+                    ];
                 }
                 WorldEvent::Abilities(abilities) => {
                     self.abilities = abilities;
@@ -319,15 +344,15 @@ impl WorldView {
     /// decides how many of them happen.
     fn tick_physics(&mut self, dt: f32) {
         const TICK: f64 = 1.0 / 60.0;
-        let axis = |held: &HashSet<KeyCode>, pos: KeyCode, neg: KeyCode| {
-            (held.contains(&pos) as i32 - held.contains(&neg) as i32) as f32
+        let axis = |pos: Action, neg: Action| {
+            (self.acting(pos) as i32 - self.acting(neg) as i32) as f32
         };
         let input = MoveInput {
-            forward: axis(&self.held, KeyCode::KeyW, KeyCode::KeyS),
-            strafe: axis(&self.held, KeyCode::KeyD, KeyCode::KeyA),
-            jump: self.held.contains(&KeyCode::Space),
-            sneak: self.held.contains(&KeyCode::ShiftLeft),
-            sprint: self.held.contains(&KeyCode::ControlLeft),
+            forward: axis(Action::Forward, Action::Back),
+            strafe: axis(Action::Right, Action::Left),
+            jump: self.acting(Action::Jump),
+            sneak: self.acting(Action::Sneak),
+            sprint: self.acting(Action::Sprint),
             yaw: self.camera.yaw,
         };
 
@@ -352,6 +377,9 @@ impl WorldView {
             self.accumulator -= TICK;
             physics::step(&mut self.body, input, &world, self.shapes.as_ref(), TICK);
         }
+
+        // Settings that the camera owns.
+        self.camera.fov_degrees = self.settings.fov;
 
         // The camera sits at the eyes.
         self.camera.position = [

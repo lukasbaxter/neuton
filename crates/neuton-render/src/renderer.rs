@@ -50,6 +50,8 @@ pub struct WorldRenderer {
     /// Too near and the world is permanently hazy; too far and it ends at a
     /// visible wall where the chunks run out.
     pub fog_scale: f32,
+    /// The lowest light any surface is drawn at. One is fullbright.
+    pub min_light: f32,
 }
 
 impl WorldRenderer {
@@ -270,6 +272,7 @@ impl WorldRenderer {
             drawn: std::cell::Cell::new(0),
             sky_color: [0.62, 0.74, 0.94, 1.0],
             fog_scale: 1.0,
+            min_light: 0.0,
         }
     }
 
@@ -373,6 +376,14 @@ impl WorldRenderer {
             .sum()
     }
 
+    /// Changes whether presentation waits for the display.
+    ///
+    /// Returns whether the surface needs reconfiguring, which only the owner of
+    /// the surface can do.
+    pub fn wants_present_mode(&self, vsync: bool) -> wgpu::PresentMode {
+        if vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync }
+    }
+
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         if (width, height) != self.depth_size && width > 0 && height > 0 {
             self.depth = create_depth(device, width, height);
@@ -400,7 +411,7 @@ impl WorldRenderer {
                 fog: [
                     distance * 0.55 * self.fog_scale,
                     distance * 0.95 * self.fog_scale,
-                    0.0,
+                    self.min_light,
                     0.0,
                 ],
             }),
