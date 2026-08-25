@@ -505,6 +505,27 @@ impl WorldView {
                     let first = !self.placed;
                     self.placed = true;
 
+                    // A teleport that is not the first one and not a command is
+                    // usually a server disagreeing with where the client thinks
+                    // it is. The distance and the direction of that disagreement
+                    // are the whole diagnosis, and they are gone the instant the
+                    // position is overwritten below.
+                    if !first && std::env::var_os("NEUTON_STATS").is_some() {
+                        let d = [
+                            x - self.body.position[0],
+                            y - self.body.position[1],
+                            z - self.body.position[2],
+                        ];
+                        let distance = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                        eprintln!(
+                            "setback: {distance:.4} blocks  by [{:+.4} {:+.4} {:+.4}]  \
+                             client {:.3?} -> server [{x:.3} {y:.3} {z:.3}]  \
+                             v {:.4?} on_ground={} relative={relative:?}",
+                            d[0], d[1], d[2],
+                            self.body.position, self.body.velocity, self.body.on_ground,
+                        );
+                    }
+
                     // Offsets were already resolved against what the server
                     // was last told, which is the base it used for them.
                     let position = [x, y, z];
