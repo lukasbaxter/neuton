@@ -189,6 +189,15 @@ const SPRINT_MULTIPLIER: f64 = 1.3;
 const SNEAK_MULTIPLIER: f64 = 0.3;
 /// How high a step the player walks up without jumping.
 const STEP_HEIGHT: f64 = 0.6;
+
+/// How close two box faces have to be to count as touching rather than
+/// overlapping.
+///
+/// The game works to about this, and anything tighter turns ordinary floating
+/// point drift into a player standing a fraction inside a wall. That fraction
+/// is not cosmetic: a server checking whether a player has entered a block
+/// sets them back for it on the first offence.
+const TOUCH: f64 = 1e-7;
 /// Ticks before another jump is allowed, as the game counts them.
 const JUMP_DELAY: u8 = 10;
 
@@ -384,14 +393,28 @@ fn clip(from: &Aabb, delta: f64, axis: usize, boxes: &[Aabb]) -> f64 {
         // Only boxes that overlap on the other two axes can block this one.
         let overlaps = (0..3)
             .filter(|a| *a != axis)
-            .all(|a| from.min[a] < other.max[a] - 1e-9 && from.max[a] > other.min[a] + 1e-9);
+            .all(|a| from.min[a] < other.max[a] - TOUCH && from.max[a] > other.min[a] + TOUCH);
         if !overlaps {
             continue;
         }
-        if delta > 0.0 && from.max[axis] <= other.min[axis] + 1e-9 {
-            allowed = allowed.min(other.min[axis] - from.max[axis]);
-        } else if delta < 0.0 && from.min[axis] >= other.max[axis] - 1e-9 {
-            allowed = allowed.max(other.max[axis] - from.min[axis]);
+        // Standing clear of the box is the ordinary case: move up to its face
+        // and no further. Already being inside it is the case that matters,
+        // because the obvious reading -- this box is not in front of me, so it
+        // cannot stop me -- lets the player carry on straight through, and a
+        // player who is a rounding error inside a wall becomes a player who
+        // walks out the other side of it.
+        if delta > 0.0 {
+            if from.max[axis] <= other.min[axis] + TOUCH {
+                allowed = allowed.min(other.min[axis] - from.max[axis]);
+            } else if from.min[axis] < other.max[axis] - TOUCH {
+                allowed = allowed.min(0.0);
+            }
+        } else if delta < 0.0 {
+            if from.min[axis] >= other.max[axis] - TOUCH {
+                allowed = allowed.max(other.max[axis] - from.min[axis]);
+            } else if from.max[axis] > other.min[axis] + TOUCH {
+                allowed = allowed.max(0.0);
+            }
         }
     }
     // Never push the player backwards through something they were already
@@ -857,5 +880,65 @@ mod shape_tests {
         assert_eq!(boxes.len(), 1);
         assert_eq!(boxes[0].min, [0.0, 0.0, 0.0]);
         assert_eq!(boxes[0].max, [1.0, 1.0, 1.0]);
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    /// A block filling 10..11 on x, and plenty of room on the other axes.
+    fn wall() -> [Aabb; 1] {
+        [Aabb { min: [10.0, 60.0, 0.0], max: [11.0, 61.0, 1.0] }]
+    }
+
+    fn player_at(max_x: f64) -> Aabb {
+        Aabb { min: [max_x - 0.6, 60.0, 0.2], max: [max_x, 61.8, 0.8] }
+    }
+
+    #[test]
+    fn a_player_short_of_a_wall_stops_at_it() {
+        let allowed = clip(&player_at(9.5), 1.0, 0, &wall());
+        assert!((allowed - 0.5).abs() < 1e-12, "{allowed}");
+    }
+
+    #[test]
+    fn a_player_flush_against_a_wall_does_not_move() {
+        assert_eq!(clip(&player_at(10.0), 1.0, 0, &wall()), 0.0);
+    }
+
+    /// The one that got Lukas set back. Standing flush and jumping puts the
+    /// player's edge a rounding error past the wall's face, and the old test
+    /// read that as "this box is behind me" and let the whole movement
+    /// through. One frame of that is a player inside a block, and the server
+    /// puts them back on the first offence.
+    #[test]
+    fn a_player_a_hair_inside_a_wall_cannot_go_deeper() {
+        for over in [1e-9, 1e-8, 1e-6, 0.01, 0.4] {
+            let allowed = clip(&player_at(10.0 + over), 1.0, 0, &wall());
+            assert_eq!(allowed, 0.0, "moved {allowed} while {over} inside");
+        }
+    }
+
+    #[test]
+    fn the_same_going_the_other_way() {
+        let boxes = wall();
+        // Approaching from the far side, a hair past the wall's own far face.
+        let inside = Aabb { min: [10.9, 60.0, 0.2], max: [11.5, 61.8, 0.8] };
+        assert_eq!(clip(&inside, -1.0, 0, &boxes), 0.0);
+    }
+
+    #[test]
+    fn a_wall_beside_the_player_never_blocks_the_jump() {
+        // Flush on x, moving up: the wall is next to the player, not under.
+        let up = clip(&player_at(10.0), 0.42, 1, &wall());
+        assert_eq!(up, 0.42);
+    }
+
+    #[test]
+    fn clearing_the_top_of_the_wall_unblocks_the_way_forward() {
+        // Feet above the wall, so nothing overlaps on y any more.
+        let above = Aabb { min: [9.4, 61.0, 0.2], max: [10.0, 62.8, 0.8] };
+        assert_eq!(clip(&above, 1.0, 0, &wall()), 1.0);
     }
 }
