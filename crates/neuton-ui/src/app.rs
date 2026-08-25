@@ -27,6 +27,8 @@ enum Modal {
 pub struct Launcher {
     accounts: Accounts,
     accounts_path: PathBuf,
+    /// A name to play under on servers in offline mode, and whether to use it.
+    offline: crate::offline::Offline,
     servers: ServerList,
     signin: SignInTask,
     pinger: Pinger,
@@ -56,6 +58,7 @@ impl Launcher {
         Self {
             accounts: Accounts::load(&accounts_path),
             accounts_path,
+            offline: crate::offline::Offline::load(),
             servers: ServerList::load_default(),
             signin: SignInTask::default(),
             pinger: Pinger::default(),
@@ -151,8 +154,18 @@ impl Launcher {
                         if ui.button(RichText::new("Accounts").size(13.0)).clicked() {
                             self.modal = Modal::Accounts;
                         }
-                        match self.accounts.active() {
-                            Some(a) => {
+                        // Offline first, because that is what a join would
+                        // actually use, and a header that named the account
+                        // instead would be telling the player the wrong name.
+                        match (self.offline.session(), self.accounts.active()) {
+                            (Some(s), _) => {
+                                ui.label(RichText::new("offline").size(11.5).color(DIM));
+                                ui.label(RichText::new(&s.profile.name).size(13.5).color(FG));
+                                let (r, _) = ui
+                                    .allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                                ui.painter().circle_filled(r.center(), 3.5, WARN);
+                            }
+                            (None, Some(a)) => {
                                 ui.label(RichText::new(&a.profile.name).size(13.5).color(FG));
                                 let (r, _) = ui
                                     .allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
@@ -162,7 +175,7 @@ impl Launcher {
                                     if a.is_valid() { ACCENT } else { WARN },
                                 );
                             }
-                            None => {
+                            (None, None) => {
                                 ui.label(RichText::new("not signed in").size(13.0).color(DIM));
                             }
                         }
@@ -376,7 +389,7 @@ impl Launcher {
                                 });
                                 ui.add_space(4.0);
 
-                                let can_join = reachable && self.accounts.active().is_some();
+                                let can_join = reachable && self.identity().is_some();
                                 let join = ui.add_enabled(
                                     can_join,
                                     egui::Button::new(RichText::new("Join").size(13.0).strong()),
@@ -388,7 +401,7 @@ impl Launcher {
                                     join.on_disabled_hover_text(if !reachable {
                                         "server did not answer"
                                     } else {
-                                        "sign in first"
+                                        "sign in, or set an offline name under Accounts"
                                     });
                                 }
 
@@ -525,14 +538,23 @@ impl Launcher {
         }
     }
 
+    /// Who a join would be made as: the offline name if one is chosen,
+    /// otherwise the signed-in account. Offline wins when it is switched on,
+    /// because choosing it is a deliberate act and a stale account should not
+    /// quietly outrank it.
+    fn identity(&self) -> Option<neuton_auth::Session> {
+        self.offline.session().or_else(|| self.accounts.active().cloned())
+    }
+
     /// Hands a join to the event loop, which owns the window and the GPU.
     fn join_selected(&mut self) {
         let Some(server) = self.selected.and_then(|id| self.servers.get(id)) else {
             self.notice = Some(("Select a server first.".to_string(), WARN));
             return;
         };
-        let Some(account) = self.accounts.active().cloned() else {
-            self.notice = Some(("Sign in first.".to_string(), WARN));
+        let Some(account) = self.identity() else {
+            self.notice =
+                Some(("Sign in, or set an offline name under Accounts.".to_string(), WARN));
             return;
         };
         // The address is resolved again by the connection, including any SRV
@@ -760,7 +782,7 @@ impl Launcher {
                             .selected
                             .and_then(|id| self.servers.get(id))
                             .map(|s| s.display_name().to_string());
-                        let ready = chosen.is_some() && self.accounts.active().is_some();
+                        let ready = chosen.is_some() && self.identity().is_some();
 
                         if ui
                             .add_enabled(
@@ -953,6 +975,7 @@ impl Launcher {
         let mut keep = !Self::dismissed(ctx);
         let mut switch_to: Option<String> = None;
         let mut remove: Option<(u128, String)> = None;
+        let mut offline_changed = false;
         let mut open = true;
 
         Self::window("Accounts").open(&mut open).show(ctx, |ui| {
@@ -1002,6 +1025,10 @@ impl Launcher {
 
             ui.separator();
             ui.add_space(6.0);
+            Self::offline_controls(ui, &mut self.offline, &mut offline_changed);
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(6.0);
             self.sign_in_controls(ui);
             ui.add_space(10.0);
             if ui.button(RichText::new("Close").size(13.0)).clicked() {
@@ -1009,9 +1036,16 @@ impl Launcher {
             }
         });
 
+        if offline_changed && let Err(e) = self.offline.save() {
+            eprintln!("neuton: could not save the offline name: {e}");
+        }
         if let Some(name) = switch_to {
             self.accounts.set_active(&name);
-            let _ = self.accounts.save();
+            self.accounts.save().ok();
+            // Picking a real account is a way of saying to stop playing under
+            // a made-up name.
+            self.offline.active = false;
+            let _ = self.offline.save();
         }
         if let Some((uuid, name)) = remove {
             self.modal = Modal::ConfirmRemoveAccount { uuid, name };
@@ -1054,6 +1088,54 @@ impl Launcher {
         } else {
             self.modal = Modal::ConfirmRemoveAccount { uuid, name };
         }
+    }
+
+    /// Setting a name to play under on servers that do not check identities.
+    ///
+    /// Associated rather than a method: the accounts dialog already has `self`
+    /// borrowed for the account rows around it.
+    fn offline_controls(
+        ui: &mut egui::Ui,
+        offline: &mut crate::offline::Offline,
+        changed: &mut bool,
+    ) {
+        ui.label(RichText::new("Offline").size(13.5).strong().color(FG));
+        ui.label(
+            RichText::new("For servers running with online-mode=false. They ask for a name and check nothing else.")
+                .size(11.5)
+                .color(DIM),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut offline.name)
+                    .hint_text("name")
+                    .desired_width(180.0),
+            );
+            if field.changed() {
+                *changed = true;
+            }
+            let problem = crate::offline::Offline::name_problem(&offline.name);
+            // Nothing to turn on until the name would be accepted, so the
+            // switch cannot be left on over a name no server will take.
+            let ok = problem.is_none();
+            if !ok {
+                offline.active = false;
+            }
+            let mut on = offline.active;
+            if ui
+                .add_enabled(ok, egui::Checkbox::new(&mut on, RichText::new("Use this name").size(12.5)))
+                .changed()
+            {
+                offline.active = on;
+                *changed = true;
+            }
+            if let Some(problem) = problem
+                && !offline.name.is_empty()
+            {
+                ui.label(RichText::new(problem).color(WARN).size(11.5));
+            }
+        });
     }
 
     fn sign_in_controls(&mut self, ui: &mut egui::Ui) {

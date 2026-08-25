@@ -31,6 +31,24 @@ struct ChunkBuffers {
 }
 
 /// Draws the world.
+/// How much entity geometry one frame can hold.
+///
+/// Two hundred mobs of a dozen boxes each, which is more than a server sends
+/// within sight. The builder stops at this rather than the buffer being asked
+/// to grow while a frame is in flight.
+pub const MAX_ENTITY_VERTICES: usize = 128 * 1024;
+pub const MAX_ENTITY_INDICES: usize = MAX_ENTITY_VERTICES / 4 * 6;
+
+/// One run of the entity mesh that shares a texture.
+#[derive(Debug, Clone)]
+pub struct EntityBatch {
+    /// The texture's path in the assets, as the model table names it.
+    pub texture: String,
+    /// Where this run starts in the index buffer, and how long it is.
+    pub start: u32,
+    pub count: u32,
+}
+
 pub struct WorldRenderer {
     pipeline: wgpu::RenderPipeline,
     translucent_pipeline: wgpu::RenderPipeline,
@@ -56,6 +74,20 @@ pub struct WorldRenderer {
     outline_buffer: wgpu::Buffer,
     /// Line ends in the outline buffer this frame.
     outline_vertices: u32,
+    /// Entities: one buffer for every model in the world, rebuilt each frame,
+    /// drawn in runs of one texture each. A zombie and a cow cannot share a
+    /// draw the way two blocks can, because they are not on the same sheet.
+    entity_pipeline: wgpu::RenderPipeline,
+    /// Every entity texture uploaded so far, by its path in the assets. Skins
+    /// arrive one per player, so this grows while a world is open.
+    entity_textures: std::collections::HashMap<String, wgpu::BindGroup>,
+    entity_vertices: wgpu::Buffer,
+    entity_indices: wgpu::Buffer,
+    /// What to draw and with what, in the order the mesh was built.
+    entity_batches: Vec<EntityBatch>,
+    /// The layout a skin has to match, kept so one can be uploaded later.
+    atlas_layout: wgpu::BindGroupLayout,
+    entity_sampler: wgpu::Sampler,
     /// Geometry for the cracks over a block being broken, and the pipeline
     /// that multiplies them into the block rather than over it.
     crumbling_pipeline: wgpu::RenderPipeline,
@@ -394,10 +426,85 @@ impl WorldRenderer {
             cache: None,
         });
 
+        // Entities are cut out rather than blended, the same as the world:
+        // a skin's outer layer is all-or-nothing and blending it leaves a halo.
+        let entity_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("entity"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x3,
+                        1 => Float32x2,
+                        2 => Float32x4,
+                        3 => Float32,
+                    ],
+                })],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                // Both sides: an arm seen from inside a swing is still an arm,
+                // and the outer skin layer is a shell around the inner one.
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_entity"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let entity_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("skin"),
+            // No mipmaps: a skin is sixty four pixels across and every one of
+            // them is meant to be seen.
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
         Self {
             pipeline,
             translucent_pipeline,
             crumbling_pipeline,
+            entity_pipeline,
+            entity_textures: std::collections::HashMap::new(),
+            entity_vertices: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("entity vertices"),
+                size: (std::mem::size_of::<Vertex>() * MAX_ENTITY_VERTICES) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            entity_indices: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("entity indices"),
+                size: (std::mem::size_of::<u32>() * MAX_ENTITY_INDICES) as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            entity_batches: Vec::new(),
+            atlas_layout,
+            entity_sampler,
             globals_buffer,
             globals_bind_group,
             outline_pipeline,
@@ -532,6 +639,105 @@ impl WorldRenderer {
     /// `stage` runs from zero to nine as the swing progresses; `None` clears
     /// them. The boxes are the block's own shapes, so cracks appear over a slab
     /// where the slab is rather than over the whole cube it sits in.
+    /// Whether a texture has already been uploaded.
+    ///
+    /// Asked before decoding a PNG, because the answer is no exactly once per
+    /// texture and yes on every frame after that.
+    pub fn has_entity_texture(&self, key: &str) -> bool {
+        self.entity_textures.contains_key(key)
+    }
+
+    /// Hands the renderer one entity texture: a mob's sheet, or a player's
+    /// skin.
+    pub fn set_entity_texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        key: &str,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) {
+        let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(key),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // Unorm rather than Srgb, to match the atlas: the surface is not
+            // sRGB either, and mixing the two darkens one of them by a gamma.
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            texture.as_image_copy(),
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.entity_textures.insert(
+            key.to_string(),
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(key),
+                layout: &self.atlas_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.entity_sampler),
+                    },
+                ],
+            }),
+        );
+    }
+
+    /// What the renderer will actually draw for entities this frame.
+    pub fn entity_debug(&self) -> (usize, usize, usize) {
+        (
+            self.entity_batches.iter().map(|b| b.count as usize).sum(),
+            self.entity_batches.len(),
+            self.entity_textures.len(),
+        )
+    }
+
+    /// Every entity's geometry for this frame, already in world space, and the
+    /// runs of it that share a texture.
+    pub fn set_entities(
+        &mut self,
+        queue: &wgpu::Queue,
+        vertices: &[Vertex],
+        indices: &[u32],
+        batches: &[EntityBatch],
+    ) {
+        self.entity_batches.clear();
+        let vertex_bytes: &[u8] = bytemuck::cast_slice(vertices);
+        let index_bytes: &[u8] = bytemuck::cast_slice(indices);
+        if vertex_bytes.len() as u64 > self.entity_vertices.size()
+            || index_bytes.len() as u64 > self.entity_indices.size()
+        {
+            // More than the buffers hold. Drawing none of them is wrong, but
+            // growing a buffer mid-frame is worse, and the builder is supposed
+            // to have stopped before this.
+            return;
+        }
+        if indices.is_empty() {
+            return;
+        }
+        queue.write_buffer(&self.entity_vertices, 0, vertex_bytes);
+        queue.write_buffer(&self.entity_indices, 0, index_bytes);
+        self.entity_batches.extend_from_slice(batches);
+    }
+
     pub fn set_breaking(
         &mut self,
         queue: &wgpu::Queue,
@@ -730,6 +936,22 @@ impl WorldRenderer {
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
             pass.set_vertex_buffer(0, self.outline_buffer.slice(..));
             pass.draw(0..self.outline_vertices, 0..1);
+        }
+
+        // Entities, with the world's solid blocks already down so they occlude
+        // each other correctly, and before anything translucent. One draw per
+        // texture, which is one per kind of mob on screen and one per skin.
+        if !self.entity_batches.is_empty() {
+            pass.set_pipeline(&self.entity_pipeline);
+            pass.set_vertex_buffer(0, self.entity_vertices.slice(..));
+            pass.set_index_buffer(self.entity_indices.slice(..), wgpu::IndexFormat::Uint32);
+            for batch in &self.entity_batches {
+                let Some(texture) = self.entity_textures.get(&batch.texture) else { continue };
+                pass.set_bind_group(1, texture, &[]);
+                pass.draw_indexed(batch.start..batch.start + batch.count, 0, 0..1);
+            }
+            // Back to the block atlas for everything after this.
+            pass.set_bind_group(1, &self.atlas_bind_group, &[]);
         }
 
         // The cracks, multiplied into the solid blocks now that they are all

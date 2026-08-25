@@ -118,7 +118,7 @@ impl ItemArt {
         }
     }
 
-    fn packs(&mut self) -> Option<&mut neuton_assets::PackStack> {
+    pub fn packs(&mut self) -> Option<&mut neuton_assets::PackStack> {
         if self.packs.is_none() {
             self.packs = neuton_assets::PackStack::discover("26.2");
         }

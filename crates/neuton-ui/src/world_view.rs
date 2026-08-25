@@ -95,6 +95,12 @@ pub struct WorldView {
     awaiting_break: Option<([i32; 3], Instant)>,
     /// Everything else in the world: mobs, dropped items, other players.
     pub entities: crate::entities::Entities,
+    /// Kept between frames so rebuilding every entity does not also rebuild
+    /// the buffers it goes into.
+    entity_mesh: crate::entity_render::Mesh,
+    /// Textures asked for and not found, so a missing one is looked for once
+    /// rather than on every frame for as long as the thing is in sight.
+    missing_textures: std::collections::HashSet<String>,
     /// What the player is carrying, and which slot is in hand.
     pub inventory: crate::inventory::Inventory,
     /// Item pictures and interface sprites, rendered as they are first needed.
@@ -217,6 +223,8 @@ impl WorldView {
             last_input: None,
             last_sprinting: false,
             entities: crate::entities::Entities::default(),
+            entity_mesh: crate::entity_render::Mesh::default(),
+            missing_textures: std::collections::HashSet::new(),
             inventory: crate::inventory::Inventory::default(),
             art: crate::inventory::ItemArt::new(),
             pending: std::collections::VecDeque::new(),
@@ -384,6 +392,54 @@ impl WorldView {
     }
 
     /// Advances the player and the world for a frame of `dt` seconds.
+    /// Uploads any entity texture this frame needs and does not have.
+    ///
+    /// One at a time and only on the frame it is first needed: decoding a PNG
+    /// is not free, and a world with a dozen kinds of mob in it would otherwise
+    /// pay for all of them on the frame the first one walks into view.
+    fn load_entity_textures(
+        &mut self,
+        renderer: &mut WorldRenderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        for batch in &self.entity_mesh.batches {
+            if renderer.has_entity_texture(&batch.texture)
+                || self.missing_textures.contains(&batch.texture)
+            {
+                continue;
+            }
+            let path = format!("assets/minecraft/textures/{}", batch.texture);
+            let image = self
+                .art
+                .packs()
+                .and_then(|packs| packs.read(&path))
+                .and_then(|bytes| crate::icons::decode(&bytes));
+            match image {
+                Some(image) => {
+                    let rgba: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
+                    renderer.set_entity_texture(
+                        device,
+                        queue,
+                        &batch.texture,
+                        &rgba,
+                        image.size[0] as u32,
+                        image.size[1] as u32,
+                    );
+                }
+                None => {
+                    // Nothing to draw it with. Said once, because the entity is
+                    // still there and will ask again next frame.
+                    eprintln!("neuton: no texture at {path}");
+                    self.missing_textures.insert(batch.texture.clone());
+                }
+            }
+            // One per frame: the first sight of a mob costs a decode, not the
+            // first sight of every mob at once.
+            break;
+        }
+    }
+
     pub fn update(
         &mut self,
         dt: f32,
@@ -409,6 +465,20 @@ impl WorldView {
             }
         }
         self.show_target(renderer, queue);
+
+        // Everything the world has told us about that has a model, rebuilt
+        // from scratch: they are nearly always moving, and there are never
+        // many of them.
+        let alpha = (self.accumulator / Self::TICK) as f32;
+        self.entities.animate(dt);
+        crate::entity_render::build(&self.entities, alpha, &mut self.entity_mesh);
+        self.load_entity_textures(renderer, device, queue);
+        renderer.set_entities(
+            queue,
+            &self.entity_mesh.vertices,
+            &self.entity_mesh.indices,
+            &self.entity_mesh.batches,
+        );
 
         // Holding the use button lays a run of blocks, at the rate the game
         // uses rather than one a frame.
@@ -1264,6 +1334,13 @@ impl WorldView {
                 self.entities.count_of("minecraft:player"),
                 self.entities.count_of("minecraft:item"),
             ),
+            {
+                let (indices, batches, textures) = renderer.entity_debug();
+                format!(
+                    "Models: {} verts, {indices} indices, {batches} draws, {textures} textures",
+                    self.entity_mesh.vertices.len(),
+                )
+            },
             format!(
                 "Mode: {}{}",
                 if self.abilities.instant_build { "creative" } else { "survival" },

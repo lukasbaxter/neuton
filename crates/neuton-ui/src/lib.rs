@@ -7,7 +7,7 @@
 pub mod app;
 pub mod chat;
 pub mod entities;
-pub mod player_model;
+pub mod entity_render;
 pub mod auth_task;
 pub mod fonts;
 pub mod gpu;
@@ -17,6 +17,7 @@ pub mod servers;
 pub mod settings;
 pub mod session;
 pub mod inventory;
+pub mod offline;
 pub mod world_view;
 pub mod theme;
 

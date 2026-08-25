@@ -19,6 +19,11 @@ pub struct Entity {
     pub pitch: f32,
     pub head_yaw: f32,
     pub velocity: [f64; 3],
+    /// Where in its walking cycle it is, and how much of the swing to show.
+    /// Kept here rather than worked out while drawing, because it depends on
+    /// how far the thing has walked rather than on where it is now.
+    pub stride: f32,
+    pub stride_amount: f32,
 }
 
 impl Entity {
@@ -81,6 +86,8 @@ impl Entities {
                 pitch,
                 head_yaw,
                 velocity,
+                stride: 0.0,
+                stride_amount: 0.0,
             },
         );
     }
@@ -125,6 +132,28 @@ impl Entities {
     pub fn head_yaw(&mut self, id: i32, yaw: f32) {
         if let Some(entity) = self.by_id.get_mut(&id) {
             entity.head_yaw = yaw;
+        }
+    }
+
+    /// Advances the walking cycle of everything in the world.
+    ///
+    /// Driven by the distance covered rather than by time, so a mob that stops
+    /// stops with its legs together and one that is pushed along does not walk
+    /// on the spot.
+    pub fn animate(&mut self, dt: f32) {
+        for entity in self.by_id.values_mut() {
+            let step = {
+                let dx = entity.position[0] - entity.previous[0];
+                let dz = entity.position[2] - entity.previous[2];
+                ((dx * dx + dz * dz).sqrt() as f32) * 20.0
+            };
+            // Full swing at a walking pace, and never more than full.
+            let wanted = (step * 0.4).min(1.0);
+            entity.stride_amount += (wanted - entity.stride_amount) * (dt * 12.0).min(1.0);
+            entity.stride += step * dt * 2.0;
+            if entity.stride > std::f32::consts::TAU * 1024.0 {
+                entity.stride %= std::f32::consts::TAU;
+            }
         }
     }
 
