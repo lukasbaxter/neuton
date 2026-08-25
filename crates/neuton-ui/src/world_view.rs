@@ -120,6 +120,8 @@ pub struct WorldView {
     missing_textures: std::collections::HashSet<String>,
     /// What the player is carrying, and which slot is in hand.
     pub inventory: crate::inventory::Inventory,
+    /// What the pointer is doing on the inventory screen.
+    pub cursor: crate::inventory::Cursor,
     /// Item pictures and interface sprites, rendered as they are first needed.
     pub art: crate::inventory::ItemArt,
     /// Chunk meshes waiting to go to the GPU, oldest first.
@@ -250,6 +252,7 @@ impl WorldView {
             placed_flat: Vec::new(),
             missing_textures: std::collections::HashSet::new(),
             inventory: crate::inventory::Inventory::default(),
+            cursor: crate::inventory::Cursor::default(),
             art: crate::inventory::ItemArt::new(),
             pending: std::collections::VecDeque::new(),
             last_jump: None,
@@ -301,6 +304,33 @@ impl WorldView {
         }
 
         let action = self.settings.keys.action_for(code);
+
+        // With the inventory up, the keys that act on a slot act on the one
+        // under the pointer instead of on what is in hand. This is the game's
+        // own overloading: the same key throws the held item in the world and
+        // the hovered stack on the screen.
+        if self.inventory.open && pressed && !repeat {
+            if let Some(slot) = self.cursor.hovered {
+                if let Some(digit) = hotbar_digit(code) {
+                    self.act(crate::clicks::Click::Swap { slot, button: digit as u8 });
+                    return false;
+                }
+                if code == KeyCode::KeyF {
+                    self.act(crate::clicks::Click::Swap {
+                        slot,
+                        button: crate::clicks::OFF_HAND_BUTTON,
+                    });
+                    return false;
+                }
+                if action == Some(Action::Drop) {
+                    let whole = self.held.contains(&KeyCode::ControlLeft)
+                        || self.held.contains(&KeyCode::ControlRight);
+                    self.act(crate::clicks::Click::Throw { slot, whole_stack: whole });
+                    return false;
+                }
+            }
+        }
+
         if pressed {
             match action {
                 Some(Action::Debug) => {
@@ -1019,20 +1049,35 @@ impl WorldView {
         self.held.clear();
         if !self.inventory.open {
             // Closing hands anything left on the cursor back to the server,
-            // which drops it or puts it away as the rules require.
+            // which drops it or puts it away as the rules require. It stops
+            // being carried here at the same moment, because the server is
+            // about to say so and a stack that outlives the screen it was
+            // picked up on is the ghost everyone notices.
             self.session.send(Outgoing::CloseContainer { window: 0 });
+            self.inventory.set_carried(None);
+            self.inventory.drag = crate::clicks::Drag::default();
+            self.cursor = crate::inventory::Cursor::default();
         }
     }
 
     /// Clicks a slot. The server decides what actually happens and says so.
-    pub fn click_slot(&mut self, slot: usize, right: bool) {
-        self.session.send(Outgoing::Click {
-            window: 0,
-            state_id: self.inventory.state_id,
-            slot: slot as i16,
-            button: u8::from(right),
-            mode: 0,
-        });
+    /// Acts on one click of the inventory screen.
+    ///
+    /// The slots move first and the packet goes out afterwards, so what the
+    /// player sees happens on the frame they clicked rather than a round trip
+    /// later. The server's answer either agrees or replaces it.
+    pub fn act(&mut self, click: crate::clicks::Click) {
+        for wire in self.inventory.click(click) {
+            let carried = self.inventory.carried().map(|s| (s.id, s.count));
+            self.session.send(Outgoing::Click {
+                window: 0,
+                state_id: self.inventory.state_id,
+                slot: wire.slot,
+                button: wire.button,
+                mode: wire.mode,
+                carried,
+            });
+        }
     }
 
     /// Asks the server to put the player back in the world.

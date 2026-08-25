@@ -944,9 +944,19 @@ impl Connection {
 
     /// Clicks a slot in an open container.
     ///
-    /// The changed-slot map is sent empty. The client is meant to predict the
-    /// result and let the server correct it, and this one does not predict, so
-    /// it says so honestly and takes the correction the server sends back.
+    /// The changed-slot map is sent empty, which is allowed: the server then
+    /// compares every slot against what it last told us and sends back the
+    /// ones that moved, rather than only the ones we claimed would.
+    ///
+    /// What the cursor ends up holding is sent, though, because the server
+    /// checks that one every time and corrects it when it disagrees. Saying
+    /// "nothing" while holding a stack earns a correction packet on every
+    /// single click.
+    ///
+    /// Components are not written. A stack that carries any -- an enchanted
+    /// sword, a named tool -- will not match and the server will correct it,
+    /// which is the same outcome as saying nothing and no worse; a plain stack
+    /// of stone, which is nearly all of them, matches exactly.
     pub fn send_container_click(
         &mut self,
         window: i32,
@@ -954,6 +964,7 @@ impl Connection {
         slot: i16,
         button: u8,
         mode: i32,
+        carried: Option<(i32, i32)>,
     ) -> Result<()> {
         let mut w = Writer::new();
         w.write_varint(window);
@@ -962,7 +973,17 @@ impl Connection {
         w.write_u8(button);
         w.write_varint(mode);
         w.write_varint(0); // no predicted slot changes
-        w.write_varint(0); // and nothing predicted on the cursor
+        match carried {
+            Some((id, count)) if count > 0 => {
+                w.write_varint(count);
+                w.write_varint(id);
+                w.write_varint(0); // no components added
+                w.write_varint(0); // and none removed
+            }
+            _ => {
+                w.write_varint(0);
+            }
+        }
         self.framed.write_packet(ids::play::serverbound::CONTAINER_CLICK, &w)?;
         Ok(())
     }
