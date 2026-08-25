@@ -98,6 +98,9 @@ pub struct WorldView {
     /// Kept between frames so rebuilding every entity does not also rebuild
     /// the buffers it goes into.
     entity_mesh: crate::entity_render::Mesh,
+    /// Where to put the camera regardless of where the player is, for a
+    /// screenshot taken from a fixed viewpoint.
+    pub view_override: Option<([f32; 3], f32, f32)>,
     /// Chests and the like, by the column they stand in, found once when the
     /// column arrives rather than looked for again every frame.
     placed_models: HashMap<(i32, i32), Vec<crate::entity_render::Placed>>,
@@ -230,6 +233,7 @@ impl WorldView {
             last_sprinting: false,
             entities: crate::entities::Entities::default(),
             entity_mesh: crate::entity_render::Mesh::default(),
+            view_override: None,
             placed_models: HashMap::new(),
             placed_flat: Vec::new(),
             missing_textures: std::collections::HashSet::new(),
@@ -878,6 +882,16 @@ impl WorldView {
         };
         self.camera.position =
             [at(0), at(1) + neuton_world::physics::EYE_HEIGHT as f32, at(2)];
+
+        // A screenshot's forced camera, applied here rather than by whoever
+        // asked for it: the camera follows the player every frame, so anything
+        // set from outside is gone by the time the frame is drawn, and what
+        // this frame aims at would still be aimed from the player.
+        if let Some((position, yaw, pitch)) = self.view_override {
+            self.camera.position = position;
+            self.camera.yaw = yaw;
+            self.camera.pitch = pitch;
+        }
     }
 
     /// Tells the server where we are, once per tick, the way the game does.
@@ -1122,10 +1136,20 @@ impl WorldView {
 
         // The cracks spread over the block being broken, which is not always
         // the one under the crosshair: a player can look away mid swing.
-        let cracks = self.breaking_stage().and_then(|stage| {
-            let m = self.mining?;
-            let state = self.state_at(m.at)?;
-            let base = [m.at[0] as f32, m.at[1] as f32, m.at[2] as f32];
+        //
+        // NEUTON_FORCE_BREAK puts a fixed stage on whatever is under the
+        // crosshair instead, which is the only way to see the cracks from a
+        // screenshot: nobody is holding the button down.
+        let forced = std::env::var("NEUTON_FORCE_BREAK")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .zip(self.looked_at_from_camera());
+        let cracks = forced
+            .map(|(stage, at)| (stage.min(neuton_render::DESTROY_STAGES - 1), at))
+            .or_else(|| Some((self.breaking_stage()?, self.mining?.at)))
+            .and_then(|(stage, at)| {
+            let state = self.state_at(at)?;
+            let base = [at[0] as f32, at[1] as f32, at[2] as f32];
             let shapes: Vec<([f32; 3], [f32; 3])> =
                 neuton_world::physics::BlockShapes::outline(self.shapes.as_ref(), state)
                     .iter()
@@ -1252,6 +1276,34 @@ impl WorldView {
         // The slot the item leaves comes back from the server, so nothing is
         // taken out of the hand here on the strength of having asked.
         self.session.send(Outgoing::DropHeld { whole_stack });
+    }
+
+    /// What the camera is pointing at, rather than what the player is.
+    ///
+    /// Only for the forced-break hook: a screenshot puts the camera somewhere
+    /// the player is not, and aiming from the body would crack a block behind
+    /// the shot.
+    fn looked_at_from_camera(&self) -> Option<[i32; 3]> {
+        let (yaw, pitch) = (
+            (self.camera.yaw as f64).to_radians(),
+            (self.camera.pitch as f64).to_radians(),
+        );
+        let (sin_yaw, cos_yaw) = yaw.sin_cos();
+        let (sin_pitch, cos_pitch) = pitch.sin_cos();
+        let eye = [
+            self.camera.position[0] as f64,
+            self.camera.position[1] as f64,
+            self.camera.position[2] as f64,
+        ];
+        let world = ChunkWorld { chunks: &self.blocks };
+        neuton_world::raycast::cast(
+            eye,
+            [-sin_yaw * cos_pitch, -sin_pitch, cos_yaw * cos_pitch],
+            neuton_world::raycast::REACH,
+            &world,
+            self.shapes.as_ref(),
+        )
+        .map(|hit| hit.block)
     }
 
     /// Works out what the player is pointing at.
