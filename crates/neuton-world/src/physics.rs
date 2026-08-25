@@ -67,6 +67,15 @@ pub trait BlockShapes {
     /// Boxes in 0..1 block space. Empty means you pass straight through.
     fn collision(&self, state: StateId) -> &[Aabb];
 
+    /// Boxes the crosshair picks against, and the selection box is drawn
+    /// around. The game keeps this separate from collision and it is not a
+    /// nicety: a fence is outlined one block tall and walked into one and a
+    /// half, so picking against the collision box would put the selection
+    /// half a block above the fence.
+    fn outline(&self, state: StateId) -> &[Aabb] {
+        self.collision(state)
+    }
+
     /// How much grip a block gives underfoot. Ordinary blocks give 0.6.
     fn friction(&self, _state: StateId) -> f64 {
         DEFAULT_FRICTION
@@ -795,3 +804,58 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod shape_tests {
+    use crate::shapes;
+    use neuton_blocks::StateId;
+
+    /// The block that started this: an end rod's model narrows to two pixels
+    /// above its base, but the box stays four pixels the whole way up. Reading
+    /// collision off the model let a player walk a pixel closer on each side
+    /// than the server allowed, and the server put them back.
+    #[test]
+    fn an_end_rod_is_four_pixels_all_the_way_up() {
+        let rod = StateId(14640);
+        let boxes = shapes::collision(rod);
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].min, [0.375, 0.0, 0.375]);
+        assert_eq!(boxes[0].max, [0.625, 1.0, 0.625]);
+    }
+
+    /// A fence is walked into half a block higher than it is drawn, which is
+    /// what stops it being jumped, and is not something any model says.
+    #[test]
+    fn a_fence_is_taller_to_walk_into_than_to_look_at() {
+        let fence = StateId(6996);
+        assert_eq!(shapes::collision(fence)[0].max[1], 1.5);
+        assert_eq!(shapes::outline(fence)[0].max[1], 1.0);
+    }
+
+    /// Walls too, and they are wider than a fence into the bargain.
+    #[test]
+    fn a_wall_is_taller_to_walk_into_than_to_look_at() {
+        let wall = StateId(9984);
+        assert_eq!(shapes::collision(wall)[0].max[1], 1.5);
+        assert_eq!(shapes::outline(wall)[0].max[1], 1.0);
+    }
+
+    /// Air is walked through, and a state past the end of the table is too
+    /// rather than panicking on a server that knows a block we do not.
+    #[test]
+    fn nothing_to_walk_into_where_there_is_nothing() {
+        assert!(shapes::collision(StateId(0)).is_empty());
+        assert!(shapes::collision(StateId(u32::MAX)).is_empty());
+        assert!(shapes::outline(StateId(u32::MAX)).is_empty());
+    }
+
+    /// A plain block is still a plain block.
+    #[test]
+    fn stone_is_a_full_cube() {
+        let stone = StateId(1);
+        let boxes = shapes::collision(stone);
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].min, [0.0, 0.0, 0.0]);
+        assert_eq!(boxes[0].max, [1.0, 1.0, 1.0]);
+    }
+}

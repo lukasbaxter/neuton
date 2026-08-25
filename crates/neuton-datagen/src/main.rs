@@ -13,6 +13,7 @@ mod breaking;
 mod items;
 mod packets;
 mod paths;
+mod shapes;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -78,6 +79,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Needs the jar itself, not the reports: hardness is in code and the
     // mineable tags are in the built-in data pack.
     breaking::generate(&ctx, &env.java, &env.classpath()?, &env.jar())?;
+    shapes::generate(&ctx, &env.java, &env.classpath()?)?;
 
     println!("datagen: done");
     Ok(())

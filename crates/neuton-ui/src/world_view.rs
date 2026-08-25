@@ -930,7 +930,7 @@ impl WorldView {
                     )
                     .unwrap_or(neuton_blocks::StateId(0));
                 let base = [hit.block[0] as f32, hit.block[1] as f32, hit.block[2] as f32];
-                for shape in neuton_world::physics::BlockShapes::collision(
+                for shape in neuton_world::physics::BlockShapes::outline(
                     self.shapes.as_ref(),
                     state,
                 ) {
@@ -958,7 +958,7 @@ impl WorldView {
             let state = self.state_at(m.at)?;
             let base = [m.at[0] as f32, m.at[1] as f32, m.at[2] as f32];
             let shapes: Vec<([f32; 3], [f32; 3])> =
-                neuton_world::physics::BlockShapes::collision(self.shapes.as_ref(), state)
+                neuton_world::physics::BlockShapes::outline(self.shapes.as_ref(), state)
                     .iter()
                     .map(|shape| {
                         (

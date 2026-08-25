@@ -112,7 +112,7 @@ fn meets(
     shapes: &dyn BlockShapes,
     distance: f64,
 ) -> Option<Hit> {
-    let boxes = shapes.collision(state);
+    let boxes = shapes.outline(state);
     if boxes.is_empty() {
         return None;
     }
