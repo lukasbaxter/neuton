@@ -493,7 +493,7 @@ impl WorldView {
                     renderer.forget(x, z);
                     self.blocks.remove(&(x, z));
                 }
-                WorldEvent::Moved { x, y, z, yaw, pitch, relative } => {
+                WorldEvent::Moved { x, y, z, yaw, pitch, velocity, relative } => {
                     // Every teleport, not just the first: a player moved by a
                     // command, a portal or a shove has to follow.
                     //
@@ -532,7 +532,13 @@ impl WorldView {
                     let turned_to = (yaw, pitch);
 
                     self.body.position = position;
-                    self.body.velocity = [0.0; 3];
+                    // The teleport carries the speed the player is meant to be
+                    // travelling at. Zeroing it instead is what turned a single
+                    // shove into a correction every tick: the server kept
+                    // simulating a player still moving, the client kept
+                    // reporting one standing still, and neither gave way until
+                    // the speed decayed to nothing on the server's side alone.
+                    self.body.velocity = velocity;
                     // The camera interpolates between the last two ticks, so
                     // without this it spends a tick travelling from wherever
                     // the player used to be to wherever they now are.
