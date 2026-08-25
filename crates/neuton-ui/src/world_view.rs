@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use neuton_render::{Camera, WorldRenderer};
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use crate::settings::{Action, Settings};
 use winit::keyboard::KeyCode;
 
@@ -18,6 +18,12 @@ pub struct WorldView {
     held: HashSet<KeyCode>,
     /// True while the pointer is locked and the mouse turns the camera.
     pub captured: bool,
+    /// Taking the pointer is a desktop-wide act, so a bug that asks for it
+    /// every frame does not only break this window. This is what notices.
+    capture_rate: GrabRate,
+    /// Set when the grabs came too fast to be a player changing screens. The
+    /// pointer then stays free until a click asks for it back.
+    pub capture_gave_up: bool,
     /// Set once, so the first teleport places the camera rather than fighting
     /// whatever the user has already done with it.
     placed: bool,
@@ -97,13 +103,62 @@ pub struct WorldView {
     reported_loaded: bool,
 }
 
+/// How many pointer grabs inside [`GRAB_RUN`] stop looking like a player
+/// moving between screens and start looking like a loop.
+const GRAB_LIMIT: u32 = 20;
+const GRAB_RUN: Duration = Duration::from_secs(1);
+
+/// Counts pointer grabs over a short run, so a loop asking for the pointer
+/// every frame can be told apart from a player opening and closing screens.
+#[derive(Default)]
+struct GrabRate {
+    run: Option<Instant>,
+    grabs: u32,
+}
+
+impl GrabRate {
+    /// Counts one grab and says whether the run has passed the limit.
+    fn saw_grab(&mut self, now: Instant) -> bool {
+        match self.run {
+            Some(start) if now.duration_since(start) < GRAB_RUN => self.grabs += 1,
+            _ => {
+                self.run = Some(now);
+                self.grabs = 1;
+            }
+        }
+        self.grabs > GRAB_LIMIT
+    }
+
+    fn forget(&mut self) {
+        self.run = None;
+        self.grabs = 0;
+    }
+}
+
 impl WorldView {
+    /// Counts one pointer grab and says whether they are arriving fast enough
+    /// to be a bug. Nothing else stands between a frame that grabs the pointer
+    /// and a cursor the whole desktop has lost, so this is deliberately blunt:
+    /// past the limit the client stops asking for the pointer at all.
+    pub fn grab_is_runaway(&mut self, now: Instant) -> bool {
+        self.capture_rate.saw_grab(now)
+    }
+
+    /// A click is the player asking for the pointer by hand, which is the one
+    /// thing that clears a grab the client gave up on.
+    pub fn allow_capture_again(&mut self) {
+        self.capture_gave_up = false;
+        self.capture_rate.forget();
+    }
+
     pub fn new(session: WorldSession, shapes: Arc<neuton_render::BlockTextures>) -> Self {
         Self {
             session,
             camera: Camera::default(),
             held: HashSet::new(),
             captured: false,
+            capture_rate: GrabRate::default(),
+            capture_gave_up: false,
             placed: false,
             frames: 0,
             last_frame_ms: 0.0,
@@ -1023,4 +1078,42 @@ fn hotbar_digit(code: KeyCode) -> Option<usize> {
         KeyCode::Digit9 | KeyCode::Numpad9 => 8,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_player_changing_screens_keeps_the_pointer() {
+        let mut rate = GrabRate::default();
+        let mut now = Instant::now();
+        // Far more grabs than the limit, but spread out the way a player
+        // opening and closing the inventory would spread them.
+        for _ in 0..100 {
+            assert!(!rate.saw_grab(now));
+            now += GRAB_RUN * 2;
+        }
+    }
+
+    #[test]
+    fn a_loop_grabbing_every_frame_gives_the_pointer_up() {
+        let mut rate = GrabRate::default();
+        let now = Instant::now();
+        let frame = GRAB_RUN / 200;
+        let tripped = (0..GRAB_LIMIT + 5).any(|i| rate.saw_grab(now + frame * i));
+        assert!(tripped);
+    }
+
+    #[test]
+    fn giving_up_lasts_only_until_the_next_quiet_run() {
+        let mut rate = GrabRate::default();
+        let now = Instant::now();
+        for i in 0..GRAB_LIMIT + 5 {
+            rate.saw_grab(now + (GRAB_RUN / 200) * i);
+        }
+        // A grab after the run has expired starts counting over, so a click
+        // that comes later is not held against the player.
+        assert!(!rate.saw_grab(now + GRAB_RUN * 3));
+    }
 }

@@ -223,8 +223,13 @@ impl ApplicationHandler for App {
         // click and the mouse could never be captured.
         let in_world = world.is_some();
         let typing = world.as_ref().is_some_and(|w| w.chat.is_open());
-        let paused = world.as_ref().is_some_and(|w| w.paused);
-        if !in_world || paused {
+        // Every screen the player is meant to click around in, not just the
+        // pause menu. A death screen whose button cannot be pressed is a dead
+        // end, and the inventory is not much use if the slots ignore the mouse.
+        let screen_open = world
+            .as_ref()
+            .is_some_and(|w| w.paused || w.dead || w.inventory.open);
+        if !in_world || screen_open {
             let response = state.egui_winit.on_window_event(&state.gpu.window, &event);
             if response.repaint {
                 state.gpu.window.request_redraw();
@@ -270,10 +275,12 @@ impl ApplicationHandler for App {
                     // Dying is not something the player chose, so the mouse has
                     // to come back on its own: a locked pointer cannot press the
                     // button that gets you out of it. Same for opening a screen
-                    // the player is meant to click around in.
-                    let wants_mouse = w.dead || w.inventory.open;
-                    if wants_mouse == w.captured {
-                        set_capture(&state.gpu.window, w, !wants_mouse);
+                    // the player is meant to click around in. Only ever
+                    // releasing here -- taking the pointer back is something
+                    // closing the screen does, so this cannot fight the pause
+                    // menu for it.
+                    if !w.paused && (w.dead || w.inventory.open) && w.captured {
+                        set_capture(&state.gpu.window, w, false);
                     }
                     // Settings that live outside the world view.
                     r.min_light = w.settings.min_light();
@@ -497,6 +504,7 @@ impl ApplicationHandler for App {
                     // menu, as it does in the game.
                     if pressed && code == KeyCode::Escape && w.inventory.open {
                         w.toggle_inventory();
+                        set_capture(&state.gpu.window, w, true);
                         return;
                     }
                     if pressed && code == KeyCode::Escape {
@@ -516,11 +524,14 @@ impl ApplicationHandler for App {
                     if w.paused {
                         return;
                     }
-                    if w.key(code, pressed, event.repeat) {
-                        set_capture(&state.gpu.window, w, false);
-                    } else if was_typing && !w.chat.is_open() {
-                        // Enter sent the message; go back to flying.
-                        set_capture(&state.gpu.window, w, true);
+                    let changed_screen = w.key(code, pressed, event.repeat);
+                    if changed_screen || (was_typing && !w.chat.is_open()) {
+                        // A key that opened or closed a screen decides who has
+                        // the pointer. Asking what is open now, rather than
+                        // assuming the key opened something, is what lets the
+                        // same key close it again and give the pointer back.
+                        let screen = w.chat.is_open() || w.inventory.open || w.dead;
+                        set_capture(&state.gpu.window, w, !screen);
                     }
                     state.gpu.window.request_redraw();
                 }
@@ -532,7 +543,10 @@ impl ApplicationHandler for App {
                         && !w.inventory.open
                     {
                         // The first click is what takes the mouse, not an
-                        // action in the world.
+                        // action in the world. It is also the player asking for
+                        // the pointer by hand, which is what clears a grab the
+                        // client gave up on.
+                        w.allow_capture_again();
                         set_capture(&state.gpu.window, w, true);
                     } else if w.captured && !w.paused {
                         w.mouse_button(button, pressed);
@@ -634,7 +648,28 @@ fn start_world(
 
 /// Locks or releases the pointer for mouse look.
 fn set_capture(window: &Window, world: &mut WorldView, capture: bool) {
+    // Asking for the state we are already in is not a reason to talk to the
+    // window system again. Pointer grab and cursor visibility are desktop-wide
+    // on macOS, so a caller that runs every frame has to cost nothing.
+    if capture == world.captured {
+        return;
+    }
     if capture {
+        if world.capture_gave_up {
+            return;
+        }
+        if world.grab_is_runaway(Instant::now()) {
+            // Whatever is asking this often is wrong, and the cost of being
+            // wrong about the pointer is a cursor no window can get back.
+            world.capture_gave_up = true;
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+            world.captured = false;
+            world
+                .chat
+                .note("Something kept grabbing the mouse; click to take it back.");
+            return;
+        }
         // Locked is what a game wants; some platforms only offer Confined.
         let grabbed = window
             .set_cursor_grab(CursorGrabMode::Locked)
@@ -710,7 +745,10 @@ fn draw_into(
                 w.settings_open = false;
             }
             PauseAction::Leave => w.leaving = true,
-            PauseAction::Respawn => w.respawn(),
+            PauseAction::Respawn => {
+                w.respawn();
+                set_capture(&state.gpu.window, w, true);
+            }
             PauseAction::OpenSettings => w.settings_open = true,
             PauseAction::CloseSettings => {
                 w.settings_open = false;
