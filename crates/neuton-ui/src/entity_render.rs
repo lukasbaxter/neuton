@@ -252,7 +252,10 @@ fn push_entity(
     };
 
     let pose = Pose {
-        sheet_flipped: false,
+        // Turning the model over turns its sheet over with it, so the sheet
+        // has to be read the other way up to land the right way up. Without
+        // this a cow wears its snout on its belly.
+        sheet_flipped: true,
         head_turn: (entity.head_yaw - entity.yaw).to_radians(),
         head_tilt: entity.pitch.to_radians(),
         stride: entity.stride,
@@ -394,14 +397,13 @@ pub(crate) fn push_part(
 /// beneath, which is why a head's face sits eight pixels across and eight down.
 /// `sheet_flipped` reads the texture the other way up.
 ///
-/// A mob's model is measured downwards -- the top of a head is at minus eight,
-/// and an arm's shoulder is its lowest number -- and the game draws it by
-/// turning the whole thing over, which lands the sheet the right way up. A
-/// block entity's model is measured upwards instead and is drawn as it stands,
-/// which also lands the sheet the right way up. The odd one out is the
-/// first-person hand: a model measured downwards, drawn without being turned
-/// over, so its sheet has to be read the other way round or a sleeve ends up
-/// on a wrist.
+/// It follows the geometry, not the model. A mob's model is measured downwards
+/// -- the top of a head is at minus eight, and an arm's shoulder is its lowest
+/// number -- and is drawn by turning the whole thing over, which turns its
+/// sheet over too: those need the flag. A block entity's model is measured
+/// upwards and is drawn as it stands, so its sheet is already the right way up
+/// and it does not. The rule is simply whether the transform that gets the
+/// model on screen has a negative y in it.
 pub(crate) fn push_cube(
     cube: &Cube,
     at: &Xform,

@@ -129,6 +129,7 @@ pub struct ItemArt {
     items: HashMap<i32, Option<egui::TextureHandle>>,
     sprites: HashMap<String, Option<egui::TextureHandle>>,
     held: HashMap<String, Option<std::sync::Arc<Held>>>,
+    portrait: crate::portrait::Portrait,
 }
 
 /// What one item looks like in the hand.
@@ -163,6 +164,7 @@ impl ItemArt {
             items: HashMap::new(),
             sprites: HashMap::new(),
             held: HashMap::new(),
+            portrait: crate::portrait::Portrait::default(),
         }
     }
 
@@ -200,6 +202,21 @@ impl ItemArt {
         id
     }
 
+    /// The player, drawn into the inventory panel's own window.
+    ///
+    /// Split out here rather than reached through the field, because the
+    /// drawing needs the pack stack and the pack stack lives on the same
+    /// struct.
+    pub fn portrait(
+        &mut self,
+        ctx: &egui::Context,
+        look: crate::portrait::Look,
+        pixels: [u32; 2],
+    ) -> Option<egui::TextureId> {
+        let Self { packs, portrait, .. } = self;
+        portrait.texture(ctx, packs, look, pixels)
+    }
+
     /// What an item looks like in the hand, worked out once and kept.
     ///
     /// The rim of a flat item is a few dozen quads read out of the sprite's
@@ -224,9 +241,12 @@ impl ItemArt {
                     let sides =
                         neuton_assets::extrude::sides(&image.rgba, image.width, image.height);
                     // The renderer names a texture by its path under
-                    // `textures/`, which is where the model's own reference
-                    // lands once the namespace is off it.
-                    let texture = format!("{}.png", path.trim_start_matches("minecraft:"));
+                    // `textures/`; a resolved model reference is the whole
+                    // asset path, so the front of it comes off.
+                    let texture = path
+                        .strip_prefix("assets/minecraft/textures/")
+                        .unwrap_or(&path)
+                        .to_string();
                     HeldGeometry::Sprite { texture, sides }
                 }
             };
@@ -541,7 +561,6 @@ pub fn screen(
     inventory: &Inventory,
     cursor: &mut Cursor,
     art: &mut ItemArt,
-    portrait: Option<egui::TextureId>,
     scale: f32,
     creative: bool,
 ) -> Vec<crate::clicks::Click> {
@@ -570,13 +589,27 @@ pub fn screen(
         }
     }
 
-    // The player, in the window the game keeps for them.
-    if let Some(id) = portrait {
-        let at = egui::Rect::from_min_size(
-            panel.min + egui::vec2(PORTRAIT_AT[0] * scale, PORTRAIT_AT[1] * scale),
-            egui::vec2(PORTRAIT_SIZE[0] * scale, PORTRAIT_SIZE[1] * scale),
-        );
-        painter.image(id, at, full_uv(), egui::Color32::WHITE);
+    // The player, in the window the game keeps for them, looking at the
+    // pointer the way the game's does.
+    let window = egui::Rect::from_min_size(
+        panel.min + egui::vec2(crate::portrait::AT[0] * scale, crate::portrait::AT[1] * scale),
+        egui::vec2(crate::portrait::SIZE[0] * scale, crate::portrait::SIZE[1] * scale),
+    );
+    {
+        let pointer = ctx.pointer_latest_pos().unwrap_or_else(|| window.center());
+        // The game measures this in its own interface pixels, so the offset
+        // has to come back out of the scale before it is used.
+        let offset = (window.center() - pointer) / scale;
+        let look = crate::portrait::Look::at(offset.x, offset.y);
+        // Drawn at the size it will be shown at, in real pixels.
+        let ppp = ctx.pixels_per_point();
+        let pixels = [
+            (window.width() * ppp).round() as u32,
+            (window.height() * ppp).round() as u32,
+        ];
+        if let Some(id) = art.portrait(&ctx, look, pixels) {
+            painter.image(id, window, full_uv(), egui::Color32::WHITE);
+        }
     }
 
     let pointer = ctx.pointer_latest_pos();
@@ -787,10 +820,6 @@ fn drag_preview(inventory: &Inventory) -> std::collections::HashMap<usize, i32> 
     }
     out
 }
-
-/// Where the player is drawn on the inventory panel, in the game's own pixels.
-const PORTRAIT_AT: [f32; 2] = [26.0, 8.0];
-const PORTRAIT_SIZE: [f32; 2] = [52.0, 70.0];
 
 fn full_uv() -> egui::Rect {
     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
