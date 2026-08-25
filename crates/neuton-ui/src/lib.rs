@@ -7,6 +7,7 @@
 pub mod app;
 pub mod chat;
 pub mod entities;
+pub mod block_models;
 pub mod entity_render;
 pub mod auth_task;
 pub mod fonts;

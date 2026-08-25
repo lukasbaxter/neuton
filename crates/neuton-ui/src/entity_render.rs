@@ -23,6 +23,18 @@ const UNIT: f32 = 1.0 / 16.0;
 /// is the game's own, and keeps a model's sole out of the surface it stands on.
 const LIFT: f32 = 1.501;
 
+/// Something standing in the world at a fixed place, drawn from a model: a
+/// chest, which has no block shape of its own.
+#[derive(Clone, Copy)]
+pub struct Placed {
+    /// The block's own corner.
+    pub at: [f32; 3],
+    /// How far round it faces, in degrees, as the game measures a facing.
+    pub yaw: f32,
+    pub model: &'static Model,
+    pub texture: &'static str,
+}
+
 /// One frame's worth of entity geometry.
 #[derive(Default)]
 pub struct Mesh {
@@ -151,7 +163,7 @@ impl Pose {
 
 /// Builds every entity that has a model into one mesh, in runs that share a
 /// texture.
-pub fn build(entities: &Entities, alpha: f32, out: &mut Mesh) {
+pub fn build(entities: &Entities, placed: &[Placed], alpha: f32, out: &mut Mesh) {
     out.clear();
     // Gathered per texture first, because a draw cannot change texture part
     // way through and two zombies should not cost two draws.
@@ -165,6 +177,13 @@ pub fn build(entities: &Entities, alpha: f32, out: &mut Mesh) {
         }
         let indices = runs.entry(texture).or_default();
         push_entity(entity, model, alpha, &mut out.vertices, indices);
+    }
+    for block in placed {
+        if out.vertices.len() + 4096 > MAX_ENTITY_VERTICES {
+            break;
+        }
+        let indices = runs.entry(block.texture).or_default();
+        push_placed(block, &mut out.vertices, indices);
     }
     for (texture, run) in runs {
         if run.is_empty() {
@@ -219,6 +238,31 @@ fn push_entity(
         stride_amount: entity.stride_amount,
     };
     push_part(&model.root, &root, &pose, model.texture_size, vertices, indices);
+}
+
+/// A block entity, turned about the middle of its own block.
+///
+/// Nothing is flipped here, unlike an entity: these models are built the way up
+/// they are drawn, which is why a chest's lid sits at the top of the numbers
+/// rather than the bottom.
+fn push_placed(block: &Placed, vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>) {
+    let turn = rotation_y((-block.yaw).to_radians());
+    let centre = [0.5, 0.0, 0.5];
+    let basis = [
+        [turn[0][0] * UNIT, turn[0][1] * UNIT, turn[0][2] * UNIT],
+        [turn[1][0] * UNIT, turn[1][1] * UNIT, turn[1][2] * UNIT],
+        [turn[2][0] * UNIT, turn[2][1] * UNIT, turn[2][2] * UNIT],
+    ];
+    // Rotating about the middle of the block rather than its corner, which is
+    // what keeps a chest inside its own block when it faces east.
+    let mut at = [0.0f32; 3];
+    for (axis, cell) in at.iter_mut().enumerate() {
+        let turned: f32 = (0..3).map(|k| turn[axis][k] * -centre[k]).sum();
+        *cell = block.at[axis] + centre[axis] + turned;
+    }
+    let root = Xform { basis, at };
+    let still = Pose { head_turn: 0.0, head_tilt: 0.0, stride: 0.0, stride_amount: 0.0 };
+    push_part(&block.model.root, &root, &still, block.model.texture_size, vertices, indices);
 }
 
 fn push_part(
@@ -382,7 +426,7 @@ mod tests {
     #[test]
     fn a_player_stands_on_their_feet() {
         let mut mesh = Mesh::default();
-        build(&one(156), 1.0, &mut mesh);
+        build(&one(156), &[], 1.0, &mut mesh);
         assert!(!mesh.vertices.is_empty(), "no geometry for a player");
         let lowest = mesh.vertices.iter().map(|v| v.position[1]).fold(f32::MAX, f32::min);
         let highest = mesh.vertices.iter().map(|v| v.position[1]).fold(f32::MIN, f32::max);
@@ -394,7 +438,7 @@ mod tests {
     #[test]
     fn every_texture_coordinate_lands_on_the_texture() {
         let mut mesh = Mesh::default();
-        build(&one(156), 1.0, &mut mesh);
+        build(&one(156), &[], 1.0, &mut mesh);
         for vertex in &mesh.vertices {
             assert!(
                 (0.0..=1.0).contains(&vertex.uv[0]) && (0.0..=1.0).contains(&vertex.uv[1]),
@@ -409,7 +453,7 @@ mod tests {
         let mut all = one(156);
         all.add(2, 0, 156, [4.0, 64.0, 0.0], 0.0, 0.0, 0.0, [0.0; 3]);
         let mut mesh = Mesh::default();
-        build(&all, 1.0, &mut mesh);
+        build(&all, &[], 1.0, &mut mesh);
         assert_eq!(mesh.batches.len(), 1, "two players should share a draw");
         assert_eq!(mesh.batches[0].count as usize, mesh.indices.len());
     }
@@ -418,7 +462,7 @@ mod tests {
     fn something_with_no_model_is_left_out() {
         // 71 is a dropped item, which is drawn some other way.
         let mut mesh = Mesh::default();
-        build(&one(71), 1.0, &mut mesh);
+        build(&one(71), &[], 1.0, &mut mesh);
         assert!(mesh.vertices.is_empty() && mesh.batches.is_empty());
     }
 }

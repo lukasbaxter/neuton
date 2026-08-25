@@ -98,6 +98,12 @@ pub struct WorldView {
     /// Kept between frames so rebuilding every entity does not also rebuild
     /// the buffers it goes into.
     entity_mesh: crate::entity_render::Mesh,
+    /// Chests and the like, by the column they stand in, found once when the
+    /// column arrives rather than looked for again every frame.
+    placed_models: HashMap<(i32, i32), Vec<crate::entity_render::Placed>>,
+    /// All of them together, rebuilt when a column changes, because the mesh
+    /// builder wants one list and columns change far less often than frames.
+    placed_flat: Vec<crate::entity_render::Placed>,
     /// Textures asked for and not found, so a missing one is looked for once
     /// rather than on every frame for as long as the thing is in sight.
     missing_textures: std::collections::HashSet<String>,
@@ -224,6 +230,8 @@ impl WorldView {
             last_sprinting: false,
             entities: crate::entities::Entities::default(),
             entity_mesh: crate::entity_render::Mesh::default(),
+            placed_models: HashMap::new(),
+            placed_flat: Vec::new(),
             missing_textures: std::collections::HashSet::new(),
             inventory: crate::inventory::Inventory::default(),
             art: crate::inventory::ItemArt::new(),
@@ -392,6 +400,14 @@ impl WorldView {
     }
 
     /// Advances the player and the world for a frame of `dt` seconds.
+    /// Gathers every column's models into the one list the builder walks.
+    fn reflatten_placed(&mut self) {
+        self.placed_flat.clear();
+        for column in self.placed_models.values() {
+            self.placed_flat.extend_from_slice(column);
+        }
+    }
+
     /// Uploads any entity texture this frame needs and does not have.
     ///
     /// One at a time and only on the frame it is first needed: decoding a PNG
@@ -471,7 +487,12 @@ impl WorldView {
         // many of them.
         let alpha = (self.accumulator / Self::TICK) as f32;
         self.entities.animate(dt);
-        crate::entity_render::build(&self.entities, alpha, &mut self.entity_mesh);
+        crate::entity_render::build(
+            &self.entities,
+            &self.placed_flat,
+            alpha,
+            &mut self.entity_mesh,
+        );
         self.load_entity_textures(renderer, device, queue);
         renderer.set_entities(
             queue,
@@ -565,12 +586,26 @@ impl WorldView {
                     // misses several ticks, which a server reads as a client
                     // that stopped playing. They go up a few at a time instead.
                     self.pending.push_back((x, z, mesh));
+                    // Re-scanned rather than added to: a re-mesh arrives here
+                    // whenever a block in the column changed, which is exactly
+                    // when a chest may have appeared or gone.
+                    let mut found = Vec::new();
+                    crate::block_models::scan(&blocks, (x, z), &mut found);
+                    if found.is_empty() {
+                        self.placed_models.remove(&(x, z));
+                    } else {
+                        self.placed_models.insert((x, z), found);
+                    }
+                    self.reflatten_placed();
                     self.blocks.insert((x, z), blocks);
                 }
                 WorldEvent::Forget { x, z } => {
                     self.pending.retain(|(px, pz, _)| (*px, *pz) != (x, z));
                     renderer.forget(x, z);
                     self.blocks.remove(&(x, z));
+                    if self.placed_models.remove(&(x, z)).is_some() {
+                        self.reflatten_placed();
+                    }
                 }
                 WorldEvent::Moved { x, y, z, yaw, pitch, velocity, relative } => {
                     // Every teleport, not just the first: a player moved by a
