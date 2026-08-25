@@ -16,6 +16,7 @@ pub mod gpu;
 pub mod hand;
 pub mod icons;
 pub mod ping_task;
+pub mod portrait;
 pub mod servers;
 pub mod settings;
 pub mod session;
@@ -1041,7 +1042,7 @@ fn overlay(ui: &mut egui::Ui, hud: &Hud, world: Option<&mut WorldView>) -> Pause
                     let WorldView { inventory, cursor, art, .. } = world;
                     if open {
                         clicked = crate::inventory::screen(
-                            ui, inventory, cursor, art, None, scale, creative,
+                            ui, inventory, cursor, art, scale, creative,
                         );
                     } else {
                         crate::inventory::held_item(ui, inventory, art, scale, bob);

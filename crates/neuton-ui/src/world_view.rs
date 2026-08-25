@@ -529,7 +529,10 @@ impl WorldView {
         queue: &wgpu::Queue,
     ) {
         for batch in self.entity_mesh.batches.iter().chain(self.hand_mesh.batches.iter()) {
-            if renderer.has_entity_texture(&batch.texture)
+            // The block atlas is not a file to go and load; the renderer knows
+            // that name and binds what it already has.
+            if batch.texture == neuton_render::ATLAS_BATCH
+                || renderer.has_entity_texture(&batch.texture)
                 || self.missing_textures.contains(&batch.texture)
             {
                 continue;

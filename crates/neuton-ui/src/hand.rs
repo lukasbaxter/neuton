@@ -18,17 +18,6 @@ pub const SKIN: &str = "entity/player/wide/steve.png";
 
 const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
-/// Where a model sits in the hand when nothing says otherwise.
-///
-/// Only reached for an item whose model chain declares no
-/// `firstperson_righthand` at all, which in the vanilla files is nothing; the
-/// real numbers come out of `block/block.json` and `item/generated.json`.
-const DEFAULT_HOLD: neuton_assets::Display = neuton_assets::Display {
-    rotation: [0.0, 45.0, 0.0],
-    translation: [0.0, 0.0, 0.0],
-    scale: [0.4, 0.4, 0.4],
-};
-
 /// What the hand is holding this frame.
 pub enum Holding<'a> {
     /// Nothing, so the arm itself is what is drawn.
