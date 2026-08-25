@@ -13,7 +13,14 @@ use std::time::{Duration, Instant};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Generous: a busy server can take a while between chunk batches, and a false
 /// timeout mid-join is worse than waiting.
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the server may say nothing at all before we call it dead.
+///
+/// A server that is up sends something every tick or two -- the time of day
+/// alone goes out once a second -- so silence this long is not a quiet moment,
+/// it is a connection that has gone. Waiting out the old half minute meant
+/// playing on against a server that had already hung up: blocks that would not
+/// break, an inventory that would not move, and no way to tell why.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub enum Error {
@@ -944,19 +951,20 @@ impl Connection {
 
     /// Clicks a slot in an open container.
     ///
-    /// The changed-slot map is sent empty, which is allowed: the server then
-    /// compares every slot against what it last told us and sends back the
-    /// ones that moved, rather than only the ones we claimed would.
+    /// The changed-slot map and the cursor are both sent empty, which is
+    /// allowed: the server then compares every slot against what it last told
+    /// us and sends back the ones that moved.
     ///
-    /// What the cursor ends up holding is sent, though, because the server
-    /// checks that one every time and corrects it when it disagrees. Saying
-    /// "nothing" while holding a stack earns a correction packet on every
-    /// single click.
+    /// Saying anything else is not as easy as it looks. Since 26.x neither
+    /// field carries an item stack -- both are a `HashedStack`, which is an
+    /// optional wrapping an item, a count and a map of component **hashes**.
+    /// Those hashes come from the game's own hash generator over each
+    /// component's serialised form, which this client cannot reproduce for
+    /// components it cannot even read. Writing a stack here in the old shape
+    /// is a decode error on the server and an instant kick, which is exactly
+    /// what it did.
     ///
-    /// Components are not written. A stack that carries any -- an enchanted
-    /// sword, a named tool -- will not match and the server will correct it,
-    /// which is the same outcome as saying nothing and no worse; a plain stack
-    /// of stone, which is nearly all of them, matches exactly.
+    /// Empty is one byte: the `false` of the optional.
     pub fn send_container_click(
         &mut self,
         window: i32,
@@ -964,7 +972,6 @@ impl Connection {
         slot: i16,
         button: u8,
         mode: i32,
-        carried: Option<(i32, i32)>,
     ) -> Result<()> {
         let mut w = Writer::new();
         w.write_varint(window);
@@ -973,17 +980,7 @@ impl Connection {
         w.write_u8(button);
         w.write_varint(mode);
         w.write_varint(0); // no predicted slot changes
-        match carried {
-            Some((id, count)) if count > 0 => {
-                w.write_varint(count);
-                w.write_varint(id);
-                w.write_varint(0); // no components added
-                w.write_varint(0); // and none removed
-            }
-            _ => {
-                w.write_varint(0);
-            }
-        }
+        w.write_u8(0); // and nothing predicted on the cursor
         self.framed.write_packet(ids::play::serverbound::CONTAINER_CLICK, &w)?;
         Ok(())
     }

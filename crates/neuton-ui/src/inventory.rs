@@ -357,39 +357,6 @@ pub fn hotbar(ui: &egui::Ui, inventory: &Inventory, art: &mut ItemArt, scale: f3
     }
 }
 
-/// What the player is holding, in the corner of the screen.
-///
-/// The game builds this from the item's model in a little scene of its own.
-/// This draws the same picture the inventory uses, which for a block is already
-/// that block seen from a corner, scaled up and sat where a hand would be. It
-/// bobs with the walk, because a held item that never moves reads as painted on
-/// the screen rather than carried.
-pub fn held_item(
-    ui: &egui::Ui,
-    inventory: &Inventory,
-    art: &mut ItemArt,
-    scale: f32,
-    bob: f32,
-) {
-    let Some(stack) = inventory.held() else { return };
-    if stack.is_empty() {
-        return;
-    }
-    let ctx = ui.ctx().clone();
-    let Some(id) = art.item(&ctx, stack) else { return };
-
-    let screen = ui.clip_rect();
-    let size = 56.0 * scale;
-    // Sat in from the corner, and low enough that most of it is on screen but
-    // its bottom edge is not.
-    let centre = egui::pos2(
-        screen.right() - size * 0.72 + bob.cos() * 3.0 * scale,
-        screen.bottom() - size * 0.42 + bob.sin() * 4.0 * scale,
-    );
-    let rect = egui::Rect::from_center_size(centre, egui::vec2(size, size));
-    ui.painter().image(id, rect, full_uv(), egui::Color32::WHITE);
-}
-
 /// Hearts and hunger, above the hotbar, drawn from the pack's own sprites.
 ///
 /// Twenty points is ten icons, and a point is half an icon, which is why a

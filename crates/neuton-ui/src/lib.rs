@@ -359,7 +359,10 @@ impl ApplicationHandler for App {
                     // releasing here -- taking the pointer back is something
                     // closing the screen does, so this cannot fight the pause
                     // menu for it.
-                    if !w.paused && (w.dead || w.inventory.open) && w.captured {
+                    if !w.paused
+                        && (w.dead || w.inventory.open || w.disconnected.is_some())
+                        && w.captured
+                    {
                         set_capture(&state.gpu.window, w, false);
                     }
                     // Settings that live outside the world view.
@@ -819,6 +822,7 @@ fn draw_into(
         settings: w.settings_open.then(|| w.settings.clone()),
         rebinding: w.rebinding,
         dead: w.dead,
+        disconnected: w.disconnected.clone(),
     });
     let mut pause_action = PauseAction::None;
     let mut output = state.egui_ctx.run_ui(raw_input, |ui| match &hud {
@@ -1003,6 +1007,8 @@ struct Hud {
     rebinding: Option<crate::settings::Action>,
     /// Set while the player is dead and waiting to come back.
     dead: bool,
+    /// Why the connection ended, once it has.
+    disconnected: Option<String>,
 }
 
 /// What the player picked on the pause menu.
@@ -1033,8 +1039,6 @@ fn overlay(ui: &mut egui::Ui, hud: &Hud, world: Option<&mut WorldView>) -> Pause
                 let scale = crate::inventory::interface_scale(ui.clip_rect().size());
                 let (health, food, survival) =
                     (world.health, world.food, !world.abilities.instant_build);
-                // Two and a bit strides to a full cycle, as the game bobs.
-                let bob = world.walked * 2.2;
                 let open = world.inventory.open;
                 let creative = world.abilities.instant_build;
                 let mut clicked = Vec::new();
@@ -1044,8 +1048,6 @@ fn overlay(ui: &mut egui::Ui, hud: &Hud, world: Option<&mut WorldView>) -> Pause
                         clicked = crate::inventory::screen(
                             ui, inventory, cursor, art, scale, creative,
                         );
-                    } else {
-                        crate::inventory::held_item(ui, inventory, art, scale, bob);
                     }
                     crate::inventory::hotbar(ui, inventory, art, scale);
                     // Creative shows neither: nothing can hurt you and nothing
@@ -1089,7 +1091,9 @@ fn overlay(ui: &mut egui::Ui, hud: &Hud, world: Option<&mut WorldView>) -> Pause
                 chat_panel(ui, hud);
             });
 
-            if hud.dead {
+            if let Some(why) = &hud.disconnected {
+                action = disconnected_screen(ui, why);
+            } else if hud.dead {
                 action = death_screen(ui);
             } else if hud.paused {
                 action = match &hud.settings {
@@ -1131,6 +1135,44 @@ fn death_screen(ui: &mut egui::Ui) -> PauseAction {
                 }
                 ui.add_space(6.0);
                 if ui.add_sized(wide, egui::Button::new("Disconnect")).clicked() {
+                    action = PauseAction::Leave;
+                }
+            });
+        });
+    action
+}
+
+/// Shown when the connection has gone, in place of everything else.
+///
+/// The world is still on screen behind it, because it is still in memory and
+/// the last thing anyone wants after being dropped is to be thrown back to a
+/// server list with no idea why.
+fn disconnected_screen(ui: &mut egui::Ui, why: &str) -> PauseAction {
+    let mut action = PauseAction::None;
+    ui.painter().rect_filled(ui.clip_rect(), 0.0, egui::Color32::from_black_alpha(0xC0));
+    egui::Window::new("disconnected")
+        .title_bar(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .frame(egui::Frame::NONE)
+        .show(ui.ctx(), |ui| {
+            ui.set_width(360.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("Connection lost")
+                        .size(30.0)
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(why)
+                        .size(13.0)
+                        .color(egui::Color32::from_gray(0xC0)),
+                );
+                ui.add_space(20.0);
+                let wide = egui::vec2(ui.available_width(), 34.0);
+                if ui.add_sized(wide, egui::Button::new("Back to servers")).clicked() {
                     action = PauseAction::Leave;
                 }
             });

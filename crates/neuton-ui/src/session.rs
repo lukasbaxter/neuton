@@ -108,9 +108,8 @@ pub enum Outgoing {
     Use { yaw: f32, pitch: f32 },
     /// Ask to be put back in the world after dying.
     Respawn,
-    /// Click a slot in an open container. `carried` is what the client
-    /// predicts the cursor will hold afterwards, as an item ID and a count.
-    Click { window: i32, state_id: i32, slot: i16, button: u8, mode: i32, carried: Option<(i32, i32)> },
+    /// Click a slot in an open container.
+    Click { window: i32, state_id: i32, slot: i16, button: u8, mode: i32 },
     /// Close an open container.
     CloseContainer { window: i32 },
 }
@@ -227,10 +226,8 @@ impl WorldSession {
                         }
                         Outgoing::Use { yaw, pitch } => conn.send_use_item(*yaw, *pitch),
                         Outgoing::Respawn => conn.send_respawn(),
-                        Outgoing::Click { window, state_id, slot, button, mode, carried } => {
-                            conn.send_container_click(
-                                *window, *state_id, *slot, *button, *mode, *carried,
-                            )
+                        Outgoing::Click { window, state_id, slot, button, mode } => {
+                            conn.send_container_click(*window, *state_id, *slot, *button, *mode)
                         }
                         Outgoing::CloseContainer { window } => {
                             conn.send_close_container(*window)
