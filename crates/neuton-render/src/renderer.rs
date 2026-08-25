@@ -401,7 +401,12 @@ impl WorldRenderer {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Less),
+                // Equal depth has to pass, or the cracks never appear at all:
+                // they are drawn on the block's own faces, at exactly the depth
+                // the block was drawn at, and `Less` rejects every one of them.
+                // The game does the same thing, with the comparison the other
+                // way up because its depth runs the other way.
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -760,11 +765,12 @@ impl WorldRenderer {
         let mut vertices: Vec<Vertex> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
         for (min, max) in boxes {
-            // A hair outside the block, so the cracks sit on the surface rather
-            // than fighting it for the same depth.
-            const OUT: f32 = 0.002;
-            let a = [min[0] - OUT, min[1] - OUT, min[2] - OUT];
-            let b = [max[0] + OUT, max[1] + OUT, max[2] + OUT];
+            // Exactly on the block, not a hair outside it. Pushing the box out
+            // was a way of dodging a depth test that rejected equal depths, and
+            // it cost a sliver of crack poking through whatever the block sits
+            // against. The depth test allows equal now, so the surface the
+            // cracks belong on is the surface they are drawn on.
+            let (a, b) = (*min, *max);
             // down, up, north, south, west, east, wound so each is seen from
             // outside the box.
             let faces: [[[f32; 3]; 4]; 6] = [

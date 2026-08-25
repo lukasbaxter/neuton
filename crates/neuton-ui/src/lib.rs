@@ -397,10 +397,8 @@ impl ApplicationHandler for App {
                             w.settings_open = which == "settings";
                         }
 
-                        if let (Some(w), Some((pos, yaw, pitch))) = (world.as_mut(), self.view) {
-                            w.camera.position = pos;
-                            w.camera.yaw = yaw;
-                            w.camera.pitch = pitch;
+                        if let (Some(w), Some(view)) = (world.as_mut(), self.view) {
+                            w.view_override = Some(view);
                         }
                         // A few ordinary frames first. The panel reports the
                         // previous frame's chunk count and frame time, and
