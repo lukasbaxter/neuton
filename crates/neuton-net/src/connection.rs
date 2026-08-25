@@ -150,6 +150,12 @@ pub enum Event {
     },
     /// One slot of one container changed.
     Slot { window: i32, state_id: i32, slot: i32, stack: Option<Stack> },
+    /// What is riding on the cursor, mid-drag. Its own packet since the
+    /// container rewrite; the old window minus one, slot minus one form is
+    /// gone and nothing on the container path carries it any more.
+    Cursor { stack: Option<Stack> },
+    /// One slot of the player's own inventory, outside any container.
+    PlayerSlot { slot: i32, stack: Option<Stack> },
     /// The server moved the hotbar selection, which it does on join and when a
     /// plugin sets it.
     HeldSlot(i32),
@@ -547,6 +553,15 @@ impl Connection {
                     let slot = i32::from(r.read_i16().map_err(named)?);
                     let stack = crate::items::read_stack(&mut r).map_err(named)?;
                     return Ok(Event::Slot { window, state_id, slot, stack });
+                }
+                ids::play::clientbound::SET_CURSOR_ITEM => {
+                    let stack = crate::items::read_stack(&mut r).map_err(named)?;
+                    return Ok(Event::Cursor { stack });
+                }
+                ids::play::clientbound::SET_PLAYER_INVENTORY => {
+                    let slot = r.read_varint().map_err(named)?;
+                    let stack = crate::items::read_stack(&mut r).map_err(named)?;
+                    return Ok(Event::PlayerSlot { slot, stack });
                 }
                 ids::play::clientbound::SET_HELD_SLOT => {
                     let slot = r.read_varint().map_err(named)?;

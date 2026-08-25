@@ -42,6 +42,10 @@ pub enum WorldEvent {
     },
     /// One slot of one container.
     Slot { window: i32, state_id: i32, slot: i32, stack: Option<Stack> },
+    /// What is riding on the cursor, mid-drag.
+    Cursor { stack: Option<Stack> },
+    /// One slot of the player's own inventory, outside any container.
+    PlayerSlot { slot: i32, stack: Option<Stack> },
     /// The server picked a hotbar slot for us.
     HeldSlot(i32),
     Health { health: f32, food: i32 },
@@ -320,6 +324,12 @@ impl WorldSession {
                             slots,
                             carried,
                         });
+                    }
+                    Ok(Event::Cursor { stack }) => {
+                        let _ = tx.send(WorldEvent::Cursor { stack });
+                    }
+                    Ok(Event::PlayerSlot { slot, stack }) => {
+                        let _ = tx.send(WorldEvent::PlayerSlot { slot, stack });
                     }
                     Ok(Event::Slot { window, state_id, slot, stack }) => {
                         let _ = tx.send(WorldEvent::Slot { window, state_id, slot, stack });
