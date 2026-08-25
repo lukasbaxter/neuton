@@ -188,6 +188,25 @@ pub enum Event {
     /// Answered automatically; surfaced so latency can be tracked.
     KeepAlive,
     Ignored { id: i32, name: &'static str, len: usize },
+    /// Something other than the player appeared: a mob, a dropped item, or
+    /// another player. Players are not a packet of their own any more.
+    EntityAdded {
+        id: i32,
+        uuid: u128,
+        kind: i32,
+        position: [f64; 3],
+        /// Body yaw, head pitch, and where the head is looking, in degrees.
+        yaw: f32,
+        pitch: f32,
+        head_yaw: f32,
+        velocity: [f64; 3],
+    },
+    EntityRemoved(Vec<i32>),
+    /// A small step from where the entity already was.
+    EntityMoved { id: i32, delta: [f64; 3], rotation: Option<(f32, f32)> },
+    /// An absolute placement, for anything the small steps cannot express.
+    EntityTeleported { id: i32, position: [f64; 3], yaw: f32, pitch: f32, velocity: [f64; 3] },
+    EntityHeadYaw { id: i32, yaw: f32 },
 }
 
 /// Counters for what the connection has actually done.
@@ -606,6 +625,89 @@ impl Connection {
                     let saturation = r.read_f32().map_err(named)?;
                     return Ok(Event::Health { health, food, saturation });
                 }
+                ids::play::clientbound::ADD_ENTITY => {
+                    let id = r.read_varint().map_err(named)?;
+                    let uuid = r.read_uuid().map_err(named)?;
+                    let kind = r.read_varint().map_err(named)?;
+                    let position = [
+                        r.read_f64().map_err(named)?,
+                        r.read_f64().map_err(named)?,
+                        r.read_f64().map_err(named)?,
+                    ];
+                    // Vec3.LP_STREAM_CODEC: low precision, the same three
+                    // shorts over eight thousand that a shove is sent as.
+                    let velocity = read_lp_vec3(&mut r).map_err(named)?;
+                    let pitch = read_angle(&mut r).map_err(named)?;
+                    let yaw = read_angle(&mut r).map_err(named)?;
+                    let head_yaw = read_angle(&mut r).map_err(named)?;
+                    let _data = r.read_varint().map_err(named)?;
+                    check_drained("minecraft:add_entity", &r);
+                    return Ok(Event::EntityAdded {
+                        id, uuid, kind, position, yaw, pitch, head_yaw, velocity,
+                    });
+                }
+                ids::play::clientbound::REMOVE_ENTITIES => {
+                    let count = r.read_varint_len(4096).map_err(named)?;
+                    let mut ids = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        ids.push(r.read_varint().map_err(named)?);
+                    }
+                    return Ok(Event::EntityRemoved(ids));
+                }
+                ids::play::clientbound::MOVE_ENTITY_POS => {
+                    let id = r.read_varint().map_err(named)?;
+                    let delta = read_step(&mut r).map_err(named)?;
+                    let _on_ground = r.read_bool().map_err(named)?;
+                    check_drained("minecraft:move_entity_pos", &r);
+                    return Ok(Event::EntityMoved { id, delta, rotation: None });
+                }
+                ids::play::clientbound::MOVE_ENTITY_POS_ROT => {
+                    let id = r.read_varint().map_err(named)?;
+                    let delta = read_step(&mut r).map_err(named)?;
+                    let yaw = read_angle(&mut r).map_err(named)?;
+                    let pitch = read_angle(&mut r).map_err(named)?;
+                    let _on_ground = r.read_bool().map_err(named)?;
+                    check_drained("minecraft:move_entity_pos_rot", &r);
+                    return Ok(Event::EntityMoved { id, delta, rotation: Some((yaw, pitch)) });
+                }
+                ids::play::clientbound::MOVE_ENTITY_ROT => {
+                    let id = r.read_varint().map_err(named)?;
+                    let yaw = read_angle(&mut r).map_err(named)?;
+                    let pitch = read_angle(&mut r).map_err(named)?;
+                    let _on_ground = r.read_bool().map_err(named)?;
+                    check_drained("minecraft:move_entity_rot", &r);
+                    return Ok(Event::EntityMoved {
+                        id,
+                        delta: [0.0; 3],
+                        rotation: Some((yaw, pitch)),
+                    });
+                }
+                ids::play::clientbound::ROTATE_HEAD => {
+                    let id = r.read_varint().map_err(named)?;
+                    let yaw = read_angle(&mut r).map_err(named)?;
+                    check_drained("minecraft:rotate_head", &r);
+                    return Ok(Event::EntityHeadYaw { id, yaw });
+                }
+                ids::play::clientbound::ENTITY_POSITION_SYNC
+                | ids::play::clientbound::TELEPORT_ENTITY => {
+                    // Both carry a PositionMoveRotation: position, then the
+                    // speed, then yaw and pitch as whole floats rather than
+                    // the single bytes the small steps use.
+                    let id = r.read_varint().map_err(named)?;
+                    let position = [
+                        r.read_f64().map_err(named)?,
+                        r.read_f64().map_err(named)?,
+                        r.read_f64().map_err(named)?,
+                    ];
+                    let velocity = [
+                        r.read_f64().map_err(named)?,
+                        r.read_f64().map_err(named)?,
+                        r.read_f64().map_err(named)?,
+                    ];
+                    let yaw = r.read_f32().map_err(named)?;
+                    let pitch = r.read_f32().map_err(named)?;
+                    return Ok(Event::EntityTeleported { id, position, yaw, pitch, velocity });
+                }
                 ids::play::clientbound::SET_ENTITY_MOTION => {
                     let who = r.read_varint().map_err(named)?;
                     if who != self.entity_id {
@@ -615,16 +717,12 @@ impl Connection {
                             len,
                         });
                     }
-                    // Three shorts at eight thousandths of a block each, which
-                    // is all the precision a shove needs.
-                    const SCALE: f64 = 8000.0;
-                    let axis = |r: &mut Reader<'_>| -> Result<f64> {
-                        Ok(f64::from(r.read_i16().map_err(named)?) / SCALE)
-                    };
-                    let x = axis(&mut r)?;
-                    let y = axis(&mut r)?;
-                    let z = axis(&mut r)?;
-                    return Ok(Event::Knockback([x, y, z]));
+                    // The same low precision vector the spawn packet uses:
+                    // ClientboundSetEntityMotionPacket is built on
+                    // Vec3.LP_STREAM_CODEC too, not on three shorts.
+                    let velocity = read_lp_vec3(&mut r).map_err(named)?;
+                    check_drained("minecraft:set_entity_motion", &r);
+                    return Ok(Event::Knockback(velocity));
                 }
                 ids::play::clientbound::PLAYER_COMBAT_KILL => {
                     // The player ID and the death message follow, neither of
@@ -888,6 +986,38 @@ impl Connection {
     /// Starts, gives up on, or finishes breaking a block.
     ///
     /// `action` is the game's own ordering: 0 starts, 1 gives up, 2 finishes.
+    /// The raw state of the movement keys, as one byte.
+    ///
+    /// The server simulates the player from this. Without it, a server that
+    /// checks movement has to guess what was pressed, and guesses wrong the
+    /// moment the player sprints: it predicts a walk, sees a sprint, and puts
+    /// them back where it last agreed with them.
+    ///
+    /// Bits read from Input in the jar: forward 1, backward 2, left 4,
+    /// right 8, jump 16, shift 32, sprint 64.
+    pub fn send_player_input(&mut self, flags: u8) -> Result<()> {
+        let mut w = Writer::new();
+        w.write_u8(flags);
+        self.framed.write_packet(ids::play::serverbound::PLAYER_INPUT, &w)?;
+        Ok(())
+    }
+
+    /// One of the things a player can start or stop doing.
+    ///
+    /// Ordinals from ServerboundPlayerCommandPacket$Action in the jar:
+    /// 0 STOP_SLEEPING, 1 START_SPRINTING, 2 STOP_SPRINTING,
+    /// 3 START_RIDING_JUMP, 4 STOP_RIDING_JUMP, 5 OPEN_INVENTORY,
+    /// 6 START_FALL_FLYING. The shift-key actions that used to live here are
+    /// gone; sneaking travels in the input byte now.
+    pub fn send_player_command(&mut self, action: i32) -> Result<()> {
+        let mut w = Writer::new();
+        w.write_varint(self.entity_id);
+        w.write_varint(action);
+        w.write_varint(0);
+        self.framed.write_packet(ids::play::serverbound::PLAYER_COMMAND, &w)?;
+        Ok(())
+    }
+
     pub fn send_player_action(&mut self, action: i32, at: [i32; 3], face: u8) -> Result<()> {
         if std::env::var_os("NEUTON_TRACE").is_some() {
             eprintln!("net: player_action {action} at {at:?} face {face}");
@@ -1203,5 +1333,65 @@ mod relatives_tests {
     fn a_relative_field_adds_and_an_absolute_one_replaces() {
         assert_eq!(Relatives::resolve(true, 0.25, 10.0), 10.25);
         assert_eq!(Relatives::resolve(false, 0.25, 10.0), 0.25);
+    }
+}
+
+/// One angle, sent as a single byte over a whole turn.
+fn read_angle(r: &mut Reader<'_>) -> neuton_protocol::Result<f32> {
+    Ok(f32::from(r.read_u8()? as i8) * 360.0 / 256.0)
+}
+
+/// A low precision vector, which is how the game packs a speed now.
+///
+/// Three fifteen-bit numbers over minus one to one, sharing one whole-number
+/// scale, in six bytes. Or in a single zero byte when the whole vector is
+/// zero, which for an entity that has just appeared it usually is. Reading it
+/// as three shorts costs five bytes it never sent and takes the rest of the
+/// packet with it, which is exactly what happened: LpVec3.read in the jar
+/// returns Vec3.ZERO the moment the first byte is zero.
+fn read_lp_vec3(r: &mut Reader<'_>) -> neuton_protocol::Result<[f64; 3]> {
+    let first = u64::from(r.read_u8()?);
+    if first == 0 {
+        return Ok([0.0; 3]);
+    }
+    let second = u64::from(r.read_u8()?);
+    let mut rest = 0u64;
+    for _ in 0..4 {
+        rest = (rest << 8) | u64::from(r.read_u8()?);
+    }
+    let packed = (rest << 16) | (second << 8) | first;
+    // The low two bits are the scale, and a third bit says a bigger one
+    // follows. Everything is a fraction of that scale.
+    let mut scale = first & 0b11;
+    if first & 0b100 != 0 {
+        scale |= u64::from(r.read_varint()? as u32) << 2;
+    }
+    let scale = scale as f64;
+    let unpack = |bits: u64| ((bits & 32767) as f64).min(32766.0) * 2.0 / 32766.0 - 1.0;
+    Ok([
+        unpack(packed >> 3) * scale,
+        unpack(packed >> 18) * scale,
+        unpack(packed >> 33) * scale,
+    ])
+}
+
+/// The small step an entity takes between ticks, in sixteenths of a
+/// four-hundred-and-ninety-sixth of a block. Anything further than eight
+/// blocks has to be sent as a teleport instead, which is why this fits.
+fn read_step(r: &mut Reader<'_>) -> neuton_protocol::Result<[f64; 3]> {
+    let axis = |r: &mut Reader<'_>| -> neuton_protocol::Result<f64> {
+        Ok(f64::from(r.read_i16()?) / 4096.0)
+    };
+    Ok([axis(r)?, axis(r)?, axis(r)?])
+}
+
+/// Says so when a packet was not read to its end.
+///
+/// A field read at the wrong width does not fail, it shifts everything after
+/// it, and the first sign is usually an entity somewhere absurd. Leftover
+/// bytes catch the same mistake at the point it was made.
+fn check_drained(name: &str, r: &Reader<'_>) {
+    if r.remaining() != 0 && std::env::var_os("NEUTON_TRACE").is_some() {
+        eprintln!("net: {name} left {} bytes unread", r.remaining());
     }
 }

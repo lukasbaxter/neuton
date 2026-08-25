@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod chat;
+pub mod entities;
 pub mod auth_task;
 pub mod fonts;
 pub mod gpu;

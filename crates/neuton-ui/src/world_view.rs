@@ -85,10 +85,16 @@ pub struct WorldView {
     /// When the last swing started, so a held button neither re-breaks the
     /// block the server has not yet taken away nor sweeps at frame rate.
     last_break: Option<Instant>,
+    /// The movement keys as last reported, so the byte only goes out when it
+    /// changes, and the sprint state that went with it.
+    last_input: Option<u8>,
+    last_sprinting: bool,
     /// A block the server has been asked to break, and when it was asked.
     /// Held until the block actually goes, so a held button does not start
     /// the cracks over on a block that is already on its way out.
     awaiting_break: Option<([i32; 3], Instant)>,
+    /// Everything else in the world: mobs, dropped items, other players.
+    pub entities: crate::entities::Entities,
     /// What the player is carrying, and which slot is in hand.
     pub inventory: crate::inventory::Inventory,
     /// Item pictures and interface sprites, rendered as they are first needed.
@@ -208,6 +214,9 @@ impl WorldView {
             last_use: None,
             last_break: None,
             awaiting_break: None,
+            last_input: None,
+            last_sprinting: false,
+            entities: crate::entities::Entities::default(),
             inventory: crate::inventory::Inventory::default(),
             art: crate::inventory::ItemArt::new(),
             pending: std::collections::VecDeque::new(),
@@ -520,9 +529,10 @@ impl WorldView {
                         eprintln!(
                             "setback: {distance:.4} blocks  by [{:+.4} {:+.4} {:+.4}]  \
                              client {:.3?} -> server [{x:.3} {y:.3} {z:.3}]  \
-                             v {:.4?} on_ground={} relative={relative:?}",
+                             client_v {:.4?} server_v {velocity:.4?} on_ground={} rel={:#011b}",
                             d[0], d[1], d[2],
                             self.body.position, self.body.velocity, self.body.on_ground,
+                            relative.0,
                         );
                     }
 
@@ -615,6 +625,17 @@ impl WorldView {
                         }
                     }
                 }
+                WorldEvent::EntityAdded {
+                    id, uuid, kind, position, yaw, pitch, head_yaw, velocity,
+                } => self.entities.add(id, uuid, kind, position, yaw, pitch, head_yaw, velocity),
+                WorldEvent::EntityRemoved(ids) => self.entities.remove(&ids),
+                WorldEvent::EntityMoved { id, delta, rotation } => {
+                    self.entities.moved(id, delta, rotation)
+                }
+                WorldEvent::EntityTeleported { id, position, yaw, pitch, velocity } => {
+                    self.entities.teleported(id, position, yaw, pitch, velocity)
+                }
+                WorldEvent::EntityHeadYaw { id, yaw } => self.entities.head_yaw(id, yaw),
                 WorldEvent::Cursor { stack } => self.inventory.set_carried(stack),
                 WorldEvent::PlayerSlot { slot, stack } => {
                     if slot >= 0 {
@@ -736,6 +757,7 @@ impl WorldView {
                 self.body.position[2] - self.previous[2],
             ];
             self.walked += (step[0] * step[0] + step[1] * step[1]).sqrt() as f32;
+            self.report_input(input);
             self.report_position();
         }
 
@@ -982,6 +1004,14 @@ impl WorldView {
                 }
             }
         }
+        // Everything else in the world, as the box it stands in. Boxes are
+        // what the renderer can draw today; the models come next, and the box
+        // is the thing a hit has to land in either way.
+        let alpha = (self.accumulator / Self::TICK) as f32;
+        for entity in self.entities.iter() {
+            let (min, max) = entity.hitbox(alpha);
+            boxes.push((min, max));
+        }
         renderer.set_outline(queue, &boxes);
 
         // The cracks spread over the block being broken, which is not always
@@ -1039,6 +1069,60 @@ impl WorldView {
             return None;
         }
         Some(m.since.elapsed().as_secs_f32() / total)
+    }
+
+    /// Tells the server which movement keys are down.
+    ///
+    /// The server simulates the player from this, so it goes out before the
+    /// position it explains rather than after. Only on a change: the game does
+    /// the same, and a byte a tick that never varies is just noise for a
+    /// server to read.
+    fn report_input(&mut self, input: physics::Input) {
+        const FORWARD: u8 = 1;
+        const BACKWARD: u8 = 2;
+        const LEFT: u8 = 4;
+        const RIGHT: u8 = 8;
+        const JUMP: u8 = 16;
+        const SHIFT: u8 = 32;
+        const SPRINT: u8 = 64;
+        let mut flags = 0u8;
+        if input.forward > 0.0 {
+            flags |= FORWARD;
+        }
+        if input.forward < 0.0 {
+            flags |= BACKWARD;
+        }
+        // Strafing right is positive here, and the game's "left" flag is the
+        // key, not the direction the player ends up going.
+        if input.strafe < 0.0 {
+            flags |= LEFT;
+        }
+        if input.strafe > 0.0 {
+            flags |= RIGHT;
+        }
+        if input.jump {
+            flags |= JUMP;
+        }
+        if input.sneak {
+            flags |= SHIFT;
+        }
+        if input.sprint {
+            flags |= SPRINT;
+        }
+        if self.last_input != Some(flags) {
+            self.last_input = Some(flags);
+            self.session.send(Outgoing::Input(flags));
+        }
+
+        // Sprinting is also its own start and stop, and a server that checks
+        // movement believes that one over the input byte: it is what decides
+        // whether the player is allowed to be going as fast as they are.
+        let sprinting = input.sprint && input.forward > 0.0;
+        if sprinting != self.last_sprinting {
+            self.last_sprinting = sprinting;
+            // 1 is START_SPRINTING and 2 is STOP_SPRINTING.
+            self.session.send(Outgoing::PlayerCommand(if sprinting { 1 } else { 2 }));
+        }
     }
 
     /// Tells the server the swing is done.
@@ -1174,6 +1258,12 @@ impl WorldView {
             String::new(),
             format!("Chunks: {} drawn / {} loaded", renderer.drawn.get(), renderer.chunk_count()),
             format!("Triangles: {:.2}M", renderer.triangles() as f64 / 1.0e6),
+            format!(
+                "Entities: {} ({} players, {} items)",
+                self.entities.len(),
+                self.entities.count_of("minecraft:player"),
+                self.entities.count_of("minecraft:item"),
+            ),
             format!(
                 "Mode: {}{}",
                 if self.abilities.instant_build { "creative" } else { "survival" },
