@@ -164,8 +164,12 @@ pub fn render(skin: &Skin, look: Look, width: u32, height: u32) -> egui::ColorIm
     let mut indices = Vec::new();
     // Facing you, turned by however far the body has come round. Upside down
     // and back to front first, the way every mob model is built.
+    //
+    // The turn is subtracted, not added: the model is mirrored on x by the
+    // flip, so a rotation applied outside it reads the other way round. Added,
+    // the body turns away from the pointer instead of towards it.
     let flip = [[-UNIT, 0.0, 0.0], [0.0, -UNIT, 0.0], [0.0, 0.0, UNIT]];
-    let turn = rotation_y(std::f32::consts::PI + look.body.to_radians());
+    let turn = rotation_y(std::f32::consts::PI - look.body.to_radians());
     // The whole scene leans with the pointer as well as the head, which is the
     // game tilting its camera rather than the player bending.
     let lean = rotation_x((-look.tilt * 0.5).to_radians());
@@ -179,6 +183,11 @@ pub fn render(skin: &Skin, look: Look, width: u32, height: u32) -> egui::ColorIm
         // Turned over to stand up, so its sheet is turned over with it. See
         // `push_cube`.
         sheet_flipped: true,
+        // Inside the flip, so this turn reads the other way round again --
+        // which is why it is the plain difference here and the body's is not.
+        // Get the sign wrong and the head cancels the body exactly: it stays
+        // pointed straight at you however far the body comes round, which
+        // looks like a head that cannot turn at all.
         head_turn: (look.head - look.body).to_radians(),
         head_tilt: look.tilt.to_radians(),
         stride: 0.0,

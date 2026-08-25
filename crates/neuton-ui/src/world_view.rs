@@ -67,6 +67,12 @@ pub struct WorldView {
     pub food: i32,
     /// Set when the player has died and has not yet asked to come back.
     pub dead: bool,
+    /// Why the connection ended, once it has.
+    ///
+    /// The world stays on screen behind the notice rather than dropping
+    /// straight back to the server list, so it is clear what happened; leaving
+    /// is still the player's choice.
+    pub disconnected: Option<String>,
     /// The block under the crosshair, if any is in reach.
     pub target: Option<neuton_world::raycast::Hit>,
     /// The block being broken, the face it was struck on, and when the swing
@@ -253,6 +259,7 @@ impl WorldView {
             missing_textures: std::collections::HashSet::new(),
             inventory: crate::inventory::Inventory::default(),
             cursor: crate::inventory::Cursor::default(),
+            disconnected: None,
             art: crate::inventory::ItemArt::new(),
             pending: std::collections::VecDeque::new(),
             last_jump: None,
@@ -908,7 +915,13 @@ impl WorldView {
                     }
                 }
                 WorldEvent::Disconnected(why) => {
+                    // A line of chat is not enough. It scrolls away, and the
+                    // world keeps running, so the first sign of a connection
+                    // that has gone is a block that will not break.
                     self.chat.note(format!("Disconnected: {why}"));
+                    if self.disconnected.is_none() {
+                        self.disconnected = Some(why);
+                    }
                 }
             }
         }
@@ -1088,14 +1101,12 @@ impl WorldView {
     /// later. The server's answer either agrees or replaces it.
     pub fn act(&mut self, click: crate::clicks::Click) {
         for wire in self.inventory.click(click) {
-            let carried = self.inventory.carried().map(|s| (s.id, s.count));
             self.session.send(Outgoing::Click {
                 window: 0,
                 state_id: self.inventory.state_id,
                 slot: wire.slot,
                 button: wire.button,
                 mode: wire.mode,
-                carried,
             });
         }
     }
