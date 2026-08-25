@@ -483,12 +483,29 @@ impl WorldView {
             self.equipped = (self.equipped + 0.25).min(1.0);
         }
 
-        let holding = match self.shown_item.as_deref() {
-            None => crate::hand::Holding::Nothing,
-            Some(item) => match crate::hand::block_in_hand(self.shapes.as_ref(), item) {
-                Some(model) => crate::hand::Holding::Block(model),
-                None => crate::hand::Holding::Flat { texture: crate::hand::flat_texture(item) },
+        // What an item looks like in the hand comes out of its own model, not
+        // out of whether it places a block: a torch places one and is carried
+        // as a picture. Resolved once per item and kept.
+        let look = self.shown_item.as_deref().and_then(|item| self.art.held(item));
+        let holding = match (self.shown_item.as_deref(), look.as_deref()) {
+            (Some(item), Some(held)) => match &held.geometry {
+                crate::inventory::HeldGeometry::Solid => {
+                    match crate::hand::block_in_hand(self.shapes.as_ref(), item) {
+                        Some(model) => {
+                            crate::hand::Holding::Block { model, display: held.display }
+                        }
+                        None => crate::hand::Holding::Nothing,
+                    }
+                }
+                crate::inventory::HeldGeometry::Sprite { texture, sides } => {
+                    crate::hand::Holding::Sprite {
+                        texture,
+                        sides,
+                        display: held.display,
+                    }
+                }
             },
+            _ => crate::hand::Holding::Nothing,
         };
         crate::hand::build(
             self.camera.position,

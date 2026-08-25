@@ -16,34 +16,33 @@ use std::f32::consts::PI;
 /// The skin a hand is drawn with, until real skins arrive.
 pub const SKIN: &str = "entity/player/wide/steve.png";
 
-/// How a first-person model is held, out of the game's own model files.
-///
-/// A block is held small and turned a little; anything flat is held out at an
-/// angle, closer to the eye and larger. These are the `firstperson_righthand`
-/// transforms from `block/block.json` and `item/generated.json`.
-struct Display {
-    rotation: [f32; 3],
-    /// In model units, sixteen to the block.
-    translation: [f32; 3],
-    scale: f32,
-}
-
-const BLOCK_IN_HAND: Display =
-    Display { rotation: [0.0, 45.0, 0.0], translation: [0.0, 0.0, 0.0], scale: 0.4 };
 const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
-const ITEM_IN_HAND: Display =
-    Display { rotation: [0.0, -90.0, 25.0], translation: [1.13, 3.2, 1.13], scale: 0.68 };
+/// Where a model sits in the hand when nothing says otherwise.
+///
+/// Only reached for an item whose model chain declares no
+/// `firstperson_righthand` at all, which in the vanilla files is nothing; the
+/// real numbers come out of `block/block.json` and `item/generated.json`.
+const DEFAULT_HOLD: neuton_assets::Display = neuton_assets::Display {
+    rotation: [0.0, 45.0, 0.0],
+    translation: [0.0, 0.0, 0.0],
+    scale: [0.4, 0.4, 0.4],
+};
 
 /// What the hand is holding this frame.
 pub enum Holding<'a> {
     /// Nothing, so the arm itself is what is drawn.
     Nothing,
     /// A block, drawn from its own model in the block atlas.
-    Block(&'a BakedModel),
-    /// Anything else, drawn as its picture with a little thickness, the way the
-    /// game builds one out of the sprite.
-    Flat { texture: String },
+    Block { model: &'a BakedModel, display: neuton_assets::Display },
+    /// A flat picture, built into a solid a sixteenth thick: the two faces and
+    /// the rim of little quads round the edge of the silhouette. Without the
+    /// rim a held item vanishes at the quarter turn where the faces line up.
+    Sprite {
+        texture: &'a str,
+        sides: &'a [neuton_assets::Side],
+        display: neuton_assets::Display,
+    },
 }
 
 /// Where the hand is in its swing and its equip, both from zero to one.
@@ -93,20 +92,25 @@ pub fn build(
     push_arm(&arm_transform(&camera, swing, dropped), out);
     match holding {
         Holding::Nothing => {}
-        Holding::Block(baked) => {
-            let held = item_transform(&camera, swing, dropped, &BLOCK_IN_HAND);
-            push_block(baked, &held, out);
+        Holding::Block { model, display } => {
+            let held = item_transform(&camera, swing, dropped, display);
+            push_block(model, &held, out);
         }
-        Holding::Flat { texture } => {
-            let held = item_transform(&camera, swing, dropped, &ITEM_IN_HAND);
-            push_flat(texture, &held, out);
+        Holding::Sprite { texture, sides, display } => {
+            let held = item_transform(&camera, swing, dropped, display);
+            push_sprite(texture, sides, &held, out);
         }
     }
 }
 
 /// Where a held item sits: out to the right and low, swung when the button is
 /// pressed, and then however that particular model is held.
-fn item_transform(camera: &Xform, swing: f32, dropped: f32, display: &Display) -> Xform {
+fn item_transform(
+    camera: &Xform,
+    swing: f32,
+    dropped: f32,
+    display: &neuton_assets::Display,
+) -> Xform {
     let mut at = Xform { basis: IDENTITY, at: [0.56, -0.52 + dropped * -0.6, -0.72] };
     at = camera.then(&at);
 
@@ -131,10 +135,13 @@ fn item_transform(camera: &Xform, swing: f32, dropped: f32, display: &Display) -
         ),
         rotation_z(display.rotation[2].to_radians()),
     );
+    // The scale goes on inside the turn, because the model is scaled in its own
+    // axes and then turned, not turned and then stretched along the screen's.
+    let s = display.scale;
     let scaled = [
-        [rotation[0][0] * display.scale, rotation[0][1] * display.scale, rotation[0][2] * display.scale],
-        [rotation[1][0] * display.scale, rotation[1][1] * display.scale, rotation[1][2] * display.scale],
-        [rotation[2][0] * display.scale, rotation[2][1] * display.scale, rotation[2][2] * display.scale],
+        [rotation[0][0] * s[0], rotation[0][1] * s[1], rotation[0][2] * s[2]],
+        [rotation[1][0] * s[0], rotation[1][1] * s[1], rotation[1][2] * s[2]],
+        [rotation[2][0] * s[0], rotation[2][1] * s[1], rotation[2][2] * s[2]],
     ];
     at.then(&Xform {
         basis: scaled,
@@ -251,24 +258,21 @@ fn push_block(baked: &BakedModel, at: &Xform, out: &mut Mesh) {
     out.indices.extend_from_slice(&indices);
 }
 
-/// Anything that is not a block: its picture, with enough thickness to have a
-/// side when it turns.
-fn push_flat(texture: &str, at: &Xform, out: &mut Mesh) {
-    // The game builds a solid out of the sprite, one sixteenth thick, sitting
-    // where the middle of a block would be. Front and back are the picture; the
-    // edges are a sliver of it.
-    const THICK: f32 = 1.0 / 16.0;
-    let (front, back) = (0.5 - THICK * 0.5, 0.5 + THICK * 0.5);
+/// Anything that is not a block: the picture on both faces, and the rim that
+/// gives it a thickness to see when it turns.
+fn push_sprite(texture: &str, sides: &[neuton_assets::Side], at: &Xform, out: &mut Mesh) {
+    let thick = neuton_assets::extrude::THICKNESS;
+    let (front, back) = (0.5 - thick * 0.5, 0.5 + thick * 0.5);
     let start = out.indices.len() as u32;
     let mut indices = Vec::new();
-    let mut quad = |corners: [[f32; 3]; 4], uvs: [[f32; 2]; 4]| {
+    let mut quad = |corners: [[f32; 3]; 4], uvs: [[f32; 2]; 4], light: f32| {
         let base = out.vertices.len() as u32;
         for (corner, uv) in corners.iter().zip(uvs) {
             out.vertices.push(Vertex {
                 position: at.apply([corner[0] - 0.5, corner[1] - 0.5, corner[2] - 0.5]),
                 uv,
                 tint: [1.0, 1.0, 1.0, 1.0],
-                light: 1.0,
+                light,
             });
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -278,11 +282,19 @@ fn push_flat(texture: &str, at: &Xform, out: &mut Mesh) {
     quad(
         [[0.0, 0.0, front], [1.0, 0.0, front], [1.0, 1.0, front], [0.0, 1.0, front]],
         [[1.0, 1.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
+        1.0,
     );
     quad(
         [[1.0, 0.0, back], [0.0, 0.0, back], [0.0, 1.0, back], [1.0, 1.0, back]],
         [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+        1.0,
     );
+    // The rim. Its corners are already in the same 0..1 space as the two faces,
+    // and its texture coordinates already point at the texel that edge came
+    // from, so both go straight through.
+    for side in sides {
+        quad(side.corners, side.uv, side.shade);
+    }
     out.batches.push(EntityBatch {
         texture: texture.to_string(),
         start,
@@ -297,11 +309,6 @@ pub fn block_in_hand<'a>(shapes: &'a BlockTextures, item: &str) -> Option<&'a Ba
     let block = neuton_blocks::by_name(item)?;
     let baked = shapes.model(block.get().default_state);
     (!baked.is_empty()).then_some(baked)
-}
-
-/// Where an item's picture lives, for the ones that are not blocks.
-pub fn flat_texture(item: &str) -> String {
-    format!("item/{}.png", item.rsplit(':').next().unwrap_or(item))
 }
 
 #[cfg(test)]

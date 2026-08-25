@@ -14,11 +14,7 @@ fn main() {
 
     let sheet = neuton_assets::ICON_SIZE;
     for name in &names {
-        let block = neuton_blocks::items::ITEMS
-            .iter()
-            .find(|i| i.name == name)
-            .and_then(|i| i.block_state.map(|_| name.as_str()));
-        match icons.render(&mut packs, name, block) {
+        match icons.render(&mut packs, name) {
             Some(icon) => {
                 let path = format!("{out}/{name}.png");
                 let file = std::fs::File::create(&path).unwrap();
