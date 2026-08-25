@@ -27,6 +27,8 @@ pub struct Inventory {
     carried: Option<Stack>,
     /// The server's revision of this container, echoed back with every click.
     pub state_id: i32,
+    /// The drag being painted, if the button is down.
+    pub drag: crate::clicks::Drag,
 }
 
 impl Default for Inventory {
@@ -37,6 +39,7 @@ impl Default for Inventory {
             open: false,
             carried: None,
             state_id: 0,
+            drag: crate::clicks::Drag::default(),
         }
     }
 }
@@ -53,6 +56,31 @@ impl Inventory {
 
     pub fn set_carried(&mut self, stack: Option<Stack>) {
         self.carried = stack;
+    }
+
+    /// Lifts a slot out to be worked on, leaving it empty.
+    ///
+    /// Clicks are easier to write against owned stacks than against two
+    /// borrows of the same vector, and a slot that ends up empty has to become
+    /// `None` rather than a stack of zero -- a zero-count stack draws as an
+    /// item with no number on it, which is the sort of thing nobody can
+    /// explain later.
+    pub(crate) fn take_slot(&mut self, index: usize) -> Option<Stack> {
+        self.slots.get_mut(index).and_then(Option::take).filter(|s| s.count > 0)
+    }
+
+    pub(crate) fn put_slot(&mut self, index: usize, stack: Option<Stack>) {
+        if let Some(slot) = self.slots.get_mut(index) {
+            *slot = stack.filter(|s| s.count > 0);
+        }
+    }
+
+    pub(crate) fn take_carried(&mut self) -> Option<Stack> {
+        self.carried.take().filter(|s| s.count > 0)
+    }
+
+    pub(crate) fn put_carried(&mut self, stack: Option<Stack>) {
+        self.carried = stack.filter(|s| s.count > 0);
     }
 
     /// What is in the player's hand.
@@ -413,13 +441,55 @@ fn slot_positions() -> Vec<(usize, [f32; 2])> {
     out
 }
 
-/// The whole inventory screen. Returns the slot that was clicked, if one was.
+/// What the pointer is doing on the inventory screen, between frames.
+///
+/// A click on a slot is not decided when the button goes down. Holding the
+/// button and moving across slots with a stack on the cursor is a drag, not a
+/// click, and which of the two it was is only known when the button comes back
+/// up -- so the press is remembered here and acted on later.
+#[derive(Default)]
+pub struct Cursor {
+    /// The button that is down, and where it went down.
+    press: Option<Press>,
+    /// The slot and time of the last completed click, for spotting a double.
+    last: Option<(usize, f64)>,
+    /// Set once a press has turned into a drag, so the release ends it rather
+    /// than counting as a click.
+    dragging: bool,
+    /// Set when the press was already spent on something else, so the release
+    /// does nothing.
+    spent: bool,
+    /// The slot under the pointer, for the keys that act on it.
+    pub hovered: Option<usize>,
+}
+
+struct Press {
+    slot: Option<usize>,
+    right: bool,
+    at: egui::Pos2,
+}
+
+/// How far the pointer has to move before a held button counts as a drag
+/// rather than a click, in screen pixels.
+const DRAG_SLOP: f32 = 3.0;
+
+/// How long two clicks on one slot can be apart and still be a double click.
+const DOUBLE_CLICK: f64 = 0.25;
+
+/// The whole inventory screen: draws it, and reads what the pointer did.
+///
+/// Clicks come back rather than being applied here, because applying one means
+/// both changing what is in the slots and telling the server, and neither
+/// belongs in a drawing function.
 pub fn screen(
     ui: &egui::Ui,
     inventory: &Inventory,
+    cursor: &mut Cursor,
     art: &mut ItemArt,
+    portrait: Option<egui::TextureId>,
     scale: f32,
-) -> Option<(usize, bool)> {
+    creative: bool,
+) -> Vec<crate::clicks::Click> {
     let screen = ui.clip_rect();
     let ctx = ui.ctx().clone();
     let painter = ui.painter();
@@ -445,38 +515,227 @@ pub fn screen(
         }
     }
 
-    let pointer = ui.ctx().pointer_latest_pos();
-    let mut hit = None;
-    for (index, at) in slot_positions() {
-        let cell = egui::Rect::from_min_size(
-            panel.min + egui::vec2(at[0] * scale, at[1] * scale),
-            egui::vec2(16.0 * scale, 16.0 * scale),
+    // The player, in the window the game keeps for them.
+    if let Some(id) = portrait {
+        let at = egui::Rect::from_min_size(
+            panel.min + egui::vec2(PORTRAIT_AT[0] * scale, PORTRAIT_AT[1] * scale),
+            egui::vec2(PORTRAIT_SIZE[0] * scale, PORTRAIT_SIZE[1] * scale),
         );
-        // The slot's own square is a pixel out from the item on every side.
-        let square = cell.expand(scale);
-        if pointer.is_some_and(|p| square.contains(p)) {
-            painter.rect_filled(square, 0.0, egui::Color32::from_white_alpha(90));
-            if ui.ctx().input(|i| i.pointer.primary_pressed()) {
-                hit = Some((index, false));
-            } else if ui.ctx().input(|i| i.pointer.secondary_pressed()) {
-                hit = Some((index, true));
-            }
-        }
-        draw_slot(ui, painter, art, inventory.slot(index), cell, scale);
+        painter.image(id, at, full_uv(), egui::Color32::WHITE);
     }
 
-    // Whatever is on the cursor rides with it.
+    let pointer = ctx.pointer_latest_pos();
+    let cells: Vec<(usize, egui::Rect)> = slot_positions()
+        .into_iter()
+        .map(|(index, at)| {
+            (
+                index,
+                egui::Rect::from_min_size(
+                    panel.min + egui::vec2(at[0] * scale, at[1] * scale),
+                    egui::vec2(16.0 * scale, 16.0 * scale),
+                ),
+            )
+        })
+        .collect();
+
+    // The slot's own square is a pixel out from the item on every side, and
+    // that square is what the pointer has to be inside.
+    let hovered = pointer.and_then(|p| {
+        cells.iter().find(|(_, cell)| cell.expand(scale).contains(p)).map(|(index, _)| *index)
+    });
+    cursor.hovered = hovered;
+
+    let clicks = read_pointer(&ctx, inventory, cursor, hovered, pointer, panel, creative);
+
+    // What a drag would put in each slot, so the split is visible before the
+    // button comes up rather than only after.
+    let painting = drag_preview(inventory);
+
+    for (index, cell) in &cells {
+        if hovered == Some(*index) {
+            painter.rect_filled(cell.expand(scale), 0.0, egui::Color32::from_white_alpha(90));
+        }
+        let held = inventory.slot(*index);
+        match painting.get(index) {
+            Some(extra) => {
+                let mut shown =
+                    held.cloned().or_else(|| inventory.carried().map(|c| Stack { count: 0, ..c.clone() }));
+                if let Some(stack) = shown.as_mut() {
+                    stack.count += extra;
+                }
+                draw_slot(ui, painter, art, shown.as_ref(), *cell, scale);
+            }
+            None => draw_slot(ui, painter, art, held, *cell, scale),
+        }
+    }
+
+    // Whatever is on the cursor rides with it, minus whatever a drag in
+    // progress has already promised to other slots.
+    let handed_out: i32 = painting.values().sum();
     if let (Some(stack), Some(at)) = (inventory.carried(), pointer)
+        && stack.count > handed_out
         && let Some(id) = art.item(&ctx, stack)
     {
         let cell = egui::Rect::from_center_size(at, egui::vec2(16.0 * scale, 16.0 * scale));
         painter.image(id, cell, full_uv(), egui::Color32::WHITE);
-        if stack.count > 1 {
-            count_label(painter, cell, stack.count, scale);
+        if stack.count - handed_out > 1 {
+            count_label(painter, cell, stack.count - handed_out, scale);
         }
     }
-    hit
+    clicks
 }
+
+/// Turns this frame's pointer state into clicks.
+fn read_pointer(
+    ctx: &egui::Context,
+    inventory: &Inventory,
+    cursor: &mut Cursor,
+    hovered: Option<usize>,
+    pointer: Option<egui::Pos2>,
+    panel: egui::Rect,
+    creative: bool,
+) -> Vec<crate::clicks::Click> {
+    use crate::clicks::{Click, DragKind};
+    use egui::PointerButton;
+
+    let mut out = Vec::new();
+    let (pressed_primary, pressed_secondary, pressed_middle, released, shift, now) = ctx
+        .input(|i| {
+            (
+                i.pointer.button_pressed(PointerButton::Primary),
+                i.pointer.button_pressed(PointerButton::Secondary),
+                i.pointer.button_pressed(PointerButton::Middle),
+                i.pointer.button_released(PointerButton::Primary)
+                    || i.pointer.button_released(PointerButton::Secondary),
+                i.modifiers.shift,
+                i.time,
+            )
+        });
+
+    // Middle click in creative fills the cursor, and does nothing anywhere
+    // else, so it never becomes a press worth remembering.
+    if pressed_middle && creative && let Some(slot) = hovered {
+        out.push(Click::Clone { slot });
+        return out;
+    }
+
+    if pressed_primary || pressed_secondary {
+        let right = pressed_secondary && !pressed_primary;
+        cursor.dragging = false;
+        cursor.spent = false;
+        cursor.press = Some(Press { slot: hovered, right, at: pointer.unwrap_or_default() });
+
+        match (hovered, inventory.carried().is_some()) {
+            // An empty cursor acts at once: there is nothing to drag, and
+            // waiting for the button to come up only makes it feel slow.
+            (Some(slot), false) => {
+                cursor.spent = true;
+                if shift {
+                    out.push(Click::QuickMove { slot });
+                } else {
+                    out.push(Click::Pickup { slot, right });
+                }
+                cursor.last = Some((slot, now));
+            }
+            // A second click on the same slot, still holding what the first
+            // one picked up: gather every matching stack onto the cursor.
+            (Some(slot), true) => {
+                let doubled = !right
+                    && !shift
+                    && cursor.last.is_some_and(|(last, at)| last == slot && now - at < DOUBLE_CLICK);
+                if doubled {
+                    cursor.spent = true;
+                    cursor.last = None;
+                    out.push(Click::Gather { slot });
+                }
+            }
+            (None, _) => {}
+        }
+        return out;
+    }
+
+    // Holding a stack and moving across slots paints a drag. The first slot
+    // painted is the one the button went down on, so a drag that starts on a
+    // slot fills that one too.
+    if let Some(press) = cursor.press.as_ref()
+        && !cursor.spent
+        && inventory.carried().is_some()
+    {
+        let moved = pointer.is_some_and(|p| (p - press.at).length() > DRAG_SLOP);
+        let elsewhere = hovered.is_some() && hovered != press.slot;
+        if !cursor.dragging && (moved || elsewhere) {
+            cursor.dragging = true;
+            let kind = if press.right { DragKind::One } else { DragKind::Even };
+            out.push(Click::DragStart(kind));
+            if let Some(slot) = press.slot {
+                out.push(Click::DragOver { slot });
+            }
+        }
+        if cursor.dragging && let Some(slot) = hovered {
+            out.push(Click::DragOver { slot });
+        }
+    }
+
+    if released {
+        let press = cursor.press.take();
+        let dragging = std::mem::take(&mut cursor.dragging);
+        let spent = std::mem::take(&mut cursor.spent);
+        if dragging {
+            out.push(Click::DragEnd);
+        } else if !spent && let Some(press) = press {
+            match press.slot {
+                Some(slot) if shift => {
+                    out.push(Click::QuickMove { slot });
+                    cursor.last = Some((slot, now));
+                }
+                Some(slot) => {
+                    out.push(Click::Pickup { slot, right: press.right });
+                    cursor.last = Some((slot, now));
+                }
+                // Away from the panel with something in hand: put it down, on
+                // the ground. Without this the stack sticks to the pointer for
+                // good, because the server was never told to let go of it.
+                None if !panel.contains(press.at) && inventory.carried().is_some() => {
+                    out.push(Click::DropCarried { whole_stack: !press.right });
+                }
+                None => {}
+            }
+        }
+    }
+    out
+}
+
+/// How many of the carried stack each painted slot would receive.
+fn drag_preview(inventory: &Inventory) -> std::collections::HashMap<usize, i32> {
+    use crate::clicks::DragKind;
+    let mut out = std::collections::HashMap::new();
+    let (Some(kind), Some(carried)) = (inventory.drag.kind, inventory.carried()) else {
+        return out;
+    };
+    if inventory.drag.slots.is_empty() {
+        return out;
+    }
+    let each = match kind {
+        DragKind::Even => carried.count / inventory.drag.slots.len() as i32,
+        DragKind::One => 1,
+        DragKind::Fill => carried.count,
+    };
+    let mut left = carried.count;
+    for index in &inventory.drag.slots {
+        let already = inventory.slot(*index).map_or(0, |s| s.count);
+        let space = (crate::clicks::slot_limit(*index, carried) - already).max(0);
+        let moved = each.min(space).min(left);
+        if moved > 0 {
+            out.insert(*index, moved);
+            left -= moved;
+        }
+    }
+    out
+}
+
+/// Where the player is drawn on the inventory panel, in the game's own pixels.
+const PORTRAIT_AT: [f32; 2] = [26.0, 8.0];
+const PORTRAIT_SIZE: [f32; 2] = [52.0, 70.0];
 
 fn full_uv() -> egui::Rect {
     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))

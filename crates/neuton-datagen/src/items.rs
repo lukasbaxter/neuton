@@ -5,7 +5,83 @@
 //! server used, which the vanilla generator will simply hand over.
 
 use crate::{Ctx, emit};
+use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::path::Path;
+use std::process::Command;
+
+type Err = Box<dyn std::error::Error>;
+
+/// What one item's default stack says about itself, out of the jar.
+struct Facts {
+    max_stack: u32,
+    /// The equipment slot's own name, or empty for something not worn.
+    slot: String,
+}
+
+/// Runs the extractor, compiling it first.
+///
+/// Stack size and the slot a thing is worn in are components on the item's
+/// default stack, not entries in any report, so the only honest way to get
+/// them is to ask the jar.
+fn facts(ctx: &Ctx, java: &Path, classpath: &str) -> Result<HashMap<String, Facts>, Err> {
+    let source = ctx.repo.join("crates/neuton-datagen/java/DumpItems.java");
+    let classes = ctx.repo.join("target/datagen/classes");
+    std::fs::create_dir_all(&classes)?;
+
+    let javac = java.with_file_name("javac");
+    let status = Command::new(&javac)
+        .args(["-nowarn", "-cp", classpath, "-d"])
+        .arg(&classes)
+        .arg(&source)
+        .status()?;
+    if !status.success() {
+        return Err(format!("compiling {} failed", source.display()).into());
+    }
+
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let dumped = ctx.repo.join("target/datagen/items.json");
+    let status = Command::new(java)
+        .arg("-XX:+UseSerialGC")
+        .arg("-cp")
+        .arg(format!("{}{separator}{classpath}", classes.display()))
+        .arg("DumpItems")
+        .arg(&dumped)
+        .stdout(std::process::Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err("the item extractor failed".into());
+    }
+
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(&dumped)?)?;
+    let mut out = HashMap::with_capacity(entries.len());
+    for entry in &entries {
+        let name = entry["name"].as_str().ok_or("item with no name")?.to_string();
+        out.insert(
+            name,
+            Facts {
+                max_stack: entry["max"].as_u64().unwrap_or(64) as u32,
+                slot: entry["slot"].as_str().unwrap_or("").to_string(),
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// The Rust name for one of the game's equipment slots.
+fn equips(slot: &str) -> &'static str {
+    match slot {
+        "head" => "Some(Equips::Head)",
+        "chest" => "Some(Equips::Chest)",
+        "legs" => "Some(Equips::Legs)",
+        "feet" => "Some(Equips::Feet)",
+        "offhand" => "Some(Equips::OffHand)",
+        // Mainhand, a horse's body, a saddle: none of them is a slot on the
+        // player's own screen, so a shift-click must not try to fill one.
+        _ => "None",
+    }
+}
 
 /// Reads a registry into a vector indexed by protocol ID.
 fn registry(doc: &serde_json::Value, name: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -23,11 +99,12 @@ fn registry(doc: &serde_json::Value, name: &str) -> Result<Vec<String>, Box<dyn 
     Ok(out)
 }
 
-pub fn generate(ctx: &Ctx) -> Result<(), Box<dyn std::error::Error>> {
+pub fn generate(ctx: &Ctx, java: &Path, classpath: &str) -> Result<(), Err> {
     let raw = std::fs::read_to_string(ctx.reports.join("registries.json"))?;
     let doc: serde_json::Value = serde_json::from_str(&raw)?;
     let items = registry(&doc, "minecraft:item")?;
     let components = registry(&doc, "minecraft:data_component_type")?;
+    let facts = facts(ctx, java, classpath)?;
 
     // Most items are blocks, and a block item is drawn as the block rather than
     // as a flat picture. Pairing them here saves a name lookup per drawn slot.
@@ -49,13 +126,25 @@ pub fn generate(ctx: &Ctx) -> Result<(), Box<dyn std::error::Error>> {
         ctx.version
     ));
     out.push_str(
-        "/// One item, by its protocol ID.\n\
+        "/// A slot on the player's own screen that an item belongs in.\n\
+         ///\n\
+         /// What a shift-click reaches for: a helmet goes to the head slot\n\
+         /// before it goes anywhere else, and a shield to the off hand.\n\
+         #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n\
+         pub enum Equips {\n    \
+             Head,\n    Chest,\n    Legs,\n    Feet,\n    OffHand,\n\
+         }\n\n\
+         /// One item, by its protocol ID.\n\
          #[derive(Debug, Clone, Copy)]\n\
          pub struct Item {\n    \
              /// Registry name without the namespace, e.g. `oak_stairs`.\n    \
              pub name: &'static str,\n    \
              /// The block this item places, if it places one.\n    \
-             pub block_state: Option<u32>,\n\
+             pub block_state: Option<u32>,\n    \
+             /// How many of it fit in one slot.\n    \
+             pub max_stack: u8,\n    \
+             /// Where it is worn, if it is worn.\n    \
+             pub equips: Option<Equips>,\n\
          }\n\n",
     );
 
@@ -66,10 +155,20 @@ pub fn generate(ctx: &Ctx) -> Result<(), Box<dyn std::error::Error>> {
         if state.is_some() {
             with_blocks += 1;
         }
-        match state {
-            Some(id) => writeln!(out, "    Item {{ name: {name:?}, block_state: Some({id}) }},")?,
-            None => writeln!(out, "    Item {{ name: {name:?}, block_state: None }},")?,
-        }
+        let fact = facts.get(name);
+        // Sixty four is the game's own default, and the only items missing
+        // from the dump would be ones the registry has and the jar does not,
+        // which is not a thing that happens.
+        let max = fact.map_or(64, |f| f.max_stack).clamp(1, 99);
+        let worn = equips(fact.map_or("", |f| f.slot.as_str()));
+        let places = match state {
+            Some(id) => format!("Some({id})"),
+            None => "None".to_string(),
+        };
+        writeln!(
+            out,
+            "    Item {{ name: {name:?}, block_state: {places}, max_stack: {max}, equips: {worn} }},"
+        )?;
     }
     writeln!(out, "];\n")?;
 

@@ -80,7 +80,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     packets::generate(&ctx)?;
     blocks::generate(&ctx)?;
-    items::generate(&ctx)?;
+    // Needs the jar too: how many fit in a slot and where a thing is worn
+    // are components on the item, not entries in any report.
+    items::generate(&ctx, &env.java, &env.classpath()?)?;
     // Needs the jar itself, not the reports: hardness is in code and the
     // mineable tags are in the built-in data pack.
     breaking::generate(&ctx, &env.java, &env.classpath()?, &env.jar())?;

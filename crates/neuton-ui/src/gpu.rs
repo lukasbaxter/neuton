@@ -65,6 +65,14 @@ impl Gpu {
             config.format = f;
         }
         config.present_mode = wgpu::PresentMode::AutoVsync;
+        // The shortest queue the display will take. Every extra frame allowed
+        // in flight is another whole refresh between moving the mouse and
+        // seeing the result, and at sixty hertz that is the entire difference
+        // between a view that turns with the hand and one that is dragged
+        // along behind it. wgpu's default is two, which on Metal is three
+        // drawables; one is two, and the frame budget here is under five
+        // milliseconds, so there is nothing to gain by pipelining deeper.
+        config.desired_maximum_frame_latency = 1;
         surface.configure(&device, &config);
 
         Ok(Self { surface, device, queue, config, window })

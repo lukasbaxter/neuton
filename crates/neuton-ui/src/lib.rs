@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod chat;
+pub mod clicks;
 pub mod entities;
 pub mod block_models;
 pub mod entity_render;
@@ -1034,11 +1035,14 @@ fn overlay(ui: &mut egui::Ui, hud: &Hud, world: Option<&mut WorldView>) -> Pause
                 // Two and a bit strides to a full cycle, as the game bobs.
                 let bob = world.walked * 2.2;
                 let open = world.inventory.open;
-                let mut clicked = None;
+                let creative = world.abilities.instant_build;
+                let mut clicked = Vec::new();
                 {
-                    let WorldView { inventory, art, .. } = world;
+                    let WorldView { inventory, cursor, art, .. } = world;
                     if open {
-                        clicked = crate::inventory::screen(ui, inventory, art, scale);
+                        clicked = crate::inventory::screen(
+                            ui, inventory, cursor, art, None, scale, creative,
+                        );
                     } else {
                         crate::inventory::held_item(ui, inventory, art, scale, bob);
                     }
@@ -1049,8 +1053,8 @@ fn overlay(ui: &mut egui::Ui, hud: &Hud, world: Option<&mut WorldView>) -> Pause
                         crate::inventory::vitals(ui, art, scale, health, food);
                     }
                 }
-                if let Some((slot, right)) = clicked {
-                    world.click_slot(slot, right);
+                for click in clicked {
+                    world.act(click);
                 }
             }
 
