@@ -39,6 +39,11 @@ struct ChunkBuffers {
 pub const MAX_ENTITY_VERTICES: usize = 128 * 1024;
 pub const MAX_ENTITY_INDICES: usize = MAX_ENTITY_VERTICES / 4 * 6;
 
+/// The texture name a batch uses to ask for the block atlas rather than an
+/// entity's own sheet. An item frame is drawn from a block model, so its
+/// texture is already in there.
+pub const ATLAS_BATCH: &str = "#atlas";
+
 /// One run of the entity mesh that shares a texture.
 #[derive(Debug, Clone)]
 pub struct EntityBatch {
@@ -946,7 +951,12 @@ impl WorldRenderer {
             pass.set_vertex_buffer(0, self.entity_vertices.slice(..));
             pass.set_index_buffer(self.entity_indices.slice(..), wgpu::IndexFormat::Uint32);
             for batch in &self.entity_batches {
-                let Some(texture) = self.entity_textures.get(&batch.texture) else { continue };
+                let texture = if batch.texture == ATLAS_BATCH {
+                    &self.atlas_bind_group
+                } else {
+                    let Some(texture) = self.entity_textures.get(&batch.texture) else { continue };
+                    texture
+                };
                 pass.set_bind_group(1, texture, &[]);
                 pass.draw_indexed(batch.start..batch.start + batch.count, 0, 0..1);
             }

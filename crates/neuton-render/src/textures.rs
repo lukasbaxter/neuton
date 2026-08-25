@@ -191,11 +191,20 @@ pub fn destroy_stage_texture(stage: u32) -> String {
     )
 }
 
+/// Models that no block state points at.
+///
+/// An item frame is an entity, but what is drawn for it is a block model, so
+/// it is baked here with everything else and its textures go into the same
+/// atlas.
+pub const LOOSE_MODELS: &[&str] = &["block/item_frame", "block/glow_item_frame"];
+
 pub struct BlockTextures {
     /// Index into `models`, one per state. Deduplicated hard: most states of a
     /// block share a model and most blocks are one plain cube.
     index: Vec<u16>,
     models: Vec<BakedModel>,
+    /// The loose models, in the order they are named above.
+    loose: Vec<BakedModel>,
     pub atlas: Atlas,
 }
 
@@ -234,6 +243,18 @@ impl BlockTextures {
             }
         }
 
+        // The loose models, resolved before the atlas is stitched so that
+        // their textures are in it.
+        let loose_models: Vec<Option<BlockModel>> = LOOSE_MODELS
+            .iter()
+            .map(|path| resolver.model_by_path(packs, path))
+            .collect();
+        for model in loose_models.iter().flatten() {
+            for path in model.textures() {
+                wanted.insert(path.to_string());
+            }
+        }
+
         // The cracks that spread over a block as it is broken. No model refers
         // to them, so they have to be asked for by name or they are not in the
         // atlas to draw with.
@@ -266,7 +287,33 @@ impl BlockTextures {
             index[id] = slot;
         }
 
-        Self { index, models, atlas }
+        let loose = loose_models
+            .iter()
+            .map(|model| match model {
+                Some(model) => bake(model, &atlas, TintSource::None),
+                None => BakedModel::default(),
+            })
+            .collect();
+
+        Self { index, models, loose, atlas }
+    }
+
+    /// A table with nothing in it, for tests that need to call something that
+    /// takes one without wanting an installed game to stitch an atlas from.
+    pub fn empty() -> Self {
+        Self {
+            index: Vec::new(),
+            models: vec![BakedModel::default()],
+            loose: Vec::new(),
+            atlas: neuton_assets::Atlas::empty(),
+        }
+    }
+
+    /// One of the models no block state points at, by its path.
+    pub fn loose_model(&self, path: &str) -> Option<&BakedModel> {
+        let index = LOOSE_MODELS.iter().position(|p| *p == path)?;
+        let model = self.loose.get(index)?;
+        (!model.is_empty()).then_some(model)
     }
 
     #[inline]

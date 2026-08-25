@@ -10,7 +10,8 @@
 use crate::entities::{Entities, Entity};
 use neuton_render::generated::entity_models::{Cube, Model, Part, look, model};
 use neuton_render::renderer::{MAX_ENTITY_VERTICES, MAX_ENTITY_INDICES};
-use neuton_render::{EntityBatch, Vertex};
+use neuton_render::textures::{BakedModel, BlockTextures};
+use neuton_render::{ATLAS_BATCH, EntityBatch, Face, Vertex};
 use std::collections::BTreeMap;
 
 /// Model units to blocks.
@@ -163,12 +164,28 @@ impl Pose {
 
 /// Builds every entity that has a model into one mesh, in runs that share a
 /// texture.
-pub fn build(entities: &Entities, placed: &[Placed], alpha: f32, out: &mut Mesh) {
+pub fn build(
+    entities: &Entities,
+    placed: &[Placed],
+    shapes: &BlockTextures,
+    alpha: f32,
+    out: &mut Mesh,
+) {
     out.clear();
     // Gathered per texture first, because a draw cannot change texture part
     // way through and two zombies should not cost two draws.
     let mut runs: BTreeMap<&'static str, Vec<u32>> = BTreeMap::new();
     for entity in entities.iter() {
+        // An item frame is not built out of parts like a mob. It is a block
+        // model hung on a wall, so it takes the block atlas rather than a
+        // sheet of its own.
+        if let Some(path) = frame_model(entity.kind.name) {
+            if let Some(baked) = shapes.loose_model(path) {
+                let indices = runs.entry(ATLAS_BATCH).or_default();
+                push_frame(entity, baked, alpha, &mut out.vertices, indices);
+            }
+            continue;
+        }
         let Some((model, texture)) = appearance(entity.kind.name) else { continue };
         // Stopping on a whole entity rather than part way through one: half a
         // cow is worse than no cow.
@@ -238,6 +255,69 @@ fn push_entity(
         stride_amount: entity.stride_amount,
     };
     push_part(&model.root, &root, &pose, model.texture_size, vertices, indices);
+}
+
+/// The block model an item frame is drawn from, if this is one.
+fn frame_model(kind: &str) -> Option<&'static str> {
+    match kind {
+        "minecraft:item_frame" => Some("block/item_frame"),
+        "minecraft:glow_item_frame" => Some("block/glow_item_frame"),
+        _ => None,
+    }
+}
+
+/// An item frame, flat against whatever it hangs on.
+///
+/// The entity stands not in the middle of its block but pushed most of the way
+/// towards the wall, which is where its own hit box is; what is drawn goes back
+/// to the middle of the block and is turned to face out of it.
+fn push_frame(
+    entity: &Entity,
+    baked: &BakedModel,
+    alpha: f32,
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+) {
+    const TO_THE_WALL: f32 = 0.46875;
+    let at = entity.drawn_at(alpha);
+    let (yaw, pitch) = (entity.yaw.to_radians(), entity.pitch.to_radians());
+    // Which way it looks: out of the wall for one hung on a wall, and straight
+    // up or down for one on a ceiling or a floor.
+    let facing = [
+        -yaw.sin() * pitch.cos(),
+        -pitch.sin(),
+        yaw.cos() * pitch.cos(),
+    ];
+    let basis = multiply(
+        rotation_x(pitch),
+        rotation_y(std::f32::consts::PI - yaw),
+    );
+    let centre = [
+        at[0] as f32 + facing[0] * TO_THE_WALL,
+        at[1] as f32 + facing[1] * TO_THE_WALL,
+        at[2] as f32 + facing[2] * TO_THE_WALL,
+    ];
+    let place = Xform { basis, at: centre };
+
+    for element in &baked.elements {
+        for face in Face::ALL {
+            let Some(baked_face) = element.faces[face as usize] else { continue };
+            let corners = face.corners(element.from, element.to);
+            let base = vertices.len() as u32;
+            for (corner, uv) in corners.iter().zip(baked_face.uv) {
+                // Measured from the middle of the block rather than its corner,
+                // because that is what the turn is about.
+                let centred = [corner[0] - 0.5, corner[1] - 0.5, corner[2] - 0.5];
+                vertices.push(Vertex {
+                    position: place.apply(centred),
+                    uv,
+                    tint: [1.0, 1.0, 1.0, 1.0],
+                    light: 1.0,
+                });
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
 }
 
 /// A block entity, turned about the middle of its own block.
@@ -426,7 +506,7 @@ mod tests {
     #[test]
     fn a_player_stands_on_their_feet() {
         let mut mesh = Mesh::default();
-        build(&one(156), &[], 1.0, &mut mesh);
+        build(&one(156), &[], &BlockTextures::empty(), 1.0, &mut mesh);
         assert!(!mesh.vertices.is_empty(), "no geometry for a player");
         let lowest = mesh.vertices.iter().map(|v| v.position[1]).fold(f32::MAX, f32::min);
         let highest = mesh.vertices.iter().map(|v| v.position[1]).fold(f32::MIN, f32::max);
@@ -438,7 +518,7 @@ mod tests {
     #[test]
     fn every_texture_coordinate_lands_on_the_texture() {
         let mut mesh = Mesh::default();
-        build(&one(156), &[], 1.0, &mut mesh);
+        build(&one(156), &[], &BlockTextures::empty(), 1.0, &mut mesh);
         for vertex in &mesh.vertices {
             assert!(
                 (0.0..=1.0).contains(&vertex.uv[0]) && (0.0..=1.0).contains(&vertex.uv[1]),
@@ -453,7 +533,7 @@ mod tests {
         let mut all = one(156);
         all.add(2, 0, 156, [4.0, 64.0, 0.0], 0.0, 0.0, 0.0, [0.0; 3]);
         let mut mesh = Mesh::default();
-        build(&all, &[], 1.0, &mut mesh);
+        build(&all, &[], &BlockTextures::empty(), 1.0, &mut mesh);
         assert_eq!(mesh.batches.len(), 1, "two players should share a draw");
         assert_eq!(mesh.batches[0].count as usize, mesh.indices.len());
     }
@@ -462,7 +542,7 @@ mod tests {
     fn something_with_no_model_is_left_out() {
         // 71 is a dropped item, which is drawn some other way.
         let mut mesh = Mesh::default();
-        build(&one(71), &[], 1.0, &mut mesh);
+        build(&one(71), &[], &BlockTextures::empty(), 1.0, &mut mesh);
         assert!(mesh.vertices.is_empty() && mesh.batches.is_empty());
     }
 }
