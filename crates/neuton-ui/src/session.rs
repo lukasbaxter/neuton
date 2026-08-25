@@ -46,6 +46,21 @@ pub enum WorldEvent {
     Slot { window: i32, state_id: i32, slot: i32, stack: Option<Stack> },
     /// What is riding on the cursor, mid-drag.
     Cursor { stack: Option<Stack> },
+    /// Something appeared, moved, turned its head, or went away.
+    EntityAdded {
+        id: i32,
+        uuid: u128,
+        kind: i32,
+        position: [f64; 3],
+        yaw: f32,
+        pitch: f32,
+        head_yaw: f32,
+        velocity: [f64; 3],
+    },
+    EntityRemoved(Vec<i32>),
+    EntityMoved { id: i32, delta: [f64; 3], rotation: Option<(f32, f32)> },
+    EntityTeleported { id: i32, position: [f64; 3], yaw: f32, pitch: f32, velocity: [f64; 3] },
+    EntityHeadYaw { id: i32, yaw: f32 },
     /// One slot of the player's own inventory, outside any container.
     PlayerSlot { slot: i32, stack: Option<Stack> },
     /// The server picked a hotbar slot for us.
@@ -83,6 +98,10 @@ pub enum Outgoing {
     FinishBreaking { at: [i32; 3], face: u8 },
     /// Throw what is in hand on the ground, the whole stack or one of it.
     DropHeld { whole_stack: bool },
+    /// The movement keys, as the byte the server simulates from.
+    Input(u8),
+    /// Started or stopped sprinting, by the action's ordinal.
+    PlayerCommand(i32),
     /// Use what is in hand against a block: placing, opening, flipping.
     UseOn { at: [i32; 3], face: u8, cursor: [f32; 3] },
     /// Use what is in hand with nothing in front of it.
@@ -196,6 +215,8 @@ impl WorldSession {
                         // 3 is DROP_ALL_ITEMS and 4 is DROP_ITEM. Neither
                         // names a block: the server drops from the hand, so
                         // the position and face go out as zero.
+                        Outgoing::Input(flags) => conn.send_player_input(*flags),
+                        Outgoing::PlayerCommand(action) => conn.send_player_command(*action),
                         Outgoing::DropHeld { whole_stack } => {
                             let action = if *whole_stack { 3 } else { 4 };
                             conn.send_player_action(action, [0, 0, 0], 0)
@@ -326,6 +347,25 @@ impl WorldSession {
                             slots,
                             carried,
                         });
+                    }
+                    Ok(Event::EntityAdded { id, uuid, kind, position, yaw, pitch, head_yaw, velocity }) => {
+                        let _ = tx.send(WorldEvent::EntityAdded {
+                            id, uuid, kind, position, yaw, pitch, head_yaw, velocity,
+                        });
+                    }
+                    Ok(Event::EntityRemoved(ids)) => {
+                        let _ = tx.send(WorldEvent::EntityRemoved(ids));
+                    }
+                    Ok(Event::EntityMoved { id, delta, rotation }) => {
+                        let _ = tx.send(WorldEvent::EntityMoved { id, delta, rotation });
+                    }
+                    Ok(Event::EntityTeleported { id, position, yaw, pitch, velocity }) => {
+                        let _ = tx.send(WorldEvent::EntityTeleported {
+                            id, position, yaw, pitch, velocity,
+                        });
+                    }
+                    Ok(Event::EntityHeadYaw { id, yaw }) => {
+                        let _ = tx.send(WorldEvent::EntityHeadYaw { id, yaw });
                     }
                     Ok(Event::Cursor { stack }) => {
                         let _ = tx.send(WorldEvent::Cursor { stack });

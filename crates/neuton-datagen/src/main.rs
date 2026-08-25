@@ -9,6 +9,7 @@
 //!   cargo run -p neuton-datagen -- [--mc-dir <dir>] [--java <path>]
 
 mod blocks;
+mod entities;
 mod breaking;
 mod items;
 mod packets;
@@ -80,6 +81,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // mineable tags are in the built-in data pack.
     breaking::generate(&ctx, &env.java, &env.classpath()?, &env.jar())?;
     shapes::generate(&ctx, &env.java, &env.classpath()?)?;
+    entities::generate(&ctx, &env.java, &env.classpath()?)?;
 
     println!("datagen: done");
     Ok(())
