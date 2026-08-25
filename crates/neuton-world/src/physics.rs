@@ -942,3 +942,76 @@ mod clip_tests {
         assert_eq!(clip(&above, 1.0, 0, &wall()), 1.0);
     }
 }
+
+#[cfg(test)]
+mod hugging_a_block {
+    use super::*;
+
+    /// A floor filling y=0, and a one-block wall along x=2.
+    struct Wall;
+    impl BlockView for Wall {
+        fn state_at(&self, x: i32, y: i32, _z: i32) -> StateId {
+            if y == 0 || (x == 2 && y == 1) { StateId(1) } else { StateId(0) }
+        }
+    }
+    struct Cubes;
+    impl BlockShapes for Cubes {
+        fn collision(&self, state: StateId) -> &[Aabb] {
+            const FULL: [Aabb; 1] = [Aabb { min: [0.0, 0.0, 0.0], max: [1.0, 1.0, 1.0] }];
+            if state.0 == 0 { &[] } else { &FULL }
+        }
+    }
+
+    fn walking(jump: bool) -> Input {
+        Input { forward: 1.0, strafe: 0.0, jump, sneak: false, sprint: false, yaw: -90.0 }
+    }
+
+    fn hugging() -> Body {
+        let mut body = Body { position: [0.5, 1.0, 0.5], on_ground: true, flying: false, ..Body::default() };
+        for _ in 0..40 {
+            step(&mut body, walking(false), &Wall, &Cubes);
+        }
+        body
+    }
+
+    /// Walking into a block stops flush against its face and no further.
+    #[test]
+    fn walking_into_a_block_stops_at_its_face() {
+        let body = hugging();
+        assert_eq!(body.position[0], 2.0 - PLAYER_WIDTH / 2.0);
+        assert!(body.on_ground);
+    }
+
+    /// Jumping from there gets on top of it, which is the whole point of
+    /// jumping, and never passes through it on the way.
+    #[test]
+    fn jumping_from_there_lands_on_top_and_never_inside() {
+        let mut body = hugging();
+        let mut landed = None;
+        for tick in 0..20 {
+            step(&mut body, walking(true), &Wall, &Cubes);
+            // Inside means overlapping the block on all three axes at once.
+            let feet = body.position[1];
+            let far_edge = body.position[0] + PLAYER_WIDTH / 2.0;
+            let inside = far_edge > 2.0 + 1e-9 && feet < 2.0 - 1e-9 && feet + PLAYER_HEIGHT > 1.0;
+            assert!(!inside, "inside the block on tick {tick}: {:?}", body.position);
+            if landed.is_none() && body.on_ground && body.position[1] > 1.5 {
+                landed = Some((tick, body.position[1]));
+            }
+        }
+        // Holding jump means it hops off the top again, so the landing is
+        // checked where it happens rather than wherever the loop ends.
+        let (_, height) = landed.expect("never got on top of the block");
+        assert_eq!(height, 2.0);
+    }
+
+    /// A jump reports leaving the ground. Saying otherwise is the kind of
+    /// thing a server checks, and it checks it every tick.
+    #[test]
+    fn the_ground_is_left_on_the_tick_the_jump_is_made() {
+        let mut body = hugging();
+        step(&mut body, walking(true), &Wall, &Cubes);
+        assert!(!body.on_ground, "still claiming to be on the ground mid-jump");
+        assert!(body.position[1] > 1.0);
+    }
+}
