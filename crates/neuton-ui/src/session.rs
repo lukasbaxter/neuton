@@ -75,6 +75,8 @@ pub enum Outgoing {
     AbortBreaking { at: [i32; 3] },
     /// The swing is done; the server breaks the block on this.
     FinishBreaking { at: [i32; 3], face: u8 },
+    /// Throw what is in hand on the ground, the whole stack or one of it.
+    DropHeld { whole_stack: bool },
     /// Use what is in hand against a block: placing, opening, flipping.
     UseOn { at: [i32; 3], face: u8, cursor: [f32; 3] },
     /// Use what is in hand with nothing in front of it.
@@ -184,6 +186,13 @@ impl WorldSession {
                         // ServerboundPlayerActionPacket$Action ordinals.
                         Outgoing::FinishBreaking { at, face } => {
                             conn.send_player_action(2, *at, *face)
+                        }
+                        // 3 is DROP_ALL_ITEMS and 4 is DROP_ITEM. Neither
+                        // names a block: the server drops from the hand, so
+                        // the position and face go out as zero.
+                        Outgoing::DropHeld { whole_stack } => {
+                            let action = if *whole_stack { 3 } else { 4 };
+                            conn.send_player_action(action, [0, 0, 0], 0)
                         }
                         Outgoing::UseOn { at, face, cursor } => {
                             conn.send_use_item_on(*at, *face, *cursor, false)
