@@ -81,6 +81,10 @@ pub struct WorldView {
     /// When the last swing started, so a held button neither re-breaks the
     /// block the server has not yet taken away nor sweeps at frame rate.
     last_break: Option<Instant>,
+    /// A block the server has been asked to break, and when it was asked.
+    /// Held until the block actually goes, so a held button does not start
+    /// the cracks over on a block that is already on its way out.
+    awaiting_break: Option<([i32; 3], Instant)>,
     /// What the player is carrying, and which slot is in hand.
     pub inventory: crate::inventory::Inventory,
     /// Item pictures and interface sprites, rendered as they are first needed.
@@ -197,6 +201,7 @@ impl WorldView {
             using: false,
             last_use: None,
             last_break: None,
+            awaiting_break: None,
             inventory: crate::inventory::Inventory::default(),
             art: crate::inventory::ItemArt::new(),
             pending: std::collections::VecDeque::new(),
@@ -275,6 +280,14 @@ impl WorldView {
                 Some(Action::Inventory) if !repeat => {
                     self.toggle_inventory();
                     return true;
+                }
+                // Control drops the whole stack. That is the sprint key as
+                // well, which is exactly how the game overloads it too.
+                Some(Action::Drop) if !repeat => {
+                    let whole = self.held.contains(&KeyCode::ControlLeft)
+                        || self.held.contains(&KeyCode::ControlRight);
+                    self.drop_held(whole);
+                    return false;
                 }
                 // Double-tap jump to fly, where the server allows it at all.
                 Some(Action::Jump) if self.abilities.may_fly && !repeat => {
@@ -408,15 +421,27 @@ impl WorldView {
         if self.break_progress().is_some_and(|progress| progress >= 1.0) {
             self.finish_breaking();
         }
+        // A block asked for is still on screen until the server's block change
+        // arrives. Forgetting it the moment it goes, or after long enough that
+        // the server plainly refused, is what lets the next swing start.
+        const BREAK_ACK_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+        if let Some((at, asked)) = self.awaiting_break
+            && (self.state_at(at).is_none_or(|state| state.is_air())
+                || asked.elapsed() >= BREAK_ACK_GRACE)
+        {
+            self.awaiting_break = None;
+        }
         // Holding the button carries on to the next block, the way sweeping
-        // through a wall does in the game. The interval is what keeps it from
-        // starting again on the block the server has not taken away yet.
+        // through a wall does in the game. Starting again on a block that is
+        // already on its way out would run the cracks up from nothing, which
+        // reads as the block healing a moment before it breaks.
         const BREAK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+        let owed = self.awaiting_break.map(|(at, _)| at);
         if self.breaking
             && !self.paused
             && !self.dead
             && self.mining.is_none()
-            && self.target.is_some()
+            && self.target.is_some_and(|hit| Some(hit.block) != owed)
             && self.last_break.is_none_or(|t| t.elapsed() >= BREAK_INTERVAL)
         {
             self.begin_breaking();
@@ -985,7 +1010,19 @@ impl WorldView {
     /// stop. Without this the cracks reach the last stage and stay there.
     fn finish_breaking(&mut self) {
         let Some(m) = self.mining.take() else { return };
+        self.awaiting_break = Some((m.at, Instant::now()));
         self.session.send(Outgoing::FinishBreaking { at: m.at, face: m.face });
+    }
+
+    /// Throws what is in hand on the ground, the whole stack with control
+    /// held, as the game does.
+    fn drop_held(&mut self, whole_stack: bool) {
+        if self.inventory.held().is_none() {
+            return;
+        }
+        // The slot the item leaves comes back from the server, so nothing is
+        // taken out of the hand here on the strength of having asked.
+        self.session.send(Outgoing::DropHeld { whole_stack });
     }
 
     /// Works out what the player is pointing at.

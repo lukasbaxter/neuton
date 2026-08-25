@@ -20,12 +20,13 @@ pub enum Action {
     Chat,
     Command,
     Inventory,
+    Drop,
     Debug,
 }
 
 impl Action {
     /// Every action, in the order the settings screen lists them.
-    pub const ALL: [Action; 11] = [
+    pub const ALL: [Action; 12] = [
         Action::Forward,
         Action::Back,
         Action::Left,
@@ -36,6 +37,7 @@ impl Action {
         Action::Chat,
         Action::Command,
         Action::Inventory,
+        Action::Drop,
         Action::Debug,
     ];
 
@@ -51,6 +53,7 @@ impl Action {
             Action::Chat => "Open chat",
             Action::Command => "Open command",
             Action::Inventory => "Open inventory",
+            Action::Drop => "Drop item",
             Action::Debug => "Debug overlay",
         }
     }
@@ -67,6 +70,7 @@ impl Action {
             Action::Chat => KeyCode::KeyT,
             Action::Command => KeyCode::Slash,
             Action::Inventory => KeyCode::KeyE,
+            Action::Drop => KeyCode::KeyQ,
             Action::Debug => KeyCode::F3,
         }
     }
@@ -291,6 +295,7 @@ mod tests {
         assert_eq!(s.keys.key_for(Action::Sneak), Some(KeyCode::ShiftLeft));
         assert_eq!(s.keys.key_for(Action::Sprint), Some(KeyCode::ControlLeft));
         assert_eq!(s.keys.key_for(Action::Debug), Some(KeyCode::F3));
+        assert_eq!(s.keys.key_for(Action::Drop), Some(KeyCode::KeyQ));
     }
 
     #[test]
