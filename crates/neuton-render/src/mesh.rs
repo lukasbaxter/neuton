@@ -113,7 +113,7 @@ impl Face {
 
     /// The four corners of this face on a box, counter-clockwise seen from
     /// outside so back-face culling keeps the right ones.
-    fn corners(self, from: [f32; 3], to: [f32; 3]) -> [[f32; 3]; 4] {
+    pub fn corners(self, from: [f32; 3], to: [f32; 3]) -> [[f32; 3]; 4] {
         let (x0, y0, z0) = (from[0], from[1], from[2]);
         let (x1, y1, z1) = (to[0], to[1], to[2]);
         match self {

@@ -490,6 +490,7 @@ impl WorldView {
         crate::entity_render::build(
             &self.entities,
             &self.placed_flat,
+            &self.shapes,
             alpha,
             &mut self.entity_mesh,
         );

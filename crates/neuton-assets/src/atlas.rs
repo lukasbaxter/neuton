@@ -11,7 +11,7 @@ use crate::PackStack;
 use std::collections::BTreeMap;
 
 /// Where one texture sits in the atlas, in normalised coordinates.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Uv {
     pub min: [f32; 2],
     pub max: [f32; 2],
@@ -30,6 +30,7 @@ impl Uv {
 }
 
 /// A stitched atlas and the map from texture path to its place in it.
+#[derive(Default)]
 pub struct Atlas {
     /// RGBA8, `size` by `size` pixels.
     pub pixels: Vec<u8>,
@@ -109,6 +110,11 @@ pub fn mip_chain(pixels: &[u8], size: u32, gutter: u32) -> Vec<Vec<u8>> {
 }
 
 impl Atlas {
+    /// An atlas with nothing in it, for tests.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
     /// Looks a texture up by its pack-relative path.
     pub fn uv(&self, path: &str) -> Uv {
         self.uvs.get(path).copied().unwrap_or(self.missing)

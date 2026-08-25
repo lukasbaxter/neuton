@@ -143,6 +143,17 @@ impl ModelResolver {
         (!elements.is_empty()).then_some(BlockModel { elements })
     }
 
+    /// Resolves a model by its own path, such as `block/item_frame`.
+    ///
+    /// For the few models no block state points at. An item frame is an entity
+    /// and has no block state, but what is drawn for it is an ordinary block
+    /// model, textures, parents and all.
+    pub fn model_by_path(&mut self, packs: &mut PackStack, model: &str) -> Option<BlockModel> {
+        let textures = self.resolve_chain(packs, model)?;
+        let elements = self.resolve_elements(packs, model, &textures)?;
+        (!elements.is_empty()).then_some(BlockModel { elements })
+    }
+
     /// Finds the child-most `elements` in the parent chain and resolves its
     /// texture references.
     ///
