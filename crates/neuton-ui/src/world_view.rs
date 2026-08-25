@@ -588,6 +588,12 @@ impl WorldView {
                         }
                     }
                 }
+                WorldEvent::Cursor { stack } => self.inventory.set_carried(stack),
+                WorldEvent::PlayerSlot { slot, stack } => {
+                    if slot >= 0 {
+                        self.inventory.set(slot, stack);
+                    }
+                }
                 WorldEvent::HeldSlot(slot) => {
                     if let Ok(slot) = usize::try_from(slot)
                         && slot < crate::inventory::HOTBAR.len()
