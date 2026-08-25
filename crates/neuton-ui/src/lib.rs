@@ -7,6 +7,7 @@
 pub mod app;
 pub mod chat;
 pub mod entities;
+pub mod player_model;
 pub mod auth_task;
 pub mod fonts;
 pub mod gpu;
@@ -39,6 +40,26 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// When the process started, for measuring how long it takes to be usable.
 static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
+/// Whether this process may take the pointer at all.
+///
+/// A grab on macOS is desktop-wide, so a run that takes the pointer and then
+/// hangs leaves the whole machine without a cursor rather than just this
+/// window. A screenshot run has nobody at the keyboard to give it back, so it
+/// never asks for it in the first place; `NEUTON_NO_GRAB` says the same thing
+/// for a run started by hand.
+static GRAB_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The last frame's age in milliseconds, and whether the pointer is held.
+///
+/// Read by a thread that has no other way to know the frame loop has stopped.
+static FRAME_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static POINTER_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn grab_allowed() -> bool {
+    GRAB_ALLOWED.load(std::sync::atomic::Ordering::Relaxed)
+        && std::env::var_os("NEUTON_NO_GRAB").is_none()
+}
+
 fn started() -> Instant {
     *START.get_or_init(Instant::now)
 }
@@ -69,6 +90,10 @@ pub fn run_screenshot(
     bench_frames: u32,
     say: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything can ask for it. Nothing about a screenshot needs the
+    // pointer, and a run nobody is watching must not be able to take it.
+    GRAB_ALLOWED.store(false, std::sync::atomic::Ordering::Relaxed);
+    watchdog(after);
     let mut app = App {
         direct: Some(app::PendingJoin { host, port, session }),
         shot: Some((path, after)),
@@ -83,6 +108,49 @@ pub fn run_screenshot(
     Ok(())
 }
 
+/// Kills a screenshot run that never finishes.
+///
+/// The deadline inside the frame loop only fires if frames are still arriving;
+/// a hang in a connect, a driver call or a lock stops them. This thread is
+/// outside all of that, so an automated run always ends on its own.
+fn watchdog(after: std::time::Duration) {
+    let grace = std::env::var("NEUTON_SHOT_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(90));
+    let limit = after + grace;
+    std::thread::spawn(move || {
+        std::thread::sleep(limit);
+        eprintln!("neuton: screenshot run gave up after {:.0}s", limit.as_secs_f64());
+        std::process::exit(2);
+    });
+}
+
+/// Ends the process if the frame loop stops while the pointer is held.
+///
+/// Releasing a grab has to happen on the thread that owns the window, and a
+/// hung main thread is exactly when that cannot be done -- so the only way out
+/// left is to exit, which hands the pointer back to the desktop. A stall this
+/// long is a dead client either way.
+fn deadman() {
+    const STALL: u64 = 30_000;
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let last = FRAME_TICK.load(std::sync::atomic::Ordering::Relaxed);
+            let now = started().elapsed().as_millis() as u64;
+            if last > 0
+                && now.saturating_sub(last) > STALL
+                && POINTER_HELD.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!("neuton: no frame in {STALL} ms with the pointer held; letting go by exiting");
+                std::process::exit(3);
+            }
+        }
+    });
+}
+
 fn run_with(
     direct: Option<app::PendingJoin>,
     shot: Option<(std::path::PathBuf, std::time::Duration)>,
@@ -92,6 +160,7 @@ fn run_with(
     // Wait for input rather than spinning: an idle launcher should use no CPU.
     // A world requests its own redraws continuously.
     event_loop.set_control_flow(ControlFlow::Wait);
+    deadman();
     let mut app = App { direct, shot, ..Default::default() };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -264,6 +333,11 @@ impl ApplicationHandler for App {
                 state.gpu.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
+                FRAME_TICK.store(
+                    // Qualified: `started` is a local binding in here.
+                    crate::started().elapsed().as_millis() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 let dt = last_frame
                     .replace(Instant::now())
                     .map(|t| t.elapsed().as_secs_f32())
@@ -659,6 +733,13 @@ fn set_capture(window: &Window, world: &mut WorldView, capture: bool) {
         if world.capture_gave_up {
             return;
         }
+        if !grab_allowed() {
+            // Looking around comes from raw device motion, which arrives
+            // whether or not the pointer is pinned, so the only thing given up
+            // here is the pointer itself.
+            world.captured = true;
+            return;
+        }
         if world.grab_is_runaway(Instant::now()) {
             // Whatever is asking this often is wrong, and the cost of being
             // wrong about the pointer is a cursor no window can get back.
@@ -666,6 +747,7 @@ fn set_capture(window: &Window, world: &mut WorldView, capture: bool) {
             let _ = window.set_cursor_grab(CursorGrabMode::None);
             window.set_cursor_visible(true);
             world.captured = false;
+            POINTER_HELD.store(false, std::sync::atomic::Ordering::Relaxed);
             world
                 .chat
                 .note("Something kept grabbing the mouse; click to take it back.");
@@ -682,6 +764,7 @@ fn set_capture(window: &Window, world: &mut WorldView, capture: bool) {
         // just because the grab failed would be worse than a cursor that
         // wanders off the window.
         world.captured = true;
+        POINTER_HELD.store(grabbed, std::sync::atomic::Ordering::Relaxed);
         if !grabbed {
             world.chat.note("Could not lock the mouse pointer; look still works.");
         }
@@ -689,6 +772,7 @@ fn set_capture(window: &Window, world: &mut WorldView, capture: bool) {
         let _ = window.set_cursor_grab(CursorGrabMode::None);
         window.set_cursor_visible(true);
         world.captured = false;
+        POINTER_HELD.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
