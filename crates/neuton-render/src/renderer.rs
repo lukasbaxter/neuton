@@ -56,7 +56,9 @@ pub struct WorldRenderer {
     outline_buffer: wgpu::Buffer,
     /// Line ends in the outline buffer this frame.
     outline_vertices: u32,
-    /// Geometry for the cracks over a block being broken.
+    /// Geometry for the cracks over a block being broken, and the pipeline
+    /// that multiplies them into the block rather than over it.
+    crumbling_pipeline: wgpu::RenderPipeline,
     breaking_vertices: wgpu::Buffer,
     breaking_indices: wgpu::Buffer,
     breaking_count: u32,
@@ -329,9 +331,73 @@ impl WorldRenderer {
                 cache: None,
             });
 
+        // The cracks. Blend factors read from the 26.2 jar:
+        // RenderPipelines.CRUMBLING builds its ColorTargetState with
+        // BlendFunction(DST_COLOR, SRC_COLOR, ONE, ZERO), which multiplies the
+        // stage texture into what has already been drawn.
+        let crumbling_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("world crumbling"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x3,
+                        1 => Float32x2,
+                        2 => Float32x4,
+                        3 => Float32,
+                    ],
+                })],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                // The box is drawn from outside, but a player can stand inside
+                // the block being broken.
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_crumbling"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Dst,
+                            dst_factor: wgpu::BlendFactor::Src,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::Zero,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             pipeline,
             translucent_pipeline,
+            crumbling_pipeline,
             globals_buffer,
             globals_bind_group,
             outline_pipeline,
@@ -666,16 +732,18 @@ impl WorldRenderer {
             pass.draw(0..self.outline_vertices, 0..1);
         }
 
-        // Second: water and glass, over everything solid, so what is behind
-        // them has already been drawn and can show through.
-        pass.set_pipeline(&self.translucent_pipeline);
-        // The cracks go in this pass: they are a texture with holes in it laid
-        // over a block that has already been drawn.
+        // The cracks, multiplied into the solid blocks now that they are all
+        // drawn and before anything translucent goes over the top.
         if self.breaking_count > 0 {
+            pass.set_pipeline(&self.crumbling_pipeline);
             pass.set_vertex_buffer(0, self.breaking_vertices.slice(..));
             pass.set_index_buffer(self.breaking_indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.breaking_count, 0, 0..1);
         }
+
+        // Second: water and glass, over everything solid, so what is behind
+        // them has already been drawn and can show through.
+        pass.set_pipeline(&self.translucent_pipeline);
         for chunk in &visible {
             let Some(buffer) = &chunk.translucent else { continue };
             pass.set_vertex_buffer(0, chunk.vertices.slice(..));

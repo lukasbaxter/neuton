@@ -82,3 +82,25 @@ fn fs_translucent(in: VertexOut) -> @location(0) vec4<f32> {
     let lit = texel.rgb * in.tint.rgb * max(in.light, globals.fog.z);
     return vec4<f32>(apply_fog(lit, in.view_distance), texel.a * in.tint.a);
 }
+
+/// The cracks over a block being broken.
+///
+/// Vanilla multiplies these into the block already on screen rather than
+/// drawing on top of it: the crumbling pipeline blends with DST_COLOR and
+/// SRC_COLOR, so the result is 2*src*dst, and mid grey leaves the block's own
+/// colour alone while the dark lines of the crack darken it. Painting the
+/// texture over the block instead is what turns a broken stone block grey.
+///
+/// Nothing here is lit or fogged. Whatever is underneath already is, and doing
+/// it a second time would darken a block just for being looked at.
+@fragment
+fn fs_crumbling(in: VertexOut) -> @location(0) vec4<f32> {
+    let texel = textureSample(atlas, atlas_sampler, in.uv);
+    // The stage textures are a palette with one transparent entry, and those
+    // texels are the gaps between the cracks. They have to miss the block
+    // entirely: multiplied in, transparent white would double its brightness.
+    if (texel.a < 0.1) {
+        discard;
+    }
+    return vec4<f32>(texel.rgb, 1.0);
+}
