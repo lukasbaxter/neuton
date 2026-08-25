@@ -90,6 +90,13 @@ pub struct WorldRenderer {
     entity_indices: wgpu::Buffer,
     /// What to draw and with what, in the order the mesh was built.
     entity_batches: Vec<EntityBatch>,
+    /// The player's own hand, drawn last and over everything: it is closer to
+    /// the eye than anything in the world can be, and testing it against the
+    /// world only ever puts a wall through it.
+    hand_pipeline: wgpu::RenderPipeline,
+    hand_vertices: wgpu::Buffer,
+    hand_indices: wgpu::Buffer,
+    hand_batches: Vec<EntityBatch>,
     /// The layout a skin has to match, kept so one can be uploaded later.
     atlas_layout: wgpu::BindGroupLayout,
     entity_sampler: wgpu::Sampler,
@@ -485,6 +492,53 @@ impl WorldRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let hand_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hand"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x3,
+                        1 => Float32x2,
+                        2 => Float32x4,
+                        3 => Float32,
+                    ],
+                })],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                // Neither tested nor written: the hand is in front of the whole
+                // world by construction, and the world is already drawn.
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_entity"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let entity_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("skin"),
             // No mipmaps: a skin is sixty four pixels across and every one of
@@ -513,6 +567,20 @@ impl WorldRenderer {
                 mapped_at_creation: false,
             }),
             entity_batches: Vec::new(),
+            hand_pipeline,
+            hand_vertices: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hand vertices"),
+                size: (std::mem::size_of::<Vertex>() * 4096) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            hand_indices: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hand indices"),
+                size: (std::mem::size_of::<u32>() * 6144) as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            hand_batches: Vec::new(),
             atlas_layout,
             entity_sampler,
             globals_buffer,
@@ -746,6 +814,30 @@ impl WorldRenderer {
         queue.write_buffer(&self.entity_vertices, 0, vertex_bytes);
         queue.write_buffer(&self.entity_indices, 0, index_bytes);
         self.entity_batches.extend_from_slice(batches);
+    }
+
+    /// The hand's geometry for this frame, in world space like everything else.
+    pub fn set_hand(
+        &mut self,
+        queue: &wgpu::Queue,
+        vertices: &[Vertex],
+        indices: &[u32],
+        batches: &[EntityBatch],
+    ) {
+        self.hand_batches.clear();
+        if indices.is_empty() {
+            return;
+        }
+        let vertex_bytes: &[u8] = bytemuck::cast_slice(vertices);
+        let index_bytes: &[u8] = bytemuck::cast_slice(indices);
+        if vertex_bytes.len() as u64 > self.hand_vertices.size()
+            || index_bytes.len() as u64 > self.hand_indices.size()
+        {
+            return;
+        }
+        queue.write_buffer(&self.hand_vertices, 0, vertex_bytes);
+        queue.write_buffer(&self.hand_indices, 0, index_bytes);
+        self.hand_batches.extend_from_slice(batches);
     }
 
     pub fn set_breaking(
@@ -987,6 +1079,24 @@ impl WorldRenderer {
             pass.set_vertex_buffer(0, chunk.vertices.slice(..));
             pass.set_index_buffer(buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..chunk.translucent_count, 0, 0..1);
+        }
+
+        // Last: the player's own hand, over the lot.
+        if !self.hand_batches.is_empty() {
+            pass.set_pipeline(&self.hand_pipeline);
+            pass.set_vertex_buffer(0, self.hand_vertices.slice(..));
+            pass.set_index_buffer(self.hand_indices.slice(..), wgpu::IndexFormat::Uint32);
+            for batch in &self.hand_batches {
+                let texture = if batch.texture == ATLAS_BATCH {
+                    &self.atlas_bind_group
+                } else {
+                    let Some(texture) = self.entity_textures.get(&batch.texture) else { continue };
+                    texture
+                };
+                pass.set_bind_group(1, texture, &[]);
+                pass.draw_indexed(batch.start..batch.start + batch.count, 0, 0..1);
+            }
+            pass.set_bind_group(1, &self.atlas_bind_group, &[]);
         }
     }
 }
