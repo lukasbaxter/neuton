@@ -98,6 +98,14 @@ pub struct WorldView {
     /// Kept between frames so rebuilding every entity does not also rebuild
     /// the buffers it goes into.
     entity_mesh: crate::entity_render::Mesh,
+    /// When the arm last started a swing, and what it was holding last frame.
+    /// A swing runs for six ticks, as the game's does, and changing what is in
+    /// hand drops the item out of sight and brings it back up.
+    swing_started: Option<Instant>,
+    shown_item: Option<String>,
+    equipped: f32,
+    /// The hand's geometry, kept between frames like the entity mesh.
+    hand_mesh: crate::entity_render::Mesh,
     /// Where to put the camera regardless of where the player is, for a
     /// screenshot taken from a fixed viewpoint.
     pub view_override: Option<([f32; 3], f32, f32)>,
@@ -233,6 +241,10 @@ impl WorldView {
             last_sprinting: false,
             entities: crate::entities::Entities::default(),
             entity_mesh: crate::entity_render::Mesh::default(),
+            swing_started: None,
+            shown_item: None,
+            equipped: 1.0,
+            hand_mesh: crate::entity_render::Mesh::default(),
             view_override: None,
             placed_models: HashMap::new(),
             placed_flat: Vec::new(),
@@ -412,6 +424,52 @@ impl WorldView {
         }
     }
 
+    /// Builds whatever the player is holding, and the arm if that is nothing.
+    ///
+    /// A swing lasts six ticks, the way the game's does, and switching what is
+    /// held drops it out of sight and raises it again rather than swapping one
+    /// model for another mid-air.
+    fn build_hand(&mut self) {
+        const SWING: f32 = 6.0 / 20.0;
+        let swing = self
+            .swing_started
+            .map(|t| t.elapsed().as_secs_f32() / SWING)
+            .filter(|progress| *progress < 1.0)
+            .unwrap_or(0.0);
+        if swing == 0.0 {
+            self.swing_started = None;
+        }
+
+        let held = self.inventory.held().map(|stack| stack.name.to_string());
+        if held != self.shown_item {
+            // Only once it has gone: the item changes at the bottom of the dip.
+            if self.equipped <= 0.0 {
+                self.shown_item = held;
+                self.equipped = 0.0;
+            } else {
+                self.equipped = (self.equipped - 0.25).max(0.0);
+            }
+        } else {
+            self.equipped = (self.equipped + 0.25).min(1.0);
+        }
+
+        let holding = match self.shown_item.as_deref() {
+            None => crate::hand::Holding::Nothing,
+            Some(item) => match crate::hand::block_in_hand(self.shapes.as_ref(), item) {
+                Some(model) => crate::hand::Holding::Block(model),
+                None => crate::hand::Holding::Flat { texture: crate::hand::flat_texture(item) },
+            },
+        };
+        crate::hand::build(
+            self.camera.position,
+            self.camera.yaw,
+            self.camera.pitch,
+            &holding,
+            &crate::hand::Motion { swing, equipped: self.equipped },
+            &mut self.hand_mesh,
+        );
+    }
+
     /// Uploads any entity texture this frame needs and does not have.
     ///
     /// One at a time and only on the frame it is first needed: decoding a PNG
@@ -423,7 +481,7 @@ impl WorldView {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) {
-        for batch in &self.entity_mesh.batches {
+        for batch in self.entity_mesh.batches.iter().chain(self.hand_mesh.batches.iter()) {
             if renderer.has_entity_texture(&batch.texture)
                 || self.missing_textures.contains(&batch.texture)
             {
@@ -498,7 +556,14 @@ impl WorldView {
             alpha,
             &mut self.entity_mesh,
         );
+        self.build_hand();
         self.load_entity_textures(renderer, device, queue);
+        renderer.set_hand(
+            queue,
+            &self.hand_mesh.vertices,
+            &self.hand_mesh.indices,
+            &self.hand_mesh.batches,
+        );
         renderer.set_entities(
             queue,
             &self.entity_mesh.vertices,
@@ -989,6 +1054,7 @@ impl WorldView {
             MouseButton::Left => {
                 self.breaking = pressed;
                 if pressed {
+                    self.swing_started = Some(Instant::now());
                     self.begin_breaking();
                 } else {
                     self.stop_breaking();
@@ -997,6 +1063,7 @@ impl WorldView {
             MouseButton::Right => {
                 self.using = pressed;
                 if pressed {
+                    self.swing_started = Some(Instant::now());
                     self.last_use = None;
                     self.use_item();
                 }
@@ -1421,6 +1488,16 @@ impl WorldView {
                 self.entities.len(),
                 self.entities.count_of("minecraft:player"),
                 self.entities.count_of("minecraft:item"),
+            ),
+            format!(
+                "Hand: {} verts, {} draws, {:?}, first {:.2?}",
+                self.hand_mesh.vertices.len(),
+                self.hand_mesh.batches.len(),
+                self.hand_mesh.batches.first().map(|b| (
+                    b.texture.clone(),
+                    renderer.has_entity_texture(&b.texture)
+                )),
+                self.hand_mesh.vertices.first().map(|v| v.position),
             ),
             {
                 let (indices, batches, textures) = renderer.entity_debug();

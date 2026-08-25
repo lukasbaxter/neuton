@@ -12,6 +12,7 @@ pub mod entity_render;
 pub mod auth_task;
 pub mod fonts;
 pub mod gpu;
+pub mod hand;
 pub mod icons;
 pub mod ping_task;
 pub mod servers;

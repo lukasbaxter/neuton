@@ -45,7 +45,7 @@ pub struct Mesh {
 }
 
 impl Mesh {
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.vertices.clear();
         self.indices.clear();
         self.batches.clear();
@@ -68,13 +68,13 @@ pub fn appearance(kind: &str) -> Option<(&'static Model, &'static str)> {
 
 /// An affine transform: a rotation and scale, then a move.
 #[derive(Clone, Copy)]
-struct Xform {
-    basis: [[f32; 3]; 3],
-    at: [f32; 3],
+pub(crate) struct Xform {
+    pub(crate) basis: [[f32; 3]; 3],
+    pub(crate) at: [f32; 3],
 }
 
 impl Xform {
-    fn apply(&self, p: [f32; 3]) -> [f32; 3] {
+    pub(crate) fn apply(&self, p: [f32; 3]) -> [f32; 3] {
         let m = &self.basis;
         [
             m[0][0] * p[0] + m[0][1] * p[1] + m[0][2] * p[2] + self.at[0],
@@ -84,7 +84,7 @@ impl Xform {
     }
 
     /// `self` applied to whatever `inner` produces.
-    fn then(&self, inner: &Xform) -> Xform {
+    pub(crate) fn then(&self, inner: &Xform) -> Xform {
         let mut basis = [[0.0f32; 3]; 3];
         for (row, out) in basis.iter_mut().enumerate() {
             for (column, cell) in out.iter_mut().enumerate() {
@@ -95,7 +95,7 @@ impl Xform {
     }
 }
 
-fn multiply(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+pub(crate) fn multiply(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
     let mut out = [[0.0f32; 3]; 3];
     for (row, cells) in out.iter_mut().enumerate() {
         for (column, cell) in cells.iter_mut().enumerate() {
@@ -105,17 +105,17 @@ fn multiply(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
     out
 }
 
-fn rotation_x(angle: f32) -> [[f32; 3]; 3] {
+pub(crate) fn rotation_x(angle: f32) -> [[f32; 3]; 3] {
     let (s, c) = angle.sin_cos();
     [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]
 }
 
-fn rotation_y(angle: f32) -> [[f32; 3]; 3] {
+pub(crate) fn rotation_y(angle: f32) -> [[f32; 3]; 3] {
     let (s, c) = angle.sin_cos();
     [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]
 }
 
-fn rotation_z(angle: f32) -> [[f32; 3]; 3] {
+pub(crate) fn rotation_z(angle: f32) -> [[f32; 3]; 3] {
     let (s, c) = angle.sin_cos();
     [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
 }
@@ -125,13 +125,16 @@ fn rotation_z(angle: f32) -> [[f32; 3]; 3] {
 /// Only the parts every model names the same way. Anything with a tail, a wing
 /// or a jaw keeps the pose the model was built in until it is worth writing
 /// down how that particular animal moves.
-struct Pose {
+pub(crate) struct Pose {
+    /// Whether this model's texture has to be read the other way up. See
+    /// `push_cube`.
+    pub(crate) sheet_flipped: bool,
     /// How far the head is turned from the body, and how far up or down.
-    head_turn: f32,
-    head_tilt: f32,
+    pub(crate) head_turn: f32,
+    pub(crate) head_tilt: f32,
     /// Where in the walking cycle it is, and how much of the swing to apply.
-    stride: f32,
-    stride_amount: f32,
+    pub(crate) stride: f32,
+    pub(crate) stride_amount: f32,
 }
 
 impl Pose {
@@ -249,6 +252,7 @@ fn push_entity(
     };
 
     let pose = Pose {
+        sheet_flipped: false,
         head_turn: (entity.head_yaw - entity.yaw).to_radians(),
         head_tilt: entity.pitch.to_radians(),
         stride: entity.stride,
@@ -341,11 +345,19 @@ fn push_placed(block: &Placed, vertices: &mut Vec<Vertex>, indices: &mut Vec<u32
         *cell = block.at[axis] + centre[axis] + turned;
     }
     let root = Xform { basis, at };
-    let still = Pose { head_turn: 0.0, head_tilt: 0.0, stride: 0.0, stride_amount: 0.0 };
+    // A block entity is measured upwards and drawn as it stands, so its sheet
+    // is already the right way up.
+    let still = Pose {
+        sheet_flipped: false,
+        head_turn: 0.0,
+        head_tilt: 0.0,
+        stride: 0.0,
+        stride_amount: 0.0,
+    };
     push_part(&block.model.root, &root, &still, block.model.texture_size, vertices, indices);
 }
 
-fn push_part(
+pub(crate) fn push_part(
     part: &Part,
     parent: &Xform,
     pose: &Pose,
@@ -370,7 +382,7 @@ fn push_part(
     let here = parent.then(&Xform { basis: scaled, at: [x, y, z] });
 
     for cube in part.cubes {
-        push_cube(cube, &here, texture, vertices, indices);
+        push_cube(cube, &here, texture, pose.sheet_flipped, vertices, indices);
     }
     for child in part.children {
         push_part(child, &here, pose, texture, vertices, indices);
@@ -380,10 +392,21 @@ fn push_part(
 /// The six faces of one box, unfolded onto the texture the way the game folds
 /// them: the two caps side by side along the top, and the four sides in a row
 /// beneath, which is why a head's face sits eight pixels across and eight down.
-fn push_cube(
+/// `sheet_flipped` reads the texture the other way up.
+///
+/// A mob's model is measured downwards -- the top of a head is at minus eight,
+/// and an arm's shoulder is its lowest number -- and the game draws it by
+/// turning the whole thing over, which lands the sheet the right way up. A
+/// block entity's model is measured upwards instead and is drawn as it stands,
+/// which also lands the sheet the right way up. The odd one out is the
+/// first-person hand: a model measured downwards, drawn without being turned
+/// over, so its sheet has to be read the other way round or a sleeve ends up
+/// on a wrist.
+pub(crate) fn push_cube(
     cube: &Cube,
     at: &Xform,
     texture: [f32; 2],
+    sheet_flipped: bool,
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
 ) {
@@ -412,11 +435,20 @@ fn push_cube(
         } else {
             (x / texture[0], (x + pw) / texture[0])
         };
-        let (y0, y1) = (y / texture[1], (y + ph) / texture[1]);
+        let (y0, y1) = if sheet_flipped {
+            ((y + ph) / texture[1], y / texture[1])
+        } else {
+            (y / texture[1], (y + ph) / texture[1])
+        };
         [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
     };
     let (uw, uh, ud) = (w * su, h * sv, d * su);
 
+    let (first_cap, second_cap) = if sheet_flipped {
+        (patch(u + ud + uw, v, uw, ud), patch(u + ud, v, uw, ud))
+    } else {
+        (patch(u + ud, v, uw, ud), patch(u + ud + uw, v, uw, ud))
+    };
     let faces = [
         // The two caps.
         (
@@ -426,7 +458,7 @@ fn push_cube(
                 [high[0], high[1], high[2]],
                 [low[0], high[1], high[2]],
             ],
-            patch(u + ud, v, uw, ud),
+            first_cap,
         ),
         (
             [
@@ -435,7 +467,7 @@ fn push_cube(
                 [high[0], low[1], low[2]],
                 [low[0], low[1], low[2]],
             ],
-            patch(u + ud + uw, v, uw, ud),
+            second_cap,
         ),
         // The model's right, its front, its left and its back.
         (
@@ -546,3 +578,4 @@ mod tests {
         assert!(mesh.vertices.is_empty() && mesh.batches.is_empty());
     }
 }
+
