@@ -244,10 +244,10 @@ impl Atlas {
 }
 
 /// A decoded texture, possibly an animation strip.
-pub(crate) struct Image {
-    pub(crate) rgba: Vec<u8>,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
+pub struct Image {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
 }
 
 impl Image {

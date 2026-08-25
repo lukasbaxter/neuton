@@ -33,6 +33,8 @@ pub struct FaceDef {
     /// Which neighbour hides this face, if any. A face with no `cullface` is
     /// always drawn, which is what keeps the inside of a fence visible.
     pub cullface: Option<u8>,
+    /// Quarter turns the texture is rotated by on this face, 0 to 3.
+    pub uv_rotation: u8,
 }
 
 /// One box of a model. Most blocks are a single full cube; grass is two.
@@ -50,6 +52,116 @@ pub struct Element {
     /// different way.
     pub x_rot: i32,
     pub y_rot: i32,
+    /// The model's own turn of this one box, if it has one.
+    ///
+    /// Different from the two above: those come from the blockstate and turn
+    /// the whole model, this comes from the model file and turns a single box
+    /// about a point inside it. It is what makes a rail climb a slope and a
+    /// lever lean off a wall, and a box drawn without it is drawn square-on.
+    pub rotation: Option<Rotation>,
+}
+
+/// One box's own turn: an angle about one axis, through a point.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rotation {
+    /// In the model's 0..16 space.
+    pub origin: [f32; 3],
+    /// 0 for x, 1 for y, 2 for z.
+    pub axis: u8,
+    pub angle: f32,
+    /// Grows the box so its corners still meet the ones it was cut from.
+    pub rescale: bool,
+}
+
+impl Rotation {
+    /// Turns one point in the model's 0..16 space.
+    pub fn apply(&self, p: [f32; 3]) -> [f32; 3] {
+        let (sin, cos) = self.angle.to_radians().sin_cos();
+        // A rescaled box grows in the two axes it was turned in, by exactly
+        // enough that a forty five degree turn still fills its cell.
+        let grow = if self.rescale { 1.0 / cos.abs().max(1e-3) } else { 1.0 };
+        let mut d = [p[0] - self.origin[0], p[1] - self.origin[1], p[2] - self.origin[2]];
+        let (a, b) = match self.axis {
+            0 => (1, 2),
+            1 => (2, 0),
+            _ => (0, 1),
+        };
+        let (da, db) = (d[a], d[b]);
+        d[a] = (da * cos - db * sin) * grow;
+        d[b] = (da * sin + db * cos) * grow;
+        [self.origin[0] + d[0], self.origin[1] + d[1], self.origin[2] + d[2]]
+    }
+}
+
+/// How a model is held, worn or shown, out of its own `display` block.
+///
+/// The numbers are the game's: a block in a slot is turned thirty degrees down
+/// and two hundred and twenty five round, and shrunk to five eighths, which is
+/// the whole of why a block icon looks the way it does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Display {
+    /// Degrees about x, then y, then z, in that order.
+    pub rotation: [f32; 3],
+    /// In model units, sixteen to the block.
+    pub translation: [f32; 3],
+    pub scale: [f32; 3],
+}
+
+impl Default for Display {
+    fn default() -> Self {
+        Self { rotation: [0.0; 3], translation: [0.0; 3], scale: [1.0; 3] }
+    }
+}
+
+impl Display {
+    /// Where a point in the model's own 0..1 space ends up.
+    ///
+    /// The game scales, then turns, then moves, and the order is not a detail:
+    /// turning after moving swings the model round the middle of the slot
+    /// instead of round itself.
+    ///
+    /// The three turns go on in the order z, y, x, which reads backwards and
+    /// is not: the game builds one turn out of the three as `x` then `y` then
+    /// `z`, and a point going through that lands in the last one first. Doing
+    /// it the way it reads yaws a block about the wrong axis and leaves the
+    /// icon leaning.
+    pub fn apply(&self, p: [f32; 3]) -> [f32; 3] {
+        let mut q = [p[0] * self.scale[0], p[1] * self.scale[1], p[2] * self.scale[2]];
+        for (axis, angle) in self.rotation.iter().enumerate().rev() {
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let (a, b) = match axis {
+                0 => (1, 2),
+                1 => (2, 0),
+                _ => (0, 1),
+            };
+            let (qa, qb) = (q[a], q[b]);
+            q[a] = qa * cos - qb * sin;
+            q[b] = qa * sin + qb * cos;
+        }
+        [
+            q[0] + self.translation[0] / 16.0,
+            q[1] + self.translation[1] / 16.0,
+            q[2] + self.translation[2] / 16.0,
+        ]
+    }
+}
+
+/// What an item is drawn as.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ItemGeometry {
+    /// A flat picture. The game builds a solid out of it a sixteenth thick,
+    /// which is why a sword seen from the side is not a line.
+    Sprite(Vec<String>),
+    /// Real geometry of its own: a block, or an item with a model.
+    Solid(BlockModel),
+}
+
+/// One item, resolved: what it is drawn as and where its transforms live.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ItemModel {
+    /// The model this item resolved to, for asking how it is held.
+    pub path: String,
+    pub geometry: ItemGeometry,
 }
 
 impl Element {
@@ -154,6 +266,90 @@ impl ModelResolver {
         (!elements.is_empty()).then_some(BlockModel { elements })
     }
 
+    /// What one item is drawn as, by its registry name.
+    ///
+    /// Since 26.x an item does not name a model directly. `items/<name>.json`
+    /// is a little program -- a model, or a choice between models on some
+    /// property -- and the model it picks is what gets drawn. That indirection
+    /// is why a torch is a flat picture in a slot while a stone is a cube:
+    /// nothing about the block decides it, the item definition does.
+    ///
+    /// The branches are not evaluated; the fallback is taken, which is what an
+    /// item with no state to dispatch on would have picked anyway.
+    pub fn item(&mut self, packs: &mut PackStack, name: &str) -> Option<ItemModel> {
+        let name = name.rsplit(':').next().unwrap_or(name);
+        let definition = packs.read_json(&format!("assets/minecraft/items/{name}.json"))?;
+        let path = pick_model(definition.get("model")?, 0)?;
+        self.model_named(packs, &path)
+    }
+
+    /// Resolves one model path to geometry, whichever kind it turns out to be.
+    pub fn model_named(&mut self, packs: &mut PackStack, path: &str) -> Option<ItemModel> {
+        let textures = self.resolve_chain(packs, path)?;
+        if let Some(elements) = self.resolve_elements(packs, path, &textures)
+            && !elements.is_empty()
+        {
+            return Some(ItemModel {
+                path: path.to_string(),
+                geometry: ItemGeometry::Solid(BlockModel { elements }),
+            });
+        }
+        // No geometry anywhere in the chain: a flat picture, stacked in layers
+        // so a leather cap is its shape and then its dye.
+        let mut layers = Vec::new();
+        for layer in 0..16 {
+            let Some(value) = textures.get(&format!("layer{layer}")) else { break };
+            if value.starts_with('#') {
+                break;
+            }
+            layers.push(texture_path(value));
+        }
+        (!layers.is_empty())
+            .then(|| ItemModel { path: path.to_string(), geometry: ItemGeometry::Sprite(layers) })
+    }
+
+    /// How a model is held in one situation: `gui`, `firstperson_righthand`,
+    /// `ground` and the rest.
+    ///
+    /// Inherited whole from the nearest parent that declares it, which is what
+    /// lets every block share one `block/block` and every flat item share one
+    /// `item/generated`.
+    pub fn display(&mut self, packs: &mut PackStack, model: &str, context: &str) -> Display {
+        let mut current = Some(model.to_string());
+        for _ in 0..32 {
+            let Some(name) = current.take() else { break };
+            let (namespace, path) = split(&name);
+            let file = format!("assets/{namespace}/models/{path}.json");
+            if !self.models.contains_key(&file) {
+                let Some(value) = packs.read_json(&file) else { break };
+                self.models.insert(file.clone(), value);
+            }
+            let Some(value) = self.models.get(&file) else { break };
+            if let Some(found) = value.get("display").and_then(|d| d.get(context)) {
+                let triple = |key: &str, fallback: f32| -> [f32; 3] {
+                    found
+                        .get(key)
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| {
+                            Some([
+                                a.first()?.as_f64()? as f32,
+                                a.get(1)?.as_f64()? as f32,
+                                a.get(2)?.as_f64()? as f32,
+                            ])
+                        })
+                        .unwrap_or([fallback; 3])
+                };
+                return Display {
+                    rotation: triple("rotation", 0.0),
+                    translation: triple("translation", 0.0),
+                    scale: triple("scale", 1.0),
+                };
+            }
+            current = value.get("parent").and_then(|p| p.as_str()).map(str::to_string);
+        }
+        Display::default()
+    }
+
     /// Finds the child-most `elements` in the parent chain and resolves its
     /// texture references.
     ///
@@ -171,6 +367,10 @@ impl ModelResolver {
             let (namespace, path) = split(&name);
             let file = format!("assets/{namespace}/models/{path}.json");
             if !self.models.contains_key(&file) {
+                // `builtin/generated` and `builtin/entity` are the end of a
+                // chain rather than files on disk: the game knows what they
+                // mean and there is nothing to read. Treating a missing parent
+                // as a failure loses every flat item, which is most of them.
                 let value = packs.read_json(&file)?;
                 self.models.insert(file.clone(), value);
             }
@@ -203,18 +403,29 @@ impl ModelResolver {
             let file = format!("assets/{namespace}/models/{path}.json");
 
             if !self.models.contains_key(&file) {
-                let value = packs.read_json(&file)?;
+                // A parent that is not a file ends the chain. `item/generated`
+                // inherits from `builtin/generated`, which the game handles in
+                // code, so refusing to go on here is what keeps flat items
+                // resolving at all.
+                let Some(value) = packs.read_json(&file) else { break };
                 self.models.insert(file.clone(), value);
             }
-            let value = self.models.get(&file)?;
+            let Some(value) = self.models.get(&file) else { break };
 
             if let Some(textures) = value.get("textures").and_then(|t| t.as_object()) {
                 for (key, v) in textures {
-                    if let Some(s) = v.as_str() {
-                        // The child was inserted first and must not be
-                        // overwritten by the parent's version of the same key.
-                        merged.entry(key.clone()).or_insert_with(|| s.to_string());
-                    }
+                    // A texture is usually a path, but 26.x also allows an
+                    // object carrying the path plus flags -- glass declares
+                    // `{"force_translucent": true, "sprite": "block/glass"}`.
+                    // Reading only the string form leaves every one of those
+                    // faces with no texture at all, which is why glass had no
+                    // icon and no sides.
+                    let Some(s) = v.as_str().or_else(|| v.get("sprite")?.as_str()) else {
+                        continue;
+                    };
+                    // The child was inserted first and must not be
+                    // overwritten by the parent's version of the same key.
+                    merged.entry(key.clone()).or_insert_with(|| s.to_string());
                 }
             }
             current = value.get("parent").and_then(|p| p.as_str()).map(str::to_string);
@@ -381,6 +592,10 @@ fn parse_elements(
                 faces[index as usize] = Some(FaceDef {
                     texture,
                     uv,
+                    uv_rotation: face
+                        .get("rotation")
+                        .and_then(|r| r.as_i64())
+                        .map_or(0, |r| ((r / 90).rem_euclid(4)) as u8),
                     tinted: face.get("tintindex").is_some(),
                     cullface: face
                         .get("cullface")
@@ -388,9 +603,68 @@ fn parse_elements(
                         .and_then(face_index),
                 });
             }
-            Some(Element { from, to, faces, x_rot: 0, y_rot: 0 })
+            let rotation = element.get("rotation").and_then(|r| {
+                let origin = r.get("origin").and_then(|o| o.as_array()).and_then(|a| {
+                    Some([
+                        a.first()?.as_f64()? as f32,
+                        a.get(1)?.as_f64()? as f32,
+                        a.get(2)?.as_f64()? as f32,
+                    ])
+                })?;
+                let axis = match r.get("axis").and_then(|a| a.as_str())? {
+                    "x" => 0,
+                    "y" => 1,
+                    "z" => 2,
+                    _ => return None,
+                };
+                Some(Rotation {
+                    origin,
+                    axis,
+                    angle: r.get("angle").and_then(|a| a.as_f64()).unwrap_or(0.0) as f32,
+                    rescale: r.get("rescale").and_then(|a| a.as_bool()).unwrap_or(false),
+                })
+            });
+            Some(Element { from, to, faces, x_rot: 0, y_rot: 0, rotation })
         })
         .collect()
+}
+
+/// Walks an item definition down to a model path.
+///
+/// Every branching form takes its fallback, or its first case where there is
+/// no fallback. A composite takes its first part, which loses the extra layers
+/// a bundle or a decorated pot draws on top.
+fn pick_model(value: &serde_json::Value, depth: u32) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    let next = |v: &serde_json::Value| pick_model(v, depth + 1);
+    match value.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "minecraft:model" | "model" => {
+            value.get("model").and_then(|m| m.as_str()).map(str::to_string)
+        }
+        "minecraft:condition" | "condition" => {
+            value.get("on_false").and_then(next).or_else(|| value.get("on_true").and_then(next))
+        }
+        "minecraft:select" | "select" => value
+            .get("fallback")
+            .and_then(next)
+            .or_else(|| value.get("cases")?.as_array()?.first()?.get("model").and_then(next)),
+        "minecraft:range_dispatch" | "range_dispatch" => value
+            .get("fallback")
+            .and_then(next)
+            .or_else(|| value.get("entries")?.as_array()?.first()?.get("model").and_then(next)),
+        "minecraft:composite" | "composite" => {
+            value.get("models")?.as_array()?.iter().find_map(next)
+        }
+        // A chest, a shield, a banner: drawn by a renderer of its own from an
+        // entity model. The base is the right model to ask about transforms,
+        // and has no geometry, so these come out as nothing to draw.
+        "minecraft:special" | "special" => {
+            value.get("base").and_then(|m| m.as_str()).map(str::to_string)
+        }
+        _ => None,
+    }
 }
 
 /// The texture region a face shows when the model does not say.

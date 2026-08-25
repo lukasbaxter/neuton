@@ -128,6 +128,25 @@ pub struct ItemArt {
     icons: neuton_assets::Icons,
     items: HashMap<i32, Option<egui::TextureHandle>>,
     sprites: HashMap<String, Option<egui::TextureHandle>>,
+    held: HashMap<String, Option<std::sync::Arc<Held>>>,
+}
+
+/// What one item looks like in the hand.
+///
+/// The two kinds are the game's own and are not the same as "is it a block":
+/// a torch places a block and is carried as a flat picture, because that is
+/// what its item definition asks for.
+pub struct Held {
+    pub geometry: HeldGeometry,
+    /// How the model is held, out of its own `display` block.
+    pub display: neuton_assets::Display,
+}
+
+pub enum HeldGeometry {
+    /// Drawn from the block atlas, using the baked model the world already has.
+    Solid,
+    /// A picture with a rim, built into a solid the way the game builds one.
+    Sprite { texture: String, sides: Vec<neuton_assets::Side> },
 }
 
 impl Default for ItemArt {
@@ -143,6 +162,7 @@ impl ItemArt {
             icons: neuton_assets::Icons::new(),
             items: HashMap::new(),
             sprites: HashMap::new(),
+            held: HashMap::new(),
         }
     }
 
@@ -158,7 +178,6 @@ impl ItemArt {
         if let Some(cached) = self.items.get(&stack.id) {
             return cached.as_ref().map(|t| t.id());
         }
-        let block = stack.block_state.map(|_| stack.name);
         let name = stack.name;
         if self.packs.is_none() {
             self.packs = neuton_assets::PackStack::discover("26.2");
@@ -166,7 +185,7 @@ impl ItemArt {
         let Self { packs, icons, .. } = self;
         let handle = packs
             .as_mut()
-            .and_then(|packs| icons.render(packs, name, block))
+            .and_then(|packs| icons.render(packs, name))
             .map(|icon| {
                 let image = egui::ColorImage::from_rgba_unmultiplied(
                     [icon.size as usize, icon.size as usize],
@@ -179,6 +198,42 @@ impl ItemArt {
         let id = handle.as_ref().map(|t| t.id());
         self.items.insert(stack.id, handle);
         id
+    }
+
+    /// What an item looks like in the hand, worked out once and kept.
+    ///
+    /// The rim of a flat item is a few dozen quads read out of the sprite's
+    /// own alpha, which is cheap but not free, and the answer never changes
+    /// for a given item.
+    pub fn held(&mut self, name: &str) -> Option<std::sync::Arc<Held>> {
+        if let Some(cached) = self.held.get(name) {
+            return cached.clone();
+        }
+        if self.packs.is_none() {
+            self.packs = neuton_assets::PackStack::discover("26.2");
+        }
+        let Self { packs, icons, .. } = self;
+        let built = packs.as_mut().and_then(|packs| {
+            let resolved = icons.models().item(packs, name)?;
+            let display = icons.models().display(packs, &resolved.path, "firstperson_righthand");
+            let geometry = match &resolved.geometry {
+                neuton_assets::ItemGeometry::Solid(_) => HeldGeometry::Solid,
+                neuton_assets::ItemGeometry::Sprite(layers) => {
+                    let path = layers.first()?.clone();
+                    let image = icons.texture(packs, &path)?;
+                    let sides =
+                        neuton_assets::extrude::sides(&image.rgba, image.width, image.height);
+                    // The renderer names a texture by its path under
+                    // `textures/`, which is where the model's own reference
+                    // lands once the namespace is off it.
+                    let texture = format!("{}.png", path.trim_start_matches("minecraft:"));
+                    HeldGeometry::Sprite { texture, sides }
+                }
+            };
+            Some(std::sync::Arc::new(Held { geometry, display }))
+        });
+        self.held.insert(name.to_string(), built.clone());
+        built
     }
 
     /// One of the game's interface pictures, by its path under `textures/gui`.
