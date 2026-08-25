@@ -78,6 +78,11 @@ impl Relatives {
     const Z: u32 = 1 << 2;
     const YAW: u32 = 1 << 3;
     const PITCH: u32 = 1 << 4;
+    // Read off the Relative enum in the jar, whose order is the bit order:
+    // X, Y, Z, Y_ROT, X_ROT, DELTA_X, DELTA_Y, DELTA_Z, ROTATE_DELTA.
+    const DELTA_X: u32 = 1 << 5;
+    const DELTA_Y: u32 = 1 << 6;
+    const DELTA_Z: u32 = 1 << 7;
 
     pub fn x(self) -> bool {
         self.0 & Self::X != 0
@@ -93,6 +98,15 @@ impl Relatives {
     }
     pub fn pitch(self) -> bool {
         self.0 & Self::PITCH != 0
+    }
+    pub fn delta_x(self) -> bool {
+        self.0 & Self::DELTA_X != 0
+    }
+    pub fn delta_y(self) -> bool {
+        self.0 & Self::DELTA_Y != 0
+    }
+    pub fn delta_z(self) -> bool {
+        self.0 & Self::DELTA_Z != 0
     }
 
     /// Applies one field: an offset from `current`, or a destination.
@@ -124,6 +138,8 @@ pub enum Event {
     /// of nearly nothing, and reading that as absolute throws the player across
     /// the world.
     Teleported {
+        /// How fast the server says the player is travelling.
+        velocity: [f64; 3],
         x: f64,
         y: f64,
         z: f64,
@@ -195,6 +211,9 @@ pub struct Connection {
     /// The last position and rotation the server was told about. Relative
     /// teleports are offsets from this, and so are echoed back against it.
     reported: ([f64; 3], (f32, f32)),
+    /// The speed the last teleport gave the player, so a relative delta has
+    /// something to be relative to.
+    reported_velocity: [f64; 3],
     /// The player's own entity ID, so packets addressed to it can be told apart
     /// from the ones about everything else in the world.
     entity_id: i32,
@@ -219,6 +238,7 @@ impl Connection {
             stats: Stats::default(),
             started,
             reported: ([0.0; 3], (0.0, 0.0)),
+            reported_velocity: [0.0; 3],
             entity_id: 0,
             batches: crate::batches::BatchRate::new(),
             sequence: 0,
@@ -486,9 +506,14 @@ impl Connection {
                     let x = r.read_f64().map_err(named)?;
                     let y = r.read_f64().map_err(named)?;
                     let z = r.read_f64().map_err(named)?;
-                    let _dx = r.read_f64().map_err(named)?;
-                    let _dy = r.read_f64().map_err(named)?;
-                    let _dz = r.read_f64().map_err(named)?;
+                    // The teleport says how fast the player is moving as well
+                    // as where they are. Dropping it and starting them from a
+                    // standstill leaves the server simulating a player who is
+                    // still travelling and the client one who is not, and the
+                    // server corrects that every tick until the speed decays.
+                    let dx = r.read_f64().map_err(named)?;
+                    let dy = r.read_f64().map_err(named)?;
+                    let dz = r.read_f64().map_err(named)?;
                     let yaw = r.read_f32().map_err(named)?;
                     let pitch = r.read_f32().map_err(named)?;
                     // A bitmask over the Relative enum, saying which of the
@@ -504,6 +529,14 @@ impl Connection {
                     let yaw = Relatives::resolve(relative.yaw(), yaw as f64, last.1.0 as f64) as f32;
                     let pitch =
                         Relatives::resolve(relative.pitch(), pitch as f64, last.1.1 as f64) as f32;
+                    // A relative delta adds to the speed the player already
+                    // has, which is how a shove is sent.
+                    let velocity = [
+                        Relatives::resolve(relative.delta_x(), dx, self.reported_velocity[0]),
+                        Relatives::resolve(relative.delta_y(), dy, self.reported_velocity[1]),
+                        Relatives::resolve(relative.delta_z(), dz, self.reported_velocity[2]),
+                    ];
+                    self.reported_velocity = velocity;
 
                     if std::env::var_os("NEUTON_TRACE").is_some() {
                         eprintln!("net: teleport #{teleport_id} rel {:#07b}", relative.0);
@@ -523,7 +556,7 @@ impl Connection {
                     // again, forever.
                     self.send_movement(Some([x, y, z]), Some((yaw, pitch)), false)?;
 
-                    return Ok(Event::Teleported { x, y, z, yaw, pitch, relative });
+                    return Ok(Event::Teleported { x, y, z, yaw, pitch, velocity, relative });
                 }
                 ids::play::clientbound::CONTAINER_SET_CONTENT => {
                     let window = r.read_varint().map_err(named)?;
@@ -1140,5 +1173,35 @@ mod position_tests {
         for at in [[0, 0, 0], [1, 2, 3], [-1587, 71, -2111], [-30_000_000, -64, 30_000_000]] {
             assert_eq!(decode_block_pos(encode_block_pos(at)), at, "{at:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod relatives_tests {
+    use super::Relatives;
+
+    /// The bit order is the declaration order of the Relative enum in the jar:
+    /// X, Y, Z, Y_ROT, X_ROT, DELTA_X, DELTA_Y, DELTA_Z, ROTATE_DELTA. Getting
+    /// it wrong reads a destination as an offset, which does not fail, it just
+    /// puts the player somewhere else.
+    #[test]
+    fn the_bits_are_in_the_jars_order() {
+        assert!(Relatives(1 << 0).x());
+        assert!(Relatives(1 << 1).y());
+        assert!(Relatives(1 << 2).z());
+        assert!(Relatives(1 << 3).yaw());
+        assert!(Relatives(1 << 4).pitch());
+        assert!(Relatives(1 << 5).delta_x());
+        assert!(Relatives(1 << 6).delta_y());
+        assert!(Relatives(1 << 7).delta_z());
+        // Nothing bleeds between neighbours.
+        assert!(!Relatives(1 << 5).pitch());
+        assert!(!Relatives(1 << 4).delta_x());
+    }
+
+    #[test]
+    fn a_relative_field_adds_and_an_absolute_one_replaces() {
+        assert_eq!(Relatives::resolve(true, 0.25, 10.0), 10.25);
+        assert_eq!(Relatives::resolve(false, 0.25, 10.0), 0.25);
     }
 }

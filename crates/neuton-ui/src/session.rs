@@ -24,6 +24,8 @@ pub enum WorldEvent {
     Chunk { x: i32, z: i32, mesh: Box<Mesh>, blocks: Arc<Chunk> },
     Forget { x: i32, z: i32 },
     Moved {
+        /// How fast the server says the player is travelling.
+        velocity: [f64; 3],
         x: f64,
         y: f64,
         z: f64,
@@ -309,8 +311,8 @@ impl WorldSession {
                         meshed_with.remove(&(x, z));
                         let _ = tx.send(WorldEvent::Forget { x, z });
                     }
-                    Ok(Event::Teleported { x, y, z, yaw, pitch, relative }) => {
-                        let _ = tx.send(WorldEvent::Moved { x, y, z, yaw, pitch, relative });
+                    Ok(Event::Teleported { x, y, z, yaw, pitch, velocity, relative }) => {
+                        let _ = tx.send(WorldEvent::Moved { x, y, z, yaw, pitch, velocity, relative });
                     }
                     Ok(Event::Container { window, state_id, slots, carried, unread }) => {
                         if let Some(why) = unread {
