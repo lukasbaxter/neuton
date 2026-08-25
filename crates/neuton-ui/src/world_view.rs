@@ -12,6 +12,15 @@ use std::time::{Duration, Instant};
 use crate::settings::{Action, Settings};
 use winit::keyboard::KeyCode;
 
+/// A swing in progress: which block, which face it was struck on, and when it
+/// started. The face goes out again with the stop, as the game sends it.
+#[derive(Clone, Copy)]
+struct Mining {
+    at: [i32; 3],
+    face: u8,
+    since: Instant,
+}
+
 pub struct WorldView {
     pub session: WorldSession,
     pub camera: Camera,
@@ -56,8 +65,12 @@ pub struct WorldView {
     pub dead: bool,
     /// The block under the crosshair, if any is in reach.
     pub target: Option<neuton_world::raycast::Hit>,
-    /// The block being broken, and when the swing at it started.
-    mining: Option<([i32; 3], Instant)>,
+    /// The block being broken, the face it was struck on, and when the swing
+    /// at it started.
+    mining: Option<Mining>,
+    /// Whether the break button is held, so a finished block moves on to the
+    /// next one rather than needing another click.
+    breaking: bool,
     /// When the arm last swung, so breaking keeps it moving.
     last_swing: Option<Instant>,
     /// Whether the use button is held, for placing a run of blocks.
@@ -65,6 +78,9 @@ pub struct WorldView {
     /// When the last placement went out, so holding the button does not send
     /// one a frame.
     last_use: Option<Instant>,
+    /// When the last swing started, so a held button neither re-breaks the
+    /// block the server has not yet taken away nor sweeps at frame rate.
+    last_break: Option<Instant>,
     /// What the player is carrying, and which slot is in hand.
     pub inventory: crate::inventory::Inventory,
     /// Item pictures and interface sprites, rendered as they are first needed.
@@ -176,9 +192,11 @@ impl WorldView {
             dead: false,
             target: None,
             mining: None,
+            breaking: false,
             last_swing: None,
             using: false,
             last_use: None,
+            last_break: None,
             inventory: crate::inventory::Inventory::default(),
             art: crate::inventory::ItemArt::new(),
             pending: std::collections::VecDeque::new(),
@@ -378,11 +396,29 @@ impl WorldView {
         // crosshair finding nothing for a frame is what happens when a chunk is
         // being replaced underneath it, and giving up on that resets the
         // server's progress and means nothing ever breaks.
-        if let Some((at, _)) = self.mining
+        if let Some(m) = self.mining
             && let Some(hit) = self.target
-            && hit.block != at
+            && hit.block != m.at
         {
             self.stop_breaking();
+            self.begin_breaking();
+        }
+        // A swing that has run its course is owed to the server, which counts
+        // the same block down but waits to be told before it breaks anything.
+        if self.break_progress().is_some_and(|progress| progress >= 1.0) {
+            self.finish_breaking();
+        }
+        // Holding the button carries on to the next block, the way sweeping
+        // through a wall does in the game. The interval is what keeps it from
+        // starting again on the block the server has not taken away yet.
+        const BREAK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+        if self.breaking
+            && !self.paused
+            && !self.dead
+            && self.mining.is_none()
+            && self.target.is_some()
+            && self.last_break.is_none_or(|t| t.elapsed() >= BREAK_INTERVAL)
+        {
             self.begin_breaking();
         }
         // The arm keeps moving while a block is being broken.
@@ -745,6 +781,7 @@ impl WorldView {
         }
         match button {
             MouseButton::Left => {
+                self.breaking = pressed;
                 if pressed {
                     self.begin_breaking();
                 } else {
@@ -770,6 +807,7 @@ impl WorldView {
     /// the start and then keeps quiet, rather than guessing when the block
     /// should give and telling the server so, repeatedly, until it agreed.
     fn begin_breaking(&mut self) {
+        self.last_break = Some(Instant::now());
         let Some(hit) = self.target else {
             // Swinging at nothing is still a swing, and everyone else sees it.
             self.session.send(Outgoing::Swing);
@@ -778,13 +816,17 @@ impl WorldView {
         self.session.send(Outgoing::Swing);
         self.session.send(Outgoing::StartBreaking { at: hit.block, face: hit.face });
         // In creative the first packet is the whole of it.
-        self.mining = (!self.abilities.instant_build).then(|| (hit.block, Instant::now()));
+        self.mining = (!self.abilities.instant_build).then(|| Mining {
+            at: hit.block,
+            face: hit.face,
+            since: Instant::now(),
+        });
     }
 
     /// Letting go, or looking away, gives up on the block.
     fn stop_breaking(&mut self) {
-        if let Some((at, _)) = self.mining.take() {
-            self.session.send(Outgoing::AbortBreaking { at });
+        if let Some(m) = self.mining.take() {
+            self.session.send(Outgoing::AbortBreaking { at: m.at });
         }
     }
 
@@ -881,9 +923,9 @@ impl WorldView {
         // The cracks spread over the block being broken, which is not always
         // the one under the crosshair: a player can look away mid swing.
         let cracks = self.breaking_stage().and_then(|stage| {
-            let (at, _) = self.mining?;
-            let state = self.state_at(at)?;
-            let base = [at[0] as f32, at[1] as f32, at[2] as f32];
+            let m = self.mining?;
+            let state = self.state_at(m.at)?;
+            let base = [m.at[0] as f32, m.at[1] as f32, m.at[2] as f32];
             let shapes: Vec<([f32; 3], [f32; 3])> =
                 neuton_world::physics::BlockShapes::collision(self.shapes.as_ref(), state)
                     .iter()
@@ -917,16 +959,33 @@ impl WorldView {
     /// `None` when nothing is being broken, or when the block cannot be broken
     /// at all and there is no progress to show.
     fn breaking_stage(&self) -> Option<u32> {
-        let (at, since) = self.mining?;
-        let state = self.state_at(at)?;
+        let progress = self.break_progress()?;
+        Some(((progress * neuton_render::DESTROY_STAGES as f32) as u32)
+            .min(neuton_render::DESTROY_STAGES - 1))
+    }
+
+    /// How far the current swing has got, as a fraction of the time the block
+    /// takes. At one the block is owed to the server.
+    fn break_progress(&self) -> Option<f32> {
+        let m = self.mining?;
+        let state = self.state_at(m.at)?;
         let held = self.inventory.held().map_or("", |stack| stack.name);
         let total = neuton_world::mining::seconds_to_break(state, held, self.body.on_ground)?;
         if total <= 0.0 {
             return None;
         }
-        let progress = since.elapsed().as_secs_f32() / total;
-        Some(((progress * neuton_render::DESTROY_STAGES as f32) as u32)
-            .min(neuton_render::DESTROY_STAGES - 1))
+        Some(m.since.elapsed().as_secs_f32() / total)
+    }
+
+    /// Tells the server the swing is done.
+    ///
+    /// The server counts the same block down from the start packet, but it
+    /// does not break anything on its own: `ServerPlayerGameMode.tick` only
+    /// reports progress, and the block is destroyed when the client sends the
+    /// stop. Without this the cracks reach the last stage and stay there.
+    fn finish_breaking(&mut self) {
+        let Some(m) = self.mining.take() else { return };
+        self.session.send(Outgoing::FinishBreaking { at: m.at, face: m.face });
     }
 
     /// Works out what the player is pointing at.

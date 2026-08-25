@@ -73,6 +73,8 @@ pub enum Outgoing {
     StartBreaking { at: [i32; 3], face: u8 },
     /// Give up on a block part way through breaking it.
     AbortBreaking { at: [i32; 3] },
+    /// The swing is done; the server breaks the block on this.
+    FinishBreaking { at: [i32; 3], face: u8 },
     /// Use what is in hand against a block: placing, opening, flipping.
     UseOn { at: [i32; 3], face: u8, cursor: [f32; 3] },
     /// Use what is in hand with nothing in front of it.
@@ -177,6 +179,11 @@ impl WorldSession {
                         }
                         Outgoing::AbortBreaking { at } => {
                             conn.send_player_action(1, *at, 1)
+                        }
+                        // 2 is STOP_DESTROY_BLOCK, read from the server jar's
+                        // ServerboundPlayerActionPacket$Action ordinals.
+                        Outgoing::FinishBreaking { at, face } => {
+                            conn.send_player_action(2, *at, *face)
                         }
                         Outgoing::UseOn { at, face, cursor } => {
                             conn.send_use_item_on(*at, *face, *cursor, false)
