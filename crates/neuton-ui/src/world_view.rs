@@ -38,6 +38,10 @@ pub struct WorldView {
     placed: bool,
     pub frames: u32,
     pub last_frame_ms: f32,
+    /// The slowest frame since the last stats line, so a stutter that an
+    /// average smooths away still shows up.
+    worst_frame_ms: f32,
+    last_stats: Option<Instant>,
     /// Whether the debug panel is up. F3, as in the game.
     pub show_debug: bool,
     /// Smoothed frame time, so the number on screen is readable rather than
@@ -182,6 +186,8 @@ impl WorldView {
             placed: false,
             frames: 0,
             last_frame_ms: 0.0,
+            worst_frame_ms: 0.0,
+            last_stats: None,
             show_debug: true,
             frame_ms_avg: 0.0,
             chat: Chat::default(),
@@ -1090,6 +1096,23 @@ impl WorldView {
     pub fn record_frame(&mut self, dt: f32) {
         self.last_frame_ms = dt * 1000.0;
         self.frames += 1;
+        // The overlay carries these numbers, but only where a window can be
+        // seen. NEUTON_STATS puts the same reading somewhere a log can keep
+        // it, which is the only way to time the windowed path from outside.
+        if std::env::var_os("NEUTON_STATS").is_some() {
+            let now = Instant::now();
+            if self.last_stats.is_none_or(|t| now.duration_since(t).as_secs_f32() >= 1.0) {
+                self.last_stats = Some(now);
+                eprintln!(
+                    "stats: {:.2} ms/frame ({:.0} fps), worst {:.2} ms over the last second",
+                    self.frame_ms_avg,
+                    self.fps(),
+                    self.worst_frame_ms,
+                );
+                self.worst_frame_ms = 0.0;
+            }
+            self.worst_frame_ms = self.worst_frame_ms.max(self.last_frame_ms);
+        }
         // Exponential average: responsive enough to show a real slowdown,
         // steady enough that the number can be read.
         self.frame_ms_avg = if self.frame_ms_avg == 0.0 {
