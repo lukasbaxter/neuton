@@ -16,7 +16,7 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("ping") if args.len() >= 2 => ping(&args[1]),
-        Some("join") if args.len() >= 2 => join(&args[1], offline_name(&args)),
+        Some("join") if args.len() >= 2 => join(&args[1], offline_name(&args), hold_secs(&args)),
         Some("play") if args.len() >= 2 => play(&args[1], offline_name(&args), shot_path(&args)),
         Some("login") => login(),
         Some("logout") => logout(args.get(1).map(String::as_str)),
@@ -205,6 +205,18 @@ fn shot_path(args: &[String]) -> Option<(std::path::PathBuf, Duration)> {
     Some((path, Duration::from_secs_f64(secs)))
 }
 
+/// `--hold <seconds>` keeps the connection open rather than reporting and
+/// leaving. A second client standing in the world is the only way to look at
+/// how another player is drawn.
+fn hold_secs(args: &[String]) -> Duration {
+    args.iter()
+        .position(|a| a == "--hold")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(20))
+}
+
 fn offline_name(args: &[String]) -> Option<&str> {
     let i = args.iter().position(|a| a == "--offline")?;
     args.get(i + 1).map(String::as_str)
@@ -375,7 +387,11 @@ fn whoami() -> Result<(), Box<dyn std::error::Error>> {
 /// This is the end-to-end check on the whole stack: auth, encryption,
 /// compression, the configuration exchange and chunk decoding all have to be
 /// right for a single chunk to arrive.
-fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+fn join(
+    target: &str,
+    offline: Option<&str>,
+    hold: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (host, port) = split_host_port(target);
 
     let session = match offline {
@@ -416,7 +432,7 @@ fn join(target: &str, offline: Option<&str>) -> Result<(), Box<dyn std::error::E
         conn.compression().map(|t| t.to_string()).unwrap_or_else(|| "off".into())
     );
 
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + hold;
     let mut ignored: std::collections::BTreeMap<&'static str, u32> = Default::default();
     // Where the server put us, and the column of blocks there once its chunk
     // arrives. Reading real terrain back as block names is the only end-to-end

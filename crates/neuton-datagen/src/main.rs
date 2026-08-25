@@ -10,6 +10,7 @@
 
 mod blocks;
 mod entities;
+mod entity_models;
 mod breaking;
 mod items;
 mod packets;
@@ -28,6 +29,8 @@ pub struct Ctx {
     pub version: String,
     /// Protocol number from the jar's `version.json`.
     pub protocol: i64,
+    /// The client jar, for the generators that read it directly.
+    pub jar: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -72,6 +75,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         repo: env.repo.clone(),
         version: env.version.clone(),
         protocol: env.protocol,
+        jar: env.jar(),
     };
 
     packets::generate(&ctx)?;
@@ -82,6 +86,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     breaking::generate(&ctx, &env.java, &env.classpath()?, &env.jar())?;
     shapes::generate(&ctx, &env.java, &env.classpath()?)?;
     entities::generate(&ctx, &env.java, &env.classpath()?)?;
+    entity_models::generate(&ctx, &env.java, &env.classpath()?)?;
 
     println!("datagen: done");
     Ok(())

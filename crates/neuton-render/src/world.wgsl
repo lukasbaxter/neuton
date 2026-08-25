@@ -104,3 +104,19 @@ fn fs_crumbling(in: VertexOut) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(texel.rgb, 1.0);
 }
+
+/// A player, drawn from a skin rather than from the block atlas.
+///
+/// Cut out, not blended: the outer layer of a skin is all or nothing, and
+/// blending its edges leaves a halo around every hat and sleeve. Lit and
+/// fogged like everything else, so a player at range sits in the same haze as
+/// the ground they are standing on.
+@fragment
+fn fs_entity(in: VertexOut) -> @location(0) vec4<f32> {
+    let texel = textureSample(atlas, atlas_sampler, in.uv);
+    if (texel.a < 0.5) {
+        discard;
+    }
+    let lit = texel.rgb * in.tint.rgb * max(in.light, globals.fog.z);
+    return vec4<f32>(apply_fog(lit, in.view_distance), 1.0);
+}
