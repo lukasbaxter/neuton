@@ -542,6 +542,10 @@ struct Press {
     slot: Option<usize>,
     right: bool,
     at: egui::Pos2,
+    /// Set when the press itself picked a stack up, so that letting go over a
+    /// different slot puts it down there. That is how the game lets a stack be
+    /// dragged from one slot to another in a single gesture.
+    picked_up: bool,
 }
 
 /// How far the pointer has to move before a held button counts as a drag
@@ -711,7 +715,8 @@ fn read_pointer(
         let right = pressed_secondary && !pressed_primary;
         cursor.dragging = false;
         cursor.spent = false;
-        cursor.press = Some(Press { slot: hovered, right, at: pointer.unwrap_or_default() });
+        let mut press =
+            Press { slot: hovered, right, at: pointer.unwrap_or_default(), picked_up: false };
 
         match (hovered, inventory.carried().is_some()) {
             // An empty cursor acts at once: there is nothing to drag, and
@@ -722,6 +727,7 @@ fn read_pointer(
                     out.push(Click::QuickMove { slot });
                 } else {
                     out.push(Click::Pickup { slot, right });
+                    press.picked_up = inventory.slot(slot).is_some();
                 }
                 cursor.last = Some((slot, now));
             }
@@ -739,6 +745,7 @@ fn read_pointer(
             }
             (None, _) => {}
         }
+        cursor.press = Some(press);
         return out;
     }
 
@@ -759,7 +766,12 @@ fn read_pointer(
                 out.push(Click::DragOver { slot });
             }
         }
-        if cursor.dragging && let Some(slot) = hovered {
+        // A slot already painted is not painted again, so a pointer resting on
+        // one does not send a packet a frame.
+        if cursor.dragging
+            && let Some(slot) = hovered
+            && !inventory.drag.slots.contains(&slot)
+        {
             out.push(Click::DragOver { slot });
         }
     }
@@ -770,6 +782,17 @@ fn read_pointer(
         let spent = std::mem::take(&mut cursor.spent);
         if dragging {
             out.push(Click::DragEnd);
+        } else if let Some(press) = press.as_ref().filter(|p| spent && p.picked_up && !p.right) {
+            // Picked up on the way down and let go somewhere else: put it
+            // there. Pressing and releasing on the same slot leaves the stack
+            // on the cursor, which is what the game does too.
+            match hovered {
+                Some(slot) if Some(slot) != press.slot && inventory.carried().is_some() => {
+                    out.push(Click::Pickup { slot, right: false });
+                    cursor.last = None;
+                }
+                _ => {}
+            }
         } else if !spent && let Some(press) = press {
             match press.slot {
                 Some(slot) if shift => {
@@ -867,5 +890,279 @@ mod tests {
         inventory.replace(vec![None, Some(stack.clone())]);
         assert_eq!(inventory.slot(1), Some(&stack));
         assert_eq!(inventory.slot(40), None, "slots the packet never reached stay empty");
+    }
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::*;
+    use crate::clicks::{Click, DragKind};
+
+    /// One frame of pointer input, fed to a real egui context so the pressed,
+    /// released and modifier state come out of the same machinery the screen
+    /// reads them from.
+    struct Frame {
+        ctx: egui::Context,
+        time: f64,
+    }
+
+    impl Frame {
+        fn new() -> Self {
+            Self { ctx: egui::Context::default(), time: 1.0 }
+        }
+
+        /// Runs one frame with the pointer at `at`, optionally changing a
+        /// button, and returns what the screen made of it.
+        fn step(
+            &mut self,
+            inventory: &Inventory,
+            cursor: &mut Cursor,
+            at: egui::Pos2,
+            button: Option<(egui::PointerButton, bool)>,
+            shift: bool,
+            hovered: Option<usize>,
+        ) -> Vec<Click> {
+            self.time += 0.016;
+            let modifiers = egui::Modifiers { shift, ..Default::default() };
+            let mut input = egui::RawInput { time: Some(self.time), ..Default::default() };
+            // Modifiers reach the context as an event of their own, so a
+            // shift already held before the click still counts.
+            input.events.push(egui::Event::ModifiersChanged(modifiers));
+            input.events.push(egui::Event::PointerMoved(at));
+            if let Some((button, pressed)) = button {
+                input.events.push(egui::Event::PointerButton {
+                    pos: at,
+                    button,
+                    pressed,
+                    modifiers,
+                });
+            }
+            self.ctx.begin_pass(input);
+            let panel = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+            let clicks =
+                read_pointer(&self.ctx, inventory, cursor, hovered, Some(at), panel, false);
+            // epaint panics on a dropped texture delta it never handed to a
+            // renderer, and there is no renderer here.
+            let mut output = self.ctx.end_pass();
+            output.textures_delta.clear();
+            clicks
+        }
+    }
+
+    fn stack(name: &'static str, count: i32) -> Stack {
+        let id = neuton_blocks::items::ITEMS
+            .iter()
+            .position(|i| i.name == name)
+            .expect("no such item") as i32;
+        Stack { count, id, name, ..Default::default() }
+    }
+
+    fn with_stone() -> Inventory {
+        let mut inventory = Inventory::default();
+        inventory.set(9, Some(stack("stone", 32)));
+        inventory
+    }
+
+    const IN_SLOT: egui::Pos2 = egui::Pos2 { x: 20.0, y: 20.0 };
+    const NEXT_SLOT: egui::Pos2 = egui::Pos2 { x: 40.0, y: 20.0 };
+    const OUTSIDE: egui::Pos2 = egui::Pos2 { x: 400.0, y: 400.0 };
+
+    #[test]
+    fn a_press_on_a_full_slot_picks_it_up_at_once() {
+        let (mut frame, mut cursor) = (Frame::new(), Cursor::default());
+        let inventory = with_stone();
+        let clicks = frame.step(
+            &inventory,
+            &mut cursor,
+            IN_SLOT,
+            Some((egui::PointerButton::Primary, true)),
+            false,
+            Some(9),
+        );
+        assert_eq!(clicks, vec![Click::Pickup { slot: 9, right: false }]);
+    }
+
+    #[test]
+    fn shift_makes_the_same_press_a_quick_move() {
+        let (mut frame, mut cursor) = (Frame::new(), Cursor::default());
+        let inventory = with_stone();
+        let clicks = frame.step(
+            &inventory,
+            &mut cursor,
+            IN_SLOT,
+            Some((egui::PointerButton::Primary, true)),
+            true,
+            Some(9),
+        );
+        assert_eq!(clicks, vec![Click::QuickMove { slot: 9 }]);
+    }
+
+    #[test]
+    fn a_stack_dragged_to_another_slot_is_put_down_there() {
+        let (mut frame, mut cursor) = (Frame::new(), Cursor::default());
+        let mut inventory = with_stone();
+        for click in frame.step(
+            &inventory,
+            &mut cursor,
+            IN_SLOT,
+            Some((egui::PointerButton::Primary, true)),
+            false,
+            Some(9),
+        ) {
+            inventory.click(click);
+        }
+        // Moving with the button down must not start painting: the press was
+        // already spent picking the stack up.
+        let moved = frame.step(&inventory, &mut cursor, NEXT_SLOT, None, false, Some(10));
+        assert!(moved.is_empty(), "a spent press does not paint: {moved:?}");
+        let released = frame.step(
+            &inventory,
+            &mut cursor,
+            NEXT_SLOT,
+            Some((egui::PointerButton::Primary, false)),
+            false,
+            Some(10),
+        );
+        assert_eq!(released, vec![Click::Pickup { slot: 10, right: false }]);
+    }
+
+    #[test]
+    fn letting_go_on_the_slot_it_came_from_leaves_it_on_the_cursor() {
+        let (mut frame, mut cursor) = (Frame::new(), Cursor::default());
+        let mut inventory = with_stone();
+        for click in frame.step(
+            &inventory,
+            &mut cursor,
+            IN_SLOT,
+            Some((egui::PointerButton::Primary, true)),
+            false,
+            Some(9),
+        ) {
+            inventory.click(click);
+        }
+        let released = frame.step(
+            &inventory,
+            &mut cursor,
+            IN_SLOT,
+            Some((egui::PointerButton::Primary, false)),
+            false,
+            Some(9),
+        );
+        assert!(released.is_empty(), "nothing more should happen: {released:?}");
+        assert!(inventory.carried().is_some());
+    }
+
+    #[test]
+    fn holding_a_stack_and_moving_across_slots_paints_a_drag() {
+        let (mut frame, mut cursor) = (Frame::new(), Cursor::default());
+        let mut inventory = Inventory::default();
+        inventory.set_carried(Some(stack("stone", 8)));
+
+        let pressed = frame.step(
+            &inventory,
+            &mut cursor,
+            IN_SLOT,
+            Some((egui::PointerButton::Primary, true)),
+            false,
+            Some(9),
+        );
+        assert!(pressed.is_empty(), "a press with a full cursor waits to see what it is");
+
+        let moved = frame.step(&inventory, &mut cursor, NEXT_SLOT, None, false, Some(10));
+        assert_eq!(
+            moved,
+            vec![
+                Click::DragStart(DragKind::Even),
+                Click::DragOver { slot: 9 },
+                Click::DragOver { slot: 10 },
+            ],
+            "the slot it started on is painted too"
+        );
+        for click in moved {
+            inventory.click(click);
+        }
+        let released = frame.step(
+            &inventory,
+            &mut cursor,
+            NEXT_SLOT,
+            Some((egui::PointerButton::Primary, false)),
+            false,
+            Some(10),
+        );
+        assert_eq!(released, vec![Click::DragEnd]);
+    }
+
+    #[test]
+    fn the_right_button_paints_one_into_each() {
+        let (mut frame, mut cursor) = (Frame::new(), Cursor::default());
+        let mut inventory = Inventory::default();
+        inventory.set_carried(Some(stack("stone", 8)));
+        frame.step(
+            &inventory,
+            &mut cursor,
+            IN_SLOT,
+            Some((egui::PointerButton::Secondary, true)),
+            false,
+            Some(9),
+        );
+        let moved = frame.step(&inventory, &mut cursor, NEXT_SLOT, None, false, Some(10));
+        assert_eq!(moved.first(), Some(&Click::DragStart(DragKind::One)));
+    }
+
+    #[test]
+    fn a_press_and_release_away_from_the_panel_drops_what_is_carried() {
+        let (mut frame, mut cursor) = (Frame::new(), Cursor::default());
+        let mut inventory = Inventory::default();
+        inventory.set_carried(Some(stack("stone", 8)));
+        frame.step(
+            &inventory,
+            &mut cursor,
+            OUTSIDE,
+            Some((egui::PointerButton::Primary, true)),
+            false,
+            None,
+        );
+        let released = frame.step(
+            &inventory,
+            &mut cursor,
+            OUTSIDE,
+            Some((egui::PointerButton::Primary, false)),
+            false,
+            None,
+        );
+        assert_eq!(released, vec![Click::DropCarried { whole_stack: true }]);
+    }
+
+    #[test]
+    fn two_presses_on_one_slot_gather_the_rest() {
+        let (mut frame, mut cursor) = (Frame::new(), Cursor::default());
+        let mut inventory = with_stone();
+        for click in frame.step(
+            &inventory,
+            &mut cursor,
+            IN_SLOT,
+            Some((egui::PointerButton::Primary, true)),
+            false,
+            Some(9),
+        ) {
+            inventory.click(click);
+        }
+        frame.step(
+            &inventory,
+            &mut cursor,
+            IN_SLOT,
+            Some((egui::PointerButton::Primary, false)),
+            false,
+            Some(9),
+        );
+        let again = frame.step(
+            &inventory,
+            &mut cursor,
+            IN_SLOT,
+            Some((egui::PointerButton::Primary, true)),
+            false,
+            Some(9),
+        );
+        assert_eq!(again, vec![Click::Gather { slot: 9 }]);
     }
 }
