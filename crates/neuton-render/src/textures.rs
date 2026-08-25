@@ -163,9 +163,19 @@ struct Pending {
 }
 
 impl neuton_world::BlockShapes for BlockTextures {
+    // Both of these come from the jar rather than from the render geometry.
+    // The model is what a block looks like, which is a different question from
+    // what a player walks into, and answering the second with the first is how
+    // a fence ends up jumpable and an end rod ends up two pixels thinner than
+    // the server thinks it is.
     #[inline]
     fn collision(&self, state: StateId) -> &[Aabb] {
-        &self.model(state).collision
+        neuton_world::shapes::collision(state)
+    }
+
+    #[inline]
+    fn outline(&self, state: StateId) -> &[Aabb] {
+        neuton_world::shapes::outline(state)
     }
 }
 
